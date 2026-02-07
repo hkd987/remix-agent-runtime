@@ -84,10 +84,8 @@ async fn main() -> ExitCode {
             );
 
             // Create webhook dispatcher
-            let webhook = WebhookDispatcher::new(
-                config.on_complete.as_ref().map(|w| w.url.clone()),
-                config.on_error.as_ref().map(|w| w.url.clone()),
-            );
+            let webhook =
+                WebhookDispatcher::new(config.on_complete.as_ref(), config.on_error.as_ref());
 
             // Convert raw credentials to real CredentialSet
             let credential_set = match credentials::convert_raw_credentials(&config.credentials) {
@@ -101,6 +99,9 @@ async fn main() -> ExitCode {
             // Run agent
             let runner = AgentRunner::new(llm_client, mcp_client, config.agent.clone());
             let result = runner.run(&task, &credential_set).await;
+
+            // Gracefully shut down the MCP browser connection
+            runner.into_tools().shutdown();
 
             match result {
                 Ok(agent_result) => {
@@ -122,12 +123,7 @@ async fn main() -> ExitCode {
                             ExitStatus::Success.into()
                         }
                         _ => {
-                            webhook
-                                .send_error(
-                                    agent_result.error.as_deref().unwrap_or("unknown error"),
-                                    &agent_result,
-                                )
-                                .await;
+                            webhook.send_error(&agent_result).await;
                             ExitStatus::AgentError.into()
                         }
                     }
@@ -138,7 +134,7 @@ async fn main() -> ExitCode {
                     // Create error result for webhook
                     let error_result =
                         remix_agent_runtime::output::AgentResult::error(e.to_string(), vec![], 0);
-                    webhook.send_error(&e.to_string(), &error_result).await;
+                    webhook.send_error(&error_result).await;
 
                     e.exit_status().into()
                 }

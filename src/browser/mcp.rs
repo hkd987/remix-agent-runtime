@@ -29,6 +29,9 @@ pub struct McpBrowserClient {
     tools: Vec<ToolDefinition>,
     peer: rmcp::Peer<rmcp::RoleClient>,
     cancel_token: rmcp::service::RunningServiceCancellationToken,
+    /// Holds the RunningService alive so the background MCP transport task
+    /// is not cancelled when this struct is created. Dropped on shutdown.
+    _service_guard: Box<dyn std::any::Any + Send + Sync>,
 }
 
 impl McpBrowserClient {
@@ -66,6 +69,7 @@ impl McpBrowserClient {
             tools,
             peer,
             cancel_token,
+            _service_guard: Box::new(service),
         })
     }
 

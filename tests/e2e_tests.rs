@@ -1,0 +1,339 @@
+use assert_cmd::cargo::cargo_bin_cmd;
+use assert_cmd::Command;
+use predicates::prelude::*;
+use serde_json::Value;
+use std::io::Read;
+use std::io::Write;
+
+fn cmd() -> Command {
+    let mut c: Command = cargo_bin_cmd!("remix-agent");
+    // Ensure remix-browser is discoverable — pass REMIX_BROWSER_PATH if set,
+    // otherwise ensure ~/.local/bin is in PATH.
+    if let Ok(path) = std::env::var("REMIX_BROWSER_PATH") {
+        c.env("REMIX_BROWSER_PATH", path);
+    }
+    c
+}
+
+// ── Config validation tests (no external deps) ──────────────────────
+
+#[test]
+fn test_e2e_missing_task() {
+    cmd()
+        .args(["run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No task"));
+}
+
+#[test]
+fn test_e2e_missing_api_key() {
+    cmd()
+        .env_remove("REMIX_LLM_API_KEY")
+        .env_remove("REMIX_LLM_BASE_URL")
+        .args(["run", "some task"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No API key"));
+}
+
+#[test]
+fn test_e2e_bad_config_file() {
+    cmd()
+        .args(["run", "--config", "/nonexistent/path/config.yaml"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Failed to read config"));
+}
+
+#[test]
+fn test_e2e_localhost_no_api_key() {
+    // localhost URLs bypass API key validation, so we should NOT get an
+    // "API key" error. Instead, it will fail trying to connect to the browser.
+    let result = cmd()
+        .env_remove("REMIX_LLM_API_KEY")
+        .args(["run", "--base-url", "http://localhost:9999", "test task"])
+        .assert()
+        .failure();
+
+    // Should NOT contain API key error
+    result.stderr(predicate::str::contains("No API key").not());
+}
+
+// ── Full pipeline tests (require API key + remix-browser) ────────────
+
+fn api_key() -> String {
+    std::env::var("REMIX_LLM_API_KEY").expect("REMIX_LLM_API_KEY must be set for E2E tests")
+}
+
+fn base_url() -> String {
+    std::env::var("REMIX_LLM_BASE_URL").unwrap_or_else(|_| "https://api.anthropic.com".to_string())
+}
+
+fn model() -> Option<String> {
+    std::env::var("REMIX_LLM_MODEL").ok()
+}
+
+/// Helper: build a Command pre-configured with API key, base URL, model, and browser path.
+fn e2e_cmd() -> Command {
+    let mut c = cmd();
+    c.env("REMIX_LLM_API_KEY", api_key());
+    c.env("REMIX_LLM_BASE_URL", base_url());
+    if let Some(m) = model() {
+        c.env("REMIX_LLM_MODEL", &m);
+    }
+    c
+}
+
+/// Build the common run args, injecting --model if set via env.
+fn run_args(extra: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = vec!["run".to_string()];
+    if let Some(m) = model() {
+        args.push("--model".to_string());
+        args.push(m);
+    }
+    for a in extra {
+        args.push(a.to_string());
+    }
+    args
+}
+
+#[test]
+#[ignore]
+fn test_e2e_navigate_and_describe() {
+    let output = e2e_cmd()
+        .args(run_args(&[
+            "Navigate to httpbin.org and tell me the page title",
+        ]))
+        .timeout(std::time::Duration::from_secs(120))
+        .output()
+        .expect("Failed to run command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "Expected exit 0, got {:?}\nstderr: {stderr}",
+        output.status
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("Invalid JSON output: {e}\nstdout: {stdout}"));
+
+    assert_eq!(json["status"], "success");
+    assert!(
+        json["result"].as_str().is_some(),
+        "Expected result field to be present"
+    );
+    assert!(
+        json["total_iterations"].as_u64().is_some_and(|i| i >= 1),
+        "Expected total_iterations >= 1"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_e2e_output_to_file() {
+    let tmp = tempfile::NamedTempFile::new().expect("Failed to create temp file");
+    let output_path = tmp.path().to_str().unwrap().to_string();
+
+    let output = e2e_cmd()
+        .args(run_args(&[
+            "--output",
+            &output_path,
+            "Navigate to httpbin.org and tell me the page title",
+        ]))
+        .timeout(std::time::Duration::from_secs(120))
+        .output()
+        .expect("Failed to run command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "Expected exit 0, got {:?}\nstderr: {stderr}",
+        output.status
+    );
+
+    let mut file = std::fs::File::open(&output_path).expect("Output file should exist");
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .expect("Failed to read output file");
+
+    let json: Value = serde_json::from_str(&contents)
+        .unwrap_or_else(|e| panic!("Invalid JSON in output file: {e}\ncontents: {contents}"));
+
+    assert_eq!(json["status"], "success");
+}
+
+#[test]
+#[ignore]
+fn test_e2e_yaml_config() {
+    let model_line = model()
+        .map(|m| format!("\n  model: \"{m}\""))
+        .unwrap_or_default();
+    let yaml_content = format!(
+        r#"
+task: "Navigate to httpbin.org and tell me the page title"
+llm:
+  api_key: "{api_key}"
+  base_url: "{base_url}"{model_line}
+"#,
+        api_key = api_key(),
+        base_url = base_url(),
+        model_line = model_line,
+    );
+
+    let mut tmp =
+        tempfile::NamedTempFile::with_suffix(".yaml").expect("Failed to create temp file");
+    tmp.write_all(yaml_content.as_bytes())
+        .expect("Failed to write YAML config");
+    tmp.flush().expect("Failed to flush");
+
+    let config_path = tmp.path().to_str().unwrap().to_string();
+
+    let output = e2e_cmd()
+        .args(run_args(&["--config", &config_path]))
+        .timeout(std::time::Duration::from_secs(120))
+        .output()
+        .expect("Failed to run command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "Expected exit 0, got {:?}\nstderr: {stderr}",
+        output.status
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("Invalid JSON output: {e}\nstdout: {stdout}"));
+
+    assert_eq!(json["status"], "success");
+}
+
+#[test]
+#[ignore]
+fn test_e2e_max_iterations() {
+    let output = e2e_cmd()
+        .args(run_args(&[
+            "--max-iterations",
+            "1",
+            "Navigate to httpbin.org and tell me the page title",
+        ]))
+        .timeout(std::time::Duration::from_secs(120))
+        .output()
+        .expect("Failed to run command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("Invalid JSON output: {e}\nstdout: {stdout}\nstderr: {stderr}"));
+
+    let status = json["status"].as_str().unwrap_or("");
+    assert!(
+        status == "max_iterations" || status == "success",
+        "Expected 'max_iterations' or 'success', got '{status}'"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_e2e_webhook_on_success() {
+    use std::net::TcpListener;
+
+    // Bind a local TCP listener to receive the webhook POST
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind TCP listener");
+    let addr = listener.local_addr().unwrap();
+    let webhook_url = format!("http://{addr}/webhook");
+
+    let model_line = model()
+        .map(|m| format!("\n  model: \"{m}\""))
+        .unwrap_or_default();
+    let yaml_content = format!(
+        r#"
+task: "Navigate to httpbin.org and tell me the page title"
+llm:
+  api_key: "{api_key}"
+  base_url: "{base_url}"{model_line}
+on_complete:
+  url: "{webhook_url}"
+"#,
+        api_key = api_key(),
+        base_url = base_url(),
+        model_line = model_line,
+        webhook_url = webhook_url,
+    );
+
+    let mut tmp =
+        tempfile::NamedTempFile::with_suffix(".yaml").expect("Failed to create temp file");
+    tmp.write_all(yaml_content.as_bytes())
+        .expect("Failed to write YAML config");
+    tmp.flush().expect("Failed to flush");
+
+    let config_path = tmp.path().to_str().unwrap().to_string();
+
+    // Run the agent in a thread so we can accept the webhook
+    let config_path_clone = config_path.clone();
+    let handle = std::thread::spawn(move || {
+        e2e_cmd()
+            .args(run_args(&["--config", &config_path_clone]))
+            .timeout(std::time::Duration::from_secs(120))
+            .output()
+            .expect("Failed to run command")
+    });
+
+    // Accept the webhook connection (with timeout)
+    let timeout = std::time::Duration::from_secs(120);
+    let start = std::time::Instant::now();
+    let mut received_body = String::new();
+
+    loop {
+        if start.elapsed() > timeout {
+            panic!("Timed out waiting for webhook");
+        }
+
+        // Try to accept with a short poll
+        listener
+            .set_nonblocking(true)
+            .expect("set nonblocking failed");
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut buf = [0u8; 8192];
+                let mut total = String::new();
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => total.push_str(&String::from_utf8_lossy(&buf[..n])),
+                        Err(_) => break,
+                    }
+                }
+                // Send back a 200 OK response
+                let response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes());
+
+                // Extract the body (after \r\n\r\n)
+                if let Some(body_start) = total.find("\r\n\r\n") {
+                    received_body = total[body_start + 4..].to_string();
+                }
+                break;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => panic!("Accept error: {e}"),
+        }
+    }
+
+    let output = handle.join().expect("Agent thread panicked");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "Expected exit 0\nstderr: {stderr}");
+
+    // Verify the webhook received valid JSON with status "success"
+    let json: Value = serde_json::from_str(&received_body)
+        .unwrap_or_else(|e| panic!("Invalid webhook JSON: {e}\nbody: {received_body}"));
+
+    assert_eq!(json["status"], "success");
+}

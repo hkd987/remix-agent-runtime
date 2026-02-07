@@ -15,16 +15,9 @@ impl BrowserManager {
         let browser_path = config.browser_path.as_deref().unwrap_or("remix-browser");
         let mut cmd = Command::new(browser_path);
 
-        if config.headless {
-            cmd.arg("--headless");
-        } else {
+        if !config.headless {
             cmd.arg("--headed");
         }
-
-        cmd.arg("--viewport-width")
-            .arg(config.viewport_width.to_string());
-        cmd.arg("--viewport-height")
-            .arg(config.viewport_height.to_string());
 
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
@@ -81,12 +74,8 @@ mod tests {
         assert_eq!(program, "remix-browser");
 
         let args: Vec<&str> = cmd.as_std().get_args().filter_map(|a| a.to_str()).collect();
-        assert!(args.contains(&"--headless"));
+        // Headless is the default in remix-browser — no flag needed
         assert!(!args.contains(&"--headed"));
-        assert!(args.contains(&"--viewport-width"));
-        assert!(args.contains(&"1280"));
-        assert!(args.contains(&"--viewport-height"));
-        assert!(args.contains(&"720"));
     }
 
     #[test]
@@ -99,21 +88,6 @@ mod tests {
         let cmd = BrowserManager::build_command(&config);
         let args: Vec<&str> = cmd.as_std().get_args().filter_map(|a| a.to_str()).collect();
         assert!(args.contains(&"--headed"));
-        assert!(!args.contains(&"--headless"));
-    }
-
-    #[test]
-    fn test_build_command_custom_viewport() {
-        let config = BrowserConfig {
-            viewport_width: 1920,
-            viewport_height: 1080,
-            ..Default::default()
-        };
-
-        let cmd = BrowserManager::build_command(&config);
-        let args: Vec<&str> = cmd.as_std().get_args().filter_map(|a| a.to_str()).collect();
-        assert!(args.contains(&"1920"));
-        assert!(args.contains(&"1080"));
     }
 
     #[test]
@@ -126,21 +100,6 @@ mod tests {
         let cmd = BrowserManager::build_command(&config);
         let program = cmd.as_std().get_program().to_str().unwrap();
         assert_eq!(program, "/usr/local/bin/remix-browser");
-    }
-
-    #[test]
-    fn test_build_command_arg_order() {
-        let config = BrowserConfig::default();
-        let cmd = BrowserManager::build_command(&config);
-        let args: Vec<&str> = cmd.as_std().get_args().filter_map(|a| a.to_str()).collect();
-
-        // Verify viewport-width comes with its value
-        let width_idx = args.iter().position(|a| *a == "--viewport-width").unwrap();
-        assert_eq!(args[width_idx + 1], "1280");
-
-        // Verify viewport-height comes with its value
-        let height_idx = args.iter().position(|a| *a == "--viewport-height").unwrap();
-        assert_eq!(args[height_idx + 1], "720");
     }
 
     #[test]

@@ -12,6 +12,7 @@ When asked to do work always spin up multiple agents and work as a team to get t
  - Always ensure the code is linted and or type checked
  - Always ensure the project builds
  - Always ensure the code is DRY
+ - Always ensure you never use an `Any` type, we will always use high quality types in our code
  
 ## When Planning or testing
  - Always see how you can validate a change you have made to ensure its correct

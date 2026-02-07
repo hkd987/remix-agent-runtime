@@ -23,6 +23,11 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         Self { llm, tools, config }
     }
 
+    /// Consume the runner and return the inner tool executor for cleanup.
+    pub fn into_tools(self) -> T {
+        self.tools
+    }
+
     pub async fn run(
         &self,
         task: &str,
@@ -68,9 +73,30 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 .send_messages(system_prompt.as_deref(), state.messages(), Some(tool_defs))
                 .await?;
 
+            state.accumulate_usage(response.usage.as_ref());
+
             match response.stop_reason {
                 StopReason::ToolUse => {
                     let assistant_content = response.content.clone();
+
+                    // Check if there are actually tool_use blocks; if not, treat as end_turn.
+                    let has_tool_use = assistant_content
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+                    if !has_tool_use {
+                        warn!("LLM returned stop_reason=tool_use but no tool_use blocks; treating as end_turn");
+                        let final_text = assistant_content
+                            .iter()
+                            .filter_map(|block| match block {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        state.add_assistant_message(assistant_content);
+                        return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
+                    }
+
                     state.add_assistant_message(assistant_content.clone());
 
                     let mut tool_results = Vec::new();
@@ -510,5 +536,152 @@ mod tests {
             result.steps[0].output,
             json!({"title":"Example","url":"https://example.com"})
         );
+    }
+
+    #[tokio::test]
+    async fn test_token_usage_accumulated_across_iterations() {
+        use crate::llm::types::Usage;
+
+        let llm = MockLlm {
+            responses: Arc::new(Mutex::new(vec![
+                MessagesResponse {
+                    id: "msg_1".to_string(),
+                    content: vec![ContentBlock::ToolUse {
+                        id: "toolu_01".to_string(),
+                        name: "navigate".to_string(),
+                        input: json!({"url": "https://example.com"}),
+                    }],
+                    model: "test-model".to_string(),
+                    stop_reason: StopReason::ToolUse,
+                    usage: Some(Usage {
+                        input_tokens: 100,
+                        output_tokens: 50,
+                    }),
+                },
+                MessagesResponse {
+                    id: "msg_2".to_string(),
+                    content: vec![ContentBlock::Text {
+                        text: "Done".to_string(),
+                    }],
+                    model: "test-model".to_string(),
+                    stop_reason: StopReason::EndTurn,
+                    usage: Some(Usage {
+                        input_tokens: 200,
+                        output_tokens: 30,
+                    }),
+                },
+            ])),
+        };
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![Ok(ToolExecutionResult {
+                content: "Page loaded".to_string(),
+                is_error: false,
+            })])),
+        };
+
+        let runner = AgentRunner::new(llm, tools, default_config());
+        let result = runner.run("Navigate", &CredentialSet::new()).await.unwrap();
+
+        assert_eq!(result.total_input_tokens, Some(300));
+        assert_eq!(result.total_output_tokens, Some(80));
+    }
+
+    #[tokio::test]
+    async fn test_token_usage_none_when_no_usage_reported() {
+        let llm = MockLlm {
+            responses: Arc::new(Mutex::new(vec![make_end_turn_response("Done")])),
+        };
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![])),
+        };
+
+        let runner = AgentRunner::new(llm, tools, default_config());
+        let result = runner.run("Hello", &CredentialSet::new()).await.unwrap();
+
+        assert_eq!(result.total_input_tokens, None);
+        assert_eq!(result.total_output_tokens, None);
+    }
+
+    #[tokio::test]
+    async fn test_tool_use_stop_reason_without_tool_use_blocks() {
+        // If the LLM returns stop_reason=tool_use but no actual tool_use blocks,
+        // the agent should treat it as end_turn rather than creating empty messages.
+        let llm = MockLlm {
+            responses: Arc::new(Mutex::new(vec![MessagesResponse {
+                id: "msg_test".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "I was going to use a tool but decided not to.".to_string(),
+                }],
+                model: "test-model".to_string(),
+                stop_reason: StopReason::ToolUse,
+                usage: None,
+            }])),
+        };
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![])),
+        };
+
+        let runner = AgentRunner::new(llm, tools, default_config());
+        let result = runner
+            .run("Do something", &CredentialSet::new())
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(
+            result.result,
+            Some("I was going to use a tool but decided not to.".to_string())
+        );
+        assert!(result.steps.is_empty());
+        assert_eq!(result.total_iterations, 1);
+    }
+
+    #[tokio::test]
+    async fn test_tool_use_stop_reason_with_empty_content() {
+        // If the LLM returns stop_reason=tool_use with completely empty content,
+        // the agent should treat it as end_turn.
+        let llm = MockLlm {
+            responses: Arc::new(Mutex::new(vec![MessagesResponse {
+                id: "msg_test".to_string(),
+                content: vec![],
+                model: "test-model".to_string(),
+                stop_reason: StopReason::ToolUse,
+                usage: None,
+            }])),
+        };
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![])),
+        };
+
+        let runner = AgentRunner::new(llm, tools, default_config());
+        let result = runner
+            .run("Empty response", &CredentialSet::new())
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.result, Some(String::new()));
+        assert!(result.steps.is_empty());
+        assert_eq!(result.total_iterations, 1);
+    }
+
+    #[test]
+    fn test_into_tools_returns_tool_executor() {
+        let llm = MockLlm {
+            responses: Arc::new(Mutex::new(vec![])),
+        };
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![])),
+        };
+
+        let runner = AgentRunner::new(llm, tools, default_config());
+        let recovered_tools = runner.into_tools();
+        assert_eq!(recovered_tools.tool_definitions().len(), 1);
+        assert_eq!(recovered_tools.tool_definitions()[0].name, "navigate");
     }
 }

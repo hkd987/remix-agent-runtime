@@ -12,6 +12,10 @@ pub struct AgentResult {
     pub total_duration_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_output_tokens: Option<u32>,
 }
 
 /// Status of the agent run.
@@ -46,6 +50,8 @@ impl AgentResult {
             total_iterations: 0,
             total_duration_ms: duration_ms,
             error: None,
+            total_input_tokens: None,
+            total_output_tokens: None,
         }
     }
 
@@ -58,6 +64,8 @@ impl AgentResult {
             total_iterations: 0,
             total_duration_ms: duration_ms,
             error: Some(error),
+            total_input_tokens: None,
+            total_output_tokens: None,
         }
     }
 
@@ -70,6 +78,8 @@ impl AgentResult {
             total_iterations: 0,
             total_duration_ms: duration_ms,
             error: Some("Agent timed out".to_string()),
+            total_input_tokens: None,
+            total_output_tokens: None,
         }
     }
 
@@ -82,6 +92,8 @@ impl AgentResult {
             total_iterations: iterations,
             total_duration_ms: duration_ms,
             error: Some(format!("Max iterations ({iterations}) reached")),
+            total_input_tokens: None,
+            total_output_tokens: None,
         }
     }
 }
@@ -122,6 +134,8 @@ mod tests {
             total_iterations: 5,
             total_duration_ms: 15000,
             error: None,
+            total_input_tokens: None,
+            total_output_tokens: None,
         };
 
         let json = serde_json::to_value(&result).unwrap();
@@ -242,6 +256,8 @@ mod tests {
             total_iterations: 2,
             total_duration_ms: 1700,
             error: None,
+            total_input_tokens: None,
+            total_output_tokens: None,
         };
 
         let json_str = serde_json::to_string(&original).unwrap();
@@ -259,6 +275,8 @@ mod tests {
             total_iterations: 0,
             total_duration_ms: 100,
             error: Some("fail".to_string()),
+            total_input_tokens: None,
+            total_output_tokens: None,
         };
 
         let json = serde_json::to_value(&result).unwrap();
@@ -294,6 +312,25 @@ mod tests {
         let obj = json.as_object().unwrap();
 
         assert!(!obj.contains_key("error"));
+    }
+
+    #[test]
+    fn test_token_fields_omitted_when_none() {
+        let result = AgentResult::success("ok".to_string(), vec![], 100);
+        let json = serde_json::to_value(&result).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(!obj.contains_key("total_input_tokens"));
+        assert!(!obj.contains_key("total_output_tokens"));
+    }
+
+    #[test]
+    fn test_token_fields_present_when_some() {
+        let mut result = AgentResult::success("ok".to_string(), vec![], 100);
+        result.total_input_tokens = Some(500);
+        result.total_output_tokens = Some(200);
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["total_input_tokens"], 500);
+        assert_eq!(json["total_output_tokens"], 200);
     }
 
     #[test]

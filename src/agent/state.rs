@@ -8,6 +8,8 @@ pub struct AgentState {
     steps: Vec<StepRecord>,
     iteration: u32,
     start_time: Instant,
+    total_input_tokens: u32,
+    total_output_tokens: u32,
 }
 
 impl AgentState {
@@ -22,6 +24,8 @@ impl AgentState {
             steps: Vec::new(),
             iteration: 0,
             start_time: Instant::now(),
+            total_input_tokens: 0,
+            total_output_tokens: 0,
         }
     }
 
@@ -59,31 +63,51 @@ impl AgentState {
         self.start_time.elapsed().as_millis() as u64
     }
 
+    pub fn accumulate_usage(&mut self, usage: Option<&crate::llm::types::Usage>) {
+        if let Some(u) = usage {
+            self.total_input_tokens += u.input_tokens;
+            self.total_output_tokens += u.output_tokens;
+        }
+    }
+
     pub fn into_result(self, status: AgentStatus, final_text: Option<String>) -> AgentResult {
         let total_iterations = self.iteration;
         let duration = self.elapsed_ms();
-        match status {
+        let input_tokens = if self.total_input_tokens > 0 {
+            Some(self.total_input_tokens)
+        } else {
+            None
+        };
+        let output_tokens = if self.total_output_tokens > 0 {
+            Some(self.total_output_tokens)
+        } else {
+            None
+        };
+        let mut result = match status {
             AgentStatus::Success => {
-                let mut result =
+                let mut r =
                     AgentResult::success(final_text.unwrap_or_default(), self.steps, duration);
-                result.total_iterations = total_iterations;
-                result
+                r.total_iterations = total_iterations;
+                r
             }
             AgentStatus::Error => {
-                let mut result =
+                let mut r =
                     AgentResult::error(final_text.unwrap_or_default(), self.steps, duration);
-                result.total_iterations = total_iterations;
-                result
+                r.total_iterations = total_iterations;
+                r
             }
             AgentStatus::Timeout => {
-                let mut result = AgentResult::timeout(self.steps, duration);
-                result.total_iterations = total_iterations;
-                result
+                let mut r = AgentResult::timeout(self.steps, duration);
+                r.total_iterations = total_iterations;
+                r
             }
             AgentStatus::MaxIterations => {
                 AgentResult::max_iterations(self.steps, total_iterations, duration)
             }
-        }
+        };
+        result.total_input_tokens = input_tokens;
+        result.total_output_tokens = output_tokens;
+        result
     }
 }
 
@@ -226,5 +250,56 @@ mod tests {
         let state = AgentState::new("task");
         let result = state.into_result(AgentStatus::Success, None);
         assert_eq!(result.result, Some(String::new()));
+    }
+
+    #[test]
+    fn test_accumulate_usage_with_some() {
+        use crate::llm::types::Usage;
+
+        let mut state = AgentState::new("task");
+        let usage1 = Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+        };
+        let usage2 = Usage {
+            input_tokens: 200,
+            output_tokens: 75,
+        };
+        state.accumulate_usage(Some(&usage1));
+        state.accumulate_usage(Some(&usage2));
+        assert_eq!(state.total_input_tokens, 300);
+        assert_eq!(state.total_output_tokens, 125);
+    }
+
+    #[test]
+    fn test_accumulate_usage_with_none() {
+        let mut state = AgentState::new("task");
+        state.accumulate_usage(None);
+        assert_eq!(state.total_input_tokens, 0);
+        assert_eq!(state.total_output_tokens, 0);
+    }
+
+    #[test]
+    fn test_into_result_includes_token_usage() {
+        use crate::llm::types::Usage;
+
+        let mut state = AgentState::new("task");
+        state.increment_iteration();
+        state.accumulate_usage(Some(&Usage {
+            input_tokens: 150,
+            output_tokens: 80,
+        }));
+        let result = state.into_result(AgentStatus::Success, Some("done".to_string()));
+        assert_eq!(result.total_input_tokens, Some(150));
+        assert_eq!(result.total_output_tokens, Some(80));
+    }
+
+    #[test]
+    fn test_into_result_no_token_usage_when_zero() {
+        let mut state = AgentState::new("task");
+        state.increment_iteration();
+        let result = state.into_result(AgentStatus::Success, Some("done".to_string()));
+        assert_eq!(result.total_input_tokens, None);
+        assert_eq!(result.total_output_tokens, None);
     }
 }

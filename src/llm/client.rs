@@ -117,6 +117,17 @@ impl LlmProvider for AnthropicClient {
 
             if status.is_server_error() {
                 let body = response.text().await.unwrap_or_default();
+                if attempt < max_retries - 1 {
+                    let delay_ms = (base_delay_ms * 2u64.pow(attempt)).min(max_delay_ms);
+                    warn!(
+                        attempt = attempt,
+                        delay_ms = delay_ms,
+                        status = status.as_u16(),
+                        "Server error, retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    continue;
+                }
                 return Err(AgentError::Llm(format!(
                     "Server error {}: {}",
                     status.as_u16(),
@@ -436,6 +447,7 @@ mod tests {
             .mock("POST", "/v1/messages")
             .with_status(500)
             .with_body("Internal Server Error")
+            .expect(3)
             .create_async()
             .await;
 
@@ -454,13 +466,103 @@ mod tests {
             }],
         }];
 
+        tokio::time::pause();
         let result = client.send_messages(None, &messages, None).await;
+        tokio::time::resume();
 
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
             matches!(&err, AgentError::Llm(msg) if msg.contains("500") && msg.contains("Internal Server Error"))
         );
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_500_retries_then_succeeds() {
+        let mut server = mockito::Server::new_async().await;
+        let response_json = make_success_response_json();
+
+        // First two calls return 500, third succeeds
+        let mock_500 = server
+            .mock("POST", "/v1/messages")
+            .with_status(500)
+            .with_body("Internal Server Error")
+            .expect(2)
+            .create_async()
+            .await;
+
+        let mock_200 = server
+            .mock("POST", "/v1/messages")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&response_json).unwrap())
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = AnthropicClient::new(
+            server.url(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            8192,
+            Default::default(),
+        );
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "Hello".to_string(),
+            }],
+        }];
+
+        tokio::time::pause();
+        let result = client.send_messages(None, &messages, None).await;
+        tokio::time::resume();
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.id, "msg_test_123");
+
+        mock_500.assert_async().await;
+        mock_200.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_500_exhausts_retries() {
+        let mut server = mockito::Server::new_async().await;
+
+        let mock = server
+            .mock("POST", "/v1/messages")
+            .with_status(500)
+            .with_body("Service Unavailable")
+            .expect(3)
+            .create_async()
+            .await;
+
+        let client = AnthropicClient::new(
+            server.url(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            8192,
+            Default::default(),
+        );
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "Hello".to_string(),
+            }],
+        }];
+
+        tokio::time::pause();
+        let result = client.send_messages(None, &messages, None).await;
+        tokio::time::resume();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(&err, AgentError::Llm(msg) if msg.contains("500")));
 
         mock.assert_async().await;
     }
