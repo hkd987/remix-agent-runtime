@@ -105,17 +105,21 @@ else
 fi
 rm -rf "$TMPDIR5"
 
-# Test 6: install dir fails when unwritable
+# Test 6: install dir fails when unwritable (skip when running as root)
 echo "Test 6: install dir fails when unwritable"
-TMPDIR6=$(mktemp -d)
-chmod 000 "$TMPDIR6"
-if ! resolve_install_dir "$TMPDIR6" >/dev/null 2>&1; then
-  pass "returns error for unwritable dir"
+if [ "$(id -u)" = "0" ]; then
+  pass "skipped (running as root — permissions don't apply)"
 else
-  fail "should fail when dir is unwritable"
+  TMPDIR6=$(mktemp -d)
+  chmod 000 "$TMPDIR6"
+  if ! resolve_install_dir "$TMPDIR6" >/dev/null 2>&1; then
+    pass "returns error for unwritable dir"
+  else
+    fail "should fail when dir is unwritable"
+  fi
+  chmod 755 "$TMPDIR6"
+  rm -rf "$TMPDIR6"
 fi
-chmod 755 "$TMPDIR6"
-rm -rf "$TMPDIR6"
 
 # Test 7: PATH check detects missing dir
 echo "Test 7: PATH check detects missing dir"
