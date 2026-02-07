@@ -105,13 +105,18 @@ else
 fi
 rm -rf "$TMPDIR5"
 
-# Test 6: install dir fails when unwritable (skip when running as root)
+# Test 6: install dir fails when unwritable
 echo "Test 6: install dir fails when unwritable"
-if [ "$(id -u)" = "0" ]; then
-  pass "skipped (running as root — permissions don't apply)"
+TMPDIR6=$(mktemp -d)
+chmod 000 "$TMPDIR6"
+# Verify chmod actually prevents mkdir (some CI runners have elevated capabilities)
+if mkdir -p "$TMPDIR6/.probe" 2>/dev/null; then
+  # chmod 000 doesn't work on this system — skip the test
+  rm -rf "$TMPDIR6/.probe"
+  chmod 755 "$TMPDIR6"
+  rm -rf "$TMPDIR6"
+  pass "skipped (chmod 000 does not restrict mkdir on this system)"
 else
-  TMPDIR6=$(mktemp -d)
-  chmod 000 "$TMPDIR6"
   if ! resolve_install_dir "$TMPDIR6" >/dev/null 2>&1; then
     pass "returns error for unwritable dir"
   else
