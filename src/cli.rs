@@ -1,0 +1,196 @@
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "remix-agent",
+    version,
+    about = "LLM-driven browser automation agent runtime"
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Commands {
+    /// Run an agent task
+    Run(RunArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct RunArgs {
+    /// Task to execute (natural language)
+    pub task: Option<String>,
+
+    /// Path to YAML configuration file
+    #[arg(short, long)]
+    pub config: Option<PathBuf>,
+
+    /// LLM provider base URL
+    #[arg(long, env = "REMIX_LLM_BASE_URL")]
+    pub base_url: Option<String>,
+
+    /// LLM API key
+    #[arg(long, env = "REMIX_LLM_API_KEY")]
+    pub api_key: Option<String>,
+
+    /// LLM model identifier
+    #[arg(long, env = "REMIX_LLM_MODEL")]
+    pub model: Option<String>,
+
+    /// Maximum tokens per LLM response
+    #[arg(long)]
+    pub max_tokens: Option<u32>,
+
+    /// Maximum duration in seconds
+    #[arg(long)]
+    pub timeout: Option<u64>,
+
+    /// Maximum agent loop iterations
+    #[arg(long)]
+    pub max_iterations: Option<u32>,
+
+    /// Run browser in headed mode (visible)
+    #[arg(long)]
+    pub headed: bool,
+
+    /// Enable verbose logging to stderr
+    #[arg(short, long)]
+    pub verbose: bool,
+
+    /// Write results to file instead of stdout
+    #[arg(short, long)]
+    pub output: Option<PathBuf>,
+
+    /// Path to remix-browser binary
+    #[arg(long, env = "REMIX_BROWSER_PATH")]
+    pub browser_path: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_parse_run_with_task() {
+        let cli = Cli::parse_from(["remix-agent", "run", "navigate to google.com"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.task, Some("navigate to google.com".to_string()));
+                assert!(args.config.is_none());
+                assert!(args.base_url.is_none());
+                assert!(args.api_key.is_none());
+                assert!(args.model.is_none());
+                assert!(args.max_tokens.is_none());
+                assert!(args.timeout.is_none());
+                assert!(args.max_iterations.is_none());
+                assert!(!args.headed);
+                assert!(!args.verbose);
+                assert!(args.output.is_none());
+                assert!(args.browser_path.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_run_without_task() {
+        let cli = Cli::parse_from(["remix-agent", "run"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert!(args.task.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_run_with_config() {
+        let cli = Cli::parse_from(["remix-agent", "run", "--config", "task.yaml"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.config, Some(PathBuf::from("task.yaml")));
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_run_with_all_flags() {
+        let cli = Cli::parse_from([
+            "remix-agent",
+            "run",
+            "--config",
+            "task.yaml",
+            "--base-url",
+            "https://api.example.com",
+            "--api-key",
+            "sk-test",
+            "--model",
+            "gpt-4",
+            "--max-tokens",
+            "4096",
+            "--timeout",
+            "600",
+            "--max-iterations",
+            "100",
+            "--headed",
+            "--verbose",
+            "--output",
+            "result.json",
+            "--browser-path",
+            "/usr/local/bin/remix-browser",
+            "do something",
+        ]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.task, Some("do something".to_string()));
+                assert_eq!(args.config, Some(PathBuf::from("task.yaml")));
+                assert_eq!(args.base_url, Some("https://api.example.com".to_string()));
+                assert_eq!(args.api_key, Some("sk-test".to_string()));
+                assert_eq!(args.model, Some("gpt-4".to_string()));
+                assert_eq!(args.max_tokens, Some(4096));
+                assert_eq!(args.timeout, Some(600));
+                assert_eq!(args.max_iterations, Some(100));
+                assert!(args.headed);
+                assert!(args.verbose);
+                assert_eq!(args.output, Some(PathBuf::from("result.json")));
+                assert_eq!(
+                    args.browser_path,
+                    Some("/usr/local/bin/remix-browser".to_string())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_run_short_flags() {
+        let cli = Cli::parse_from([
+            "remix-agent",
+            "run",
+            "-c",
+            "task.yaml",
+            "-v",
+            "-o",
+            "out.json",
+        ]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.config, Some(PathBuf::from("task.yaml")));
+                assert!(args.verbose);
+                assert_eq!(args.output, Some(PathBuf::from("out.json")));
+            }
+        }
+    }
+
+    #[test]
+    fn test_missing_subcommand_fails() {
+        let result = Cli::try_parse_from(["remix-agent"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_invalid_subcommand_fails() {
+        let result = Cli::try_parse_from(["remix-agent", "invalid"]);
+        assert!(result.is_err());
+    }
+}
