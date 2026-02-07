@@ -31,11 +31,16 @@ esac
 
 TARGET="${ARCH_TARGET}-${OS_TARGET}"
 
-# Determine install directory
-INSTALL_DIR="/usr/local/bin"
-if [ ! -w "$INSTALL_DIR" ]; then
-  INSTALL_DIR="$HOME/.local/bin"
-  mkdir -p "$INSTALL_DIR"
+# Determine install directory (prefer ~/.local/bin, aligned with remix-browser)
+INSTALL_DIR="$HOME/.local/bin"
+if mkdir -p "$INSTALL_DIR" 2>/dev/null; then
+  : # success
+else
+  INSTALL_DIR="/usr/local/bin"
+  if [ ! -w "$INSTALL_DIR" ]; then
+    echo "Error: Cannot write to $HOME/.local/bin or /usr/local/bin"
+    exit 1
+  fi
 fi
 
 # install_binary <repo> <binary_name>
@@ -62,6 +67,12 @@ install_binary() {
   echo "Extracting..."
   tar xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR"
 
+  # If a symlink exists (e.g., from plugin install), remove it before copying
+  if [ -L "$INSTALL_DIR/$BINARY" ]; then
+    echo "Replacing existing symlink at $INSTALL_DIR/$BINARY with standalone binary..."
+    rm -f "$INSTALL_DIR/$BINARY"
+  fi
+
   cp "$TMPDIR/$BINARY" "$INSTALL_DIR/$BINARY"
   chmod +x "$INSTALL_DIR/$BINARY"
   rm -rf "$TMPDIR"
@@ -81,19 +92,39 @@ fi
 # --- Install remix-agent ---
 install_binary "hkd987/remix-agent-runtime" "remix-agent"
 
-# --- Done ---
-echo "Setup complete! Both remix-agent and remix-browser are ready."
+# --- Verify installation ---
+echo "Setup complete!"
 echo ""
-echo "Usage:"
-echo "  export REMIX_LLM_API_KEY=sk-ant-your-key-here"
-echo "  remix-agent run \"Navigate to example.com and tell me what's on the page\""
+
+# Check each binary
+for bin in remix-agent remix-browser; do
+  resolved=$(command -v "$bin" 2>/dev/null || true)
+  if [ -n "$resolved" ]; then
+    echo "  $bin -> $resolved"
+  elif [ -f "$INSTALL_DIR/$bin" ]; then
+    echo "  $bin -> $INSTALL_DIR/$bin (not on PATH)"
+  else
+    echo "  $bin -> NOT FOUND"
+  fi
+done
 echo ""
 
 # Check if install dir is in PATH
 case ":$PATH:" in
-  *":$INSTALL_DIR:"*) ;;
+  *":$INSTALL_DIR:"*)
+    echo "Usage:"
+    echo "  export REMIX_LLM_API_KEY=sk-ant-your-key-here"
+    echo "  remix-agent run \"Navigate to example.com and tell me what's on the page\""
+    ;;
   *)
-    echo "Warning: $INSTALL_DIR is not in your PATH."
-    echo "Add it with: export PATH=\"$INSTALL_DIR:\$PATH\""
+    echo "ACTION REQUIRED: $INSTALL_DIR is not in your PATH."
+    echo ""
+    echo "Run this now:"
+    echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
+    echo ""
+    echo "To make it permanent, add the line above to your shell profile:"
+    echo "  bash -> ~/.bashrc"
+    echo "  zsh  -> ~/.zshrc"
     ;;
 esac
+echo ""
