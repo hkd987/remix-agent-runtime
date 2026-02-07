@@ -20,12 +20,12 @@ symlink_guard() {
 
 resolve_install_dir() {
   local home_dir="$1"
+  local fallback="${2:-/usr/local/bin}"
   local local_bin="$home_dir/.local/bin"
   if mkdir -p "$local_bin" 2>/dev/null; then
     echo "$local_bin"
     return 0
   fi
-  local fallback="/usr/local/bin"
   if [ -w "$fallback" ]; then
     echo "$fallback"
     return 0
@@ -105,25 +105,12 @@ else
 fi
 rm -rf "$TMPDIR5"
 
-# Test 6: install dir fails when unwritable
+# Test 6: install dir fails when both paths are unwritable
 echo "Test 6: install dir fails when unwritable"
-TMPDIR6=$(mktemp -d)
-chmod 000 "$TMPDIR6"
-# Verify chmod actually prevents mkdir (some CI runners have elevated capabilities)
-if mkdir -p "$TMPDIR6/.probe" 2>/dev/null; then
-  # chmod 000 doesn't work on this system — skip the test
-  rm -rf "$TMPDIR6/.probe"
-  chmod 755 "$TMPDIR6"
-  rm -rf "$TMPDIR6"
-  pass "skipped (chmod 000 does not restrict mkdir on this system)"
+if ! resolve_install_dir "/dev" "/dev/null/nonexistent" >/dev/null 2>&1; then
+  pass "returns error for unwritable dir"
 else
-  if ! resolve_install_dir "$TMPDIR6" >/dev/null 2>&1; then
-    pass "returns error for unwritable dir"
-  else
-    fail "should fail when dir is unwritable"
-  fi
-  chmod 755 "$TMPDIR6"
-  rm -rf "$TMPDIR6"
+  fail "should fail when dir is unwritable"
 fi
 
 # Test 7: PATH check detects missing dir
