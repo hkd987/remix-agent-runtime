@@ -17,6 +17,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+remix-credentials = { git = "https://github.com/hkd987/remix-credentials" }
 rmcp = { version = "0.14", features = ["client", "transport-child-process"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

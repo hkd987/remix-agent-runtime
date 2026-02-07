@@ -73,9 +73,6 @@ pub fn load_config(args: &RunArgs) -> Result<AppConfig, AgentError> {
         config.task = args.task.clone();
     }
 
-    // Normalize credentials
-    config.credentials = credentials::load_credentials_from_config(&config.credentials);
-
     Ok(config)
 }
 
@@ -370,12 +367,17 @@ credentials:
         };
         let config = load_config(&args).unwrap();
         assert_eq!(config.credentials.len(), 1);
-        let cred = &config.credentials[0];
-        assert_eq!(cred.fields.get("username").unwrap(), "admin");
-        assert_eq!(cred.fields.get("password").unwrap(), "secret");
-        // username/password flat fields should be cleared after normalization
-        assert!(cred.username.is_none());
-        assert!(cred.password.is_none());
+        let raw = &config.credentials[0];
+        // Raw credentials preserve flat fields — normalization happens at conversion boundary
+        assert_eq!(raw.username.as_deref(), Some("admin"));
+        assert_eq!(raw.password.as_deref(), Some("secret"));
+        assert_eq!(raw.url_pattern.as_deref(), Some("*.test.com"));
+
+        // Verify they convert correctly to real CredentialSet
+        let set = credentials::convert_raw_credentials(&config.credentials).unwrap();
+        let cred = set.get("test_login").unwrap();
+        assert_eq!(cred.field("username").unwrap().expose(), "admin");
+        assert_eq!(cred.field("password").unwrap().expose(), "secret");
     }
 
     #[test]

@@ -2,9 +2,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::error::AgentError;
+
+// Re-export real crate types for use throughout the runtime
+pub use remix_credentials::{Credential, CredentialSet, CredentialType};
+
+/// Raw credential type for YAML deserialization.
+/// Maps to `remix_credentials::CredentialType` during conversion.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum CredentialType {
+pub enum RawCredentialType {
     UsernamePassword,
     ApiKey,
     Token,
@@ -12,15 +19,18 @@ pub enum CredentialType {
     Custom,
 }
 
-fn default_credential_type() -> CredentialType {
-    CredentialType::UsernamePassword
+fn default_credential_type() -> RawCredentialType {
+    RawCredentialType::UsernamePassword
 }
 
+/// Raw credential struct for YAML config deserialization.
+/// Implements `Clone` (required for `AppConfig`). Converted to the real
+/// `remix_credentials::Credential` at the boundary via [`convert_raw_credentials`].
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
-pub struct Credential {
+pub struct RawCredential {
     pub name: String,
     #[serde(default = "default_credential_type")]
-    pub credential_type: CredentialType,
+    pub credential_type: RawCredentialType,
     #[serde(default)]
     pub fields: HashMap<String, String>,
     pub url_pattern: Option<String>,
@@ -30,11 +40,11 @@ pub struct Credential {
     pub password: Option<String>,
 }
 
-impl fmt::Debug for Credential {
+impl fmt::Debug for RawCredential {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let redacted_fields: HashMap<&String, &str> =
             self.fields.keys().map(|k| (k, "***")).collect();
-        f.debug_struct("Credential")
+        f.debug_struct("RawCredential")
             .field("name", &self.name)
             .field("credential_type", &self.credential_type)
             .field("fields", &redacted_fields)
@@ -46,44 +56,65 @@ impl fmt::Debug for Credential {
     }
 }
 
-/// Normalizes credentials by moving flat username/password fields into the
-/// `fields` map when present. This allows YAML configs to use the convenient
-/// flat syntax while the rest of the system always reads from `fields`.
-pub fn load_credentials_from_config(creds: &[Credential]) -> Vec<Credential> {
-    creds
-        .iter()
-        .map(|cred| {
-            let mut normalized = cred.clone();
-            if let Some(ref username) = cred.username {
-                normalized
-                    .fields
-                    .entry("username".to_string())
-                    .or_insert_with(|| username.clone());
+/// Normalizes flat username/password into the fields map, then converts
+/// `RawCredential` values into real `remix_credentials::Credential` values
+/// collected into a `CredentialSet`.
+pub fn convert_raw_credentials(raws: &[RawCredential]) -> Result<CredentialSet, AgentError> {
+    let mut set = CredentialSet::new();
+
+    for raw in raws {
+        let mut fields: Vec<(String, String)> = raw
+            .fields
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        // Normalize flat username/password into fields (don't overwrite existing)
+        if let Some(ref username) = raw.username {
+            if !raw.fields.contains_key("username") {
+                fields.push(("username".to_string(), username.clone()));
             }
-            if let Some(ref password) = cred.password {
-                normalized
-                    .fields
-                    .entry("password".to_string())
-                    .or_insert_with(|| password.clone());
+        }
+        if let Some(ref password) = raw.password {
+            if !raw.fields.contains_key("password") {
+                fields.push(("password".to_string(), password.clone()));
             }
-            normalized.username = None;
-            normalized.password = None;
-            normalized
-        })
-        .collect()
+        }
+
+        let cred_type = match raw.credential_type {
+            RawCredentialType::UsernamePassword => CredentialType::UsernamePassword,
+            RawCredentialType::ApiKey => CredentialType::ApiKey,
+            RawCredentialType::Token => CredentialType::Token,
+            RawCredentialType::Cookie => CredentialType::Cookie,
+            RawCredentialType::Custom => CredentialType::Custom,
+        };
+
+        let credential = remix_credentials::Credential::new(
+            raw.name.clone(),
+            cred_type,
+            fields,
+            raw.url_pattern.clone(),
+            raw.metadata.clone(),
+        )
+        .map_err(|e| AgentError::Config(format!("Invalid credential '{}': {}", raw.name, e)))?;
+
+        set.add(credential);
+    }
+
+    Ok(set)
 }
 
 /// Formats credentials for inclusion in an LLM system prompt.
 /// Returns `None` if no credentials are provided.
-pub fn inject_credentials_into_system_prompt(creds: &[Credential]) -> Option<String> {
+pub fn inject_credentials_into_system_prompt(creds: &CredentialSet) -> Option<String> {
     if creds.is_empty() {
         return None;
     }
 
     let mut lines = vec!["Available credentials:".to_string()];
 
-    for cred in creds {
-        let type_str = match cred.credential_type {
+    for cred in creds.iter() {
+        let type_str = match cred.credential_type() {
             CredentialType::UsernamePassword => "username_password",
             CredentialType::ApiKey => "api_key",
             CredentialType::Token => "token",
@@ -91,16 +122,18 @@ pub fn inject_credentials_into_system_prompt(creds: &[Credential]) -> Option<Str
             CredentialType::Custom => "custom",
         };
 
-        let pattern = cred.url_pattern.as_deref().unwrap_or("*");
+        let pattern = cred.url_pattern().unwrap_or("*");
 
-        lines.push(format!("- {} ({}) for {}:", cred.name, type_str, pattern));
+        lines.push(format!("- {} ({}) for {}:", cred.name(), type_str, pattern));
 
         // Emit fields sorted by key for deterministic output
-        let mut sorted_fields: Vec<_> = cred.fields.iter().collect();
-        sorted_fields.sort_by_key(|(k, _)| (*k).clone());
+        let mut sorted_keys: Vec<&String> = cred.fields().keys().collect();
+        sorted_keys.sort();
 
-        for (key, value) in sorted_fields {
-            lines.push(format!("  {}: {}", key, value));
+        for key in sorted_keys {
+            if let Some(secret) = cred.field(key) {
+                lines.push(format!("  {}: {}", key, secret.expose()));
+            }
         }
     }
 
@@ -111,15 +144,15 @@ pub fn inject_credentials_into_system_prompt(creds: &[Credential]) -> Option<Str
 mod tests {
     use super::*;
 
-    fn make_credential(
+    fn make_raw_credential(
         name: &str,
-        cred_type: CredentialType,
+        cred_type: RawCredentialType,
         fields: Vec<(&str, &str)>,
         url_pattern: Option<&str>,
         username: Option<&str>,
         password: Option<&str>,
-    ) -> Credential {
-        Credential {
+    ) -> RawCredential {
+        RawCredential {
             name: name.to_string(),
             credential_type: cred_type,
             fields: fields
@@ -133,93 +166,214 @@ mod tests {
         }
     }
 
+    fn make_credential_set(
+        creds: Vec<(&str, CredentialType, Vec<(&str, &str)>, Option<&str>)>,
+    ) -> CredentialSet {
+        let mut set = CredentialSet::new();
+        for (name, cred_type, fields, url_pattern) in creds {
+            let field_vec: Vec<(String, String)> = fields
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            set.add(
+                remix_credentials::Credential::new(
+                    name.to_string(),
+                    cred_type,
+                    field_vec,
+                    url_pattern.map(|s| s.to_string()),
+                    HashMap::new(),
+                )
+                .unwrap(),
+            );
+        }
+        set
+    }
+
+    // --- RawCredential tests ---
+
     #[test]
     fn test_debug_redacts_fields() {
-        let cred = make_credential(
+        let cred = make_raw_credential(
             "test",
-            CredentialType::UsernamePassword,
+            RawCredentialType::UsernamePassword,
             vec![("password", "s3cret_value")],
             None,
             Some("alice_jones"),
             Some("hunter2"),
         );
         let debug_str = format!("{:?}", cred);
-        // Actual secret values must not appear in debug output
         assert!(!debug_str.contains("s3cret_value"));
         assert!(!debug_str.contains("alice_jones"));
         assert!(!debug_str.contains("hunter2"));
-        // Redaction markers must appear
         assert!(debug_str.contains("***"));
-        // Struct field name "password" is expected (it's a key, not a value)
         assert!(debug_str.contains("password"));
         assert!(debug_str.contains("test"));
     }
 
     #[test]
     fn test_debug_redacts_no_fields() {
-        let cred = make_credential("empty", CredentialType::Custom, vec![], None, None, None);
+        let cred =
+            make_raw_credential("empty", RawCredentialType::Custom, vec![], None, None, None);
         let debug_str = format!("{:?}", cred);
         assert!(debug_str.contains("empty"));
     }
 
+    // --- convert_raw_credentials tests ---
+
     #[test]
-    fn test_load_credentials_normalizes_username_password() {
-        let creds = vec![make_credential(
+    fn test_convert_normalizes_username_password() {
+        let raws = vec![make_raw_credential(
             "login",
-            CredentialType::UsernamePassword,
+            RawCredentialType::UsernamePassword,
             vec![],
             Some("*.example.com"),
             Some("user@example.com"),
             Some("s3cret"),
         )];
-        let normalized = load_credentials_from_config(&creds);
-        assert_eq!(normalized.len(), 1);
-        let cred = &normalized[0];
-        assert_eq!(cred.fields.get("username").unwrap(), "user@example.com");
-        assert_eq!(cred.fields.get("password").unwrap(), "s3cret");
-        assert!(cred.username.is_none());
-        assert!(cred.password.is_none());
+        let set = convert_raw_credentials(&raws).unwrap();
+        assert_eq!(set.len(), 1);
+        let cred = set.get("login").unwrap();
+        assert_eq!(cred.field("username").unwrap().expose(), "user@example.com");
+        assert_eq!(cred.field("password").unwrap().expose(), "s3cret");
     }
 
     #[test]
-    fn test_load_credentials_does_not_overwrite_existing_fields() {
-        let creds = vec![make_credential(
+    fn test_convert_does_not_overwrite_existing_fields() {
+        let raws = vec![make_raw_credential(
             "login",
-            CredentialType::UsernamePassword,
-            vec![("username", "existing_user")],
+            RawCredentialType::UsernamePassword,
+            vec![("username", "existing_user"), ("password", "existing_pass")],
             None,
             Some("new_user"),
-            None,
+            Some("new_pass"),
         )];
-        let normalized = load_credentials_from_config(&creds);
+        let set = convert_raw_credentials(&raws).unwrap();
+        let cred = set.get("login").unwrap();
+        assert_eq!(cred.field("username").unwrap().expose(), "existing_user");
+        assert_eq!(cred.field("password").unwrap().expose(), "existing_pass");
+    }
+
+    #[test]
+    fn test_convert_empty() {
+        let set = convert_raw_credentials(&[]).unwrap();
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn test_convert_all_types() {
+        let raws = vec![
+            make_raw_credential(
+                "up",
+                RawCredentialType::UsernamePassword,
+                vec![("username", "u"), ("password", "p")],
+                None,
+                None,
+                None,
+            ),
+            make_raw_credential(
+                "ak",
+                RawCredentialType::ApiKey,
+                vec![("api_key", "k")],
+                None,
+                None,
+                None,
+            ),
+            make_raw_credential(
+                "tok",
+                RawCredentialType::Token,
+                vec![("token", "t")],
+                None,
+                None,
+                None,
+            ),
+            make_raw_credential(
+                "ck",
+                RawCredentialType::Cookie,
+                vec![("cookie", "c")],
+                None,
+                None,
+                None,
+            ),
+            make_raw_credential(
+                "cust",
+                RawCredentialType::Custom,
+                vec![("x", "y")],
+                None,
+                None,
+                None,
+            ),
+        ];
+        let set = convert_raw_credentials(&raws).unwrap();
+        assert_eq!(set.len(), 5);
         assert_eq!(
-            normalized[0].fields.get("username").unwrap(),
-            "existing_user"
+            set.get("up").unwrap().credential_type(),
+            CredentialType::UsernamePassword
+        );
+        assert_eq!(
+            set.get("ak").unwrap().credential_type(),
+            CredentialType::ApiKey
+        );
+        assert_eq!(
+            set.get("tok").unwrap().credential_type(),
+            CredentialType::Token
+        );
+        assert_eq!(
+            set.get("ck").unwrap().credential_type(),
+            CredentialType::Cookie
+        );
+        assert_eq!(
+            set.get("cust").unwrap().credential_type(),
+            CredentialType::Custom
         );
     }
 
     #[test]
-    fn test_load_credentials_empty() {
-        let normalized = load_credentials_from_config(&[]);
-        assert!(normalized.is_empty());
+    fn test_convert_validation_error_empty_name() {
+        let raws = vec![make_raw_credential(
+            "",
+            RawCredentialType::ApiKey,
+            vec![("api_key", "k")],
+            None,
+            None,
+            None,
+        )];
+        let result = convert_raw_credentials(&raws);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("name"));
     }
 
     #[test]
+    fn test_convert_validation_error_missing_required_field() {
+        let raws = vec![make_raw_credential(
+            "bad",
+            RawCredentialType::ApiKey,
+            vec![],
+            None,
+            None,
+            None,
+        )];
+        let result = convert_raw_credentials(&raws);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("api_key"));
+    }
+
+    // --- inject_credentials_into_system_prompt tests ---
+
+    #[test]
     fn test_inject_credentials_none_when_empty() {
-        assert!(inject_credentials_into_system_prompt(&[]).is_none());
+        let set = CredentialSet::new();
+        assert!(inject_credentials_into_system_prompt(&set).is_none());
     }
 
     #[test]
     fn test_inject_credentials_formats_correctly() {
-        let creds = vec![make_credential(
+        let set = make_credential_set(vec![(
             "example_login",
             CredentialType::UsernamePassword,
             vec![("password", "s3cret"), ("username", "user@example.com")],
             Some("*.example.com"),
-            None,
-            None,
-        )];
-        let prompt = inject_credentials_into_system_prompt(&creds).unwrap();
+        )]);
+        let prompt = inject_credentials_into_system_prompt(&set).unwrap();
         assert!(prompt.contains("Available credentials:"));
         assert!(prompt.contains("example_login (username_password) for *.example.com:"));
         assert!(prompt.contains("  username: user@example.com"));
@@ -228,61 +382,55 @@ mod tests {
 
     #[test]
     fn test_inject_credentials_default_pattern() {
-        let creds = vec![make_credential(
+        let set = make_credential_set(vec![(
             "my_api",
             CredentialType::ApiKey,
-            vec![("key", "abc123")],
+            vec![("api_key", "abc123")],
             None,
-            None,
-            None,
-        )];
-        let prompt = inject_credentials_into_system_prompt(&creds).unwrap();
+        )]);
+        let prompt = inject_credentials_into_system_prompt(&set).unwrap();
         assert!(prompt.contains("my_api (api_key) for *:"));
     }
 
     #[test]
     fn test_inject_credentials_multiple() {
-        let creds = vec![
-            make_credential(
+        let set = make_credential_set(vec![
+            (
                 "login1",
                 CredentialType::UsernamePassword,
-                vec![("username", "u1")],
+                vec![("username", "u1"), ("password", "p1")],
                 Some("a.com"),
-                None,
-                None,
             ),
-            make_credential(
+            (
                 "login2",
                 CredentialType::Token,
                 vec![("token", "tok123")],
                 Some("b.com"),
-                None,
-                None,
             ),
-        ];
-        let prompt = inject_credentials_into_system_prompt(&creds).unwrap();
+        ]);
+        let prompt = inject_credentials_into_system_prompt(&set).unwrap();
         assert!(prompt.contains("login1 (username_password) for a.com:"));
         assert!(prompt.contains("login2 (token) for b.com:"));
     }
 
     #[test]
-    fn test_credential_type_serde_roundtrip() {
+    fn test_raw_credential_type_serde_roundtrip() {
         let types = vec![
-            CredentialType::UsernamePassword,
-            CredentialType::ApiKey,
-            CredentialType::Token,
-            CredentialType::Cookie,
-            CredentialType::Custom,
+            RawCredentialType::UsernamePassword,
+            RawCredentialType::ApiKey,
+            RawCredentialType::Token,
+            RawCredentialType::Cookie,
+            RawCredentialType::Custom,
         ];
         for ct in types {
             let json = serde_json::to_string(&ct).unwrap();
-            let deserialized: CredentialType = serde_json::from_str(&json).unwrap();
+            let deserialized: RawCredentialType = serde_json::from_str(&json).unwrap();
             assert_eq!(ct, deserialized);
         }
     }
 
     #[test]
-    fn test_credential_yaml_deserialization() {
+    fn test_raw_credential_yaml_deserialization() {
         let yaml = r#"
 name: test_cred
 credential_type: api_key
@@ -290,40 +438,64 @@ fields:
   api_key: "my-secret-key"
 url_pattern: "*.api.com"
 "#;
-        let cred: Credential = serde_yaml::from_str(yaml).unwrap();
+        let cred: RawCredential = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cred.name, "test_cred");
-        assert_eq!(cred.credential_type, CredentialType::ApiKey);
+        assert_eq!(cred.credential_type, RawCredentialType::ApiKey);
         assert_eq!(cred.fields.get("api_key").unwrap(), "my-secret-key");
         assert_eq!(cred.url_pattern.as_deref(), Some("*.api.com"));
     }
 
     #[test]
-    fn test_credential_default_type() {
+    fn test_raw_credential_default_type() {
         let yaml = r#"
 name: default_type_cred
 fields: {}
 "#;
-        let cred: Credential = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(cred.credential_type, CredentialType::UsernamePassword);
+        let cred: RawCredential = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cred.credential_type, RawCredentialType::UsernamePassword);
     }
 
     #[test]
     fn test_all_credential_types_in_prompt() {
         let types = vec![
-            (CredentialType::UsernamePassword, "username_password"),
-            (CredentialType::ApiKey, "api_key"),
-            (CredentialType::Token, "token"),
-            (CredentialType::Cookie, "cookie"),
-            (CredentialType::Custom, "custom"),
+            (
+                CredentialType::UsernamePassword,
+                "username_password",
+                vec![("username", "u"), ("password", "p")],
+            ),
+            (CredentialType::ApiKey, "api_key", vec![("api_key", "k")]),
+            (CredentialType::Token, "token", vec![("token", "t")]),
+            (CredentialType::Cookie, "cookie", vec![("cookie", "c")]),
+            (CredentialType::Custom, "custom", vec![("x", "y")]),
         ];
-        for (ct, expected_str) in types {
-            let creds = vec![make_credential("t", ct, vec![], None, None, None)];
-            let prompt = inject_credentials_into_system_prompt(&creds).unwrap();
+        for (ct, expected_str, fields) in types {
+            let set = make_credential_set(vec![("t", ct, fields, None)]);
+            let prompt = inject_credentials_into_system_prompt(&set).unwrap();
             assert!(
                 prompt.contains(expected_str),
                 "Expected '{}' in prompt for credential type",
                 expected_str
             );
         }
+    }
+
+    // --- YAML backward compatibility ---
+
+    #[test]
+    fn test_yaml_backward_compat_flat_username_password() {
+        let yaml = r#"
+name: "site_login"
+credential_type: username_password
+username: "admin"
+password: "secret"
+url_pattern: "*.example.com"
+"#;
+        let raw: RawCredential = serde_yaml::from_str(yaml).unwrap();
+        let set = convert_raw_credentials(&[raw]).unwrap();
+        assert_eq!(set.len(), 1);
+        let cred = set.get("site_login").unwrap();
+        assert_eq!(cred.field("username").unwrap().expose(), "admin");
+        assert_eq!(cred.field("password").unwrap().expose(), "secret");
+        assert_eq!(cred.url_pattern(), Some("*.example.com"));
     }
 }

@@ -3,7 +3,7 @@ use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::browser::mcp::ToolExecutor;
-use crate::config::credentials::{inject_credentials_into_system_prompt, Credential};
+use crate::config::credentials::{inject_credentials_into_system_prompt, CredentialSet};
 use crate::config::schema::AgentConfig;
 use crate::error::AgentError;
 use crate::llm::client::LlmProvider;
@@ -26,7 +26,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
     pub async fn run(
         &self,
         task: &str,
-        credentials: &[Credential],
+        credentials: &CredentialSet,
     ) -> Result<AgentResult, AgentError> {
         let mut state = AgentState::new(task);
 
@@ -268,7 +268,10 @@ mod tests {
         };
 
         let runner = AgentRunner::new(llm, tools, default_config());
-        let result = runner.run("Navigate to example.com", &[]).await.unwrap();
+        let result = runner
+            .run("Navigate to example.com", &CredentialSet::new())
+            .await
+            .unwrap();
 
         assert_eq!(result.status, AgentStatus::Success);
         assert_eq!(
@@ -291,7 +294,10 @@ mod tests {
         };
 
         let runner = AgentRunner::new(llm, tools, default_config());
-        let result = runner.run("Just say hello", &[]).await.unwrap();
+        let result = runner
+            .run("Just say hello", &CredentialSet::new())
+            .await
+            .unwrap();
 
         assert_eq!(result.status, AgentStatus::Success);
         assert_eq!(result.result, Some("Nothing to do".to_string()));
@@ -320,7 +326,10 @@ mod tests {
         };
 
         let runner = AgentRunner::new(llm, tools, config);
-        let result = runner.run("Loop forever", &[]).await.unwrap();
+        let result = runner
+            .run("Loop forever", &CredentialSet::new())
+            .await
+            .unwrap();
 
         assert_eq!(result.status, AgentStatus::MaxIterations);
         assert_eq!(result.total_iterations, 2);
@@ -343,7 +352,10 @@ mod tests {
         };
 
         let runner = AgentRunner::new(llm, tools, default_config());
-        let result = runner.run("Navigate to bad.com", &[]).await.unwrap();
+        let result = runner
+            .run("Navigate to bad.com", &CredentialSet::new())
+            .await
+            .unwrap();
 
         assert_eq!(result.status, AgentStatus::Success);
         assert_eq!(result.steps.len(), 1);
@@ -400,7 +412,10 @@ mod tests {
         };
 
         let runner = AgentRunner::new(llm, tools, default_config());
-        let result = runner.run("Open two pages", &[]).await.unwrap();
+        let result = runner
+            .run("Open two pages", &CredentialSet::new())
+            .await
+            .unwrap();
 
         assert_eq!(result.status, AgentStatus::Success);
         assert_eq!(result.steps.len(), 2);
@@ -426,17 +441,20 @@ mod tests {
             results: Arc::new(Mutex::new(vec![])),
         };
 
-        let credentials = vec![Credential {
-            name: "test_cred".to_string(),
-            credential_type: crate::config::credentials::CredentialType::UsernamePassword,
-            fields: [("username".to_string(), "admin".to_string())]
-                .into_iter()
-                .collect(),
-            url_pattern: Some("*.example.com".to_string()),
-            metadata: Default::default(),
-            username: None,
-            password: None,
-        }];
+        let mut credentials = CredentialSet::new();
+        credentials.add(
+            remix_credentials::Credential::new(
+                "test_cred".to_string(),
+                remix_credentials::CredentialType::UsernamePassword,
+                vec![
+                    ("username".to_string(), "admin".to_string()),
+                    ("password".to_string(), "pass".to_string()),
+                ],
+                Some("*.example.com".to_string()),
+                Default::default(),
+            )
+            .unwrap(),
+        );
 
         let runner = AgentRunner::new(llm, tools, config);
         let result = runner
@@ -458,7 +476,7 @@ mod tests {
         };
 
         let runner = AgentRunner::new(llm, tools, default_config());
-        let result = runner.run("Fail", &[]).await;
+        let result = runner.run("Fail", &CredentialSet::new()).await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), AgentError::Llm(_)));
@@ -485,7 +503,7 @@ mod tests {
         };
 
         let runner = AgentRunner::new(llm, tools, default_config());
-        let result = runner.run("Navigate", &[]).await.unwrap();
+        let result = runner.run("Navigate", &CredentialSet::new()).await.unwrap();
 
         // JSON content should be parsed into a Value::Object, not a string
         assert_eq!(

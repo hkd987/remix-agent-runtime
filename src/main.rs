@@ -7,6 +7,7 @@ use remix_agent_runtime::browser::manager::BrowserManager;
 use remix_agent_runtime::browser::mcp::McpBrowserClient;
 use remix_agent_runtime::browser::ToolExecutor;
 use remix_agent_runtime::cli::{Cli, Commands};
+use remix_agent_runtime::config::credentials;
 use remix_agent_runtime::config::load_config;
 use remix_agent_runtime::error::ExitStatus;
 use remix_agent_runtime::llm::client::AnthropicClient;
@@ -88,9 +89,18 @@ async fn main() -> ExitCode {
                 config.on_error.as_ref().map(|w| w.url.clone()),
             );
 
+            // Convert raw credentials to real CredentialSet
+            let credential_set = match credentials::convert_raw_credentials(&config.credentials) {
+                Ok(cs) => cs,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    return ExitStatus::ConfigError.into();
+                }
+            };
+
             // Run agent
             let runner = AgentRunner::new(llm_client, mcp_client, config.agent.clone());
-            let result = runner.run(&task, &config.credentials).await;
+            let result = runner.run(&task, &credential_set).await;
 
             match result {
                 Ok(agent_result) => {

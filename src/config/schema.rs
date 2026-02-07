@@ -12,7 +12,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
-    pub credentials: Vec<super::credentials::Credential>,
+    pub credentials: Vec<super::credentials::RawCredential>,
     pub on_complete: Option<WebhookConfig>,
     pub on_error: Option<WebhookConfig>,
 }
