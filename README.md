@@ -52,7 +52,6 @@ LLM-driven browser automation agent runtime. Give it a task in plain English, an
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/) 1.88+
 - Google Chrome or Chromium
 - [remix-browser](https://github.com/hkd987/remix-browser) binary in your PATH
 - An API key from a supported LLM provider (Anthropic, OpenRouter, AWS Bedrock, etc.)
@@ -63,21 +62,29 @@ LLM-driven browser automation agent runtime. Give it a task in plain English, an
 curl -fsSL https://raw.githubusercontent.com/hkd987/remix-browser/main/scripts/install.sh | sh
 ```
 
-Or build from source:
+### Install remix-agent
+
+**Pre-built binary (recommended)** — no Rust toolchain needed:
 
 ```bash
-git clone https://github.com/hkd987/remix-browser.git
-cd remix-browser && cargo build --release
-cp target/release/remix-browser /usr/local/bin/
+curl -fsSL https://raw.githubusercontent.com/hkd987/remix-agent-runtime/main/scripts/install.sh | sh
 ```
 
-### Install remix-agent
+**From source** (requires [Rust](https://rustup.rs/) 1.88+):
 
 ```bash
 git clone https://github.com/hkd987/remix-agent-runtime.git
 cd remix-agent-runtime && cargo build --release
 cp target/release/remix-agent /usr/local/bin/
 ```
+
+Pre-built binaries are available for:
+- macOS Apple Silicon (aarch64)
+- macOS Intel (x86_64)
+- Linux x86_64
+- Windows x86_64
+
+See [Releases](https://github.com/hkd987/remix-agent-runtime/releases) for all downloads.
 
 ### Run your first task
 

@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            archive: tar.gz
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        run: tar czf remix-agent-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release remix-agent
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: Compress-Archive -Path target/${{ matrix.target }}/release/remix-agent.exe -DestinationPath remix-agent-${{ matrix.target }}.zip
+      - name: Checksum (unix)
+        if: matrix.archive == 'tar.gz'
+        run: shasum -a 256 remix-agent-${{ matrix.target }}.* > remix-agent-${{ matrix.target }}.sha256
+      - name: Checksum (windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash remix-agent-${{ matrix.target }}.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  remix-agent-${{ matrix.target }}.zip" | Out-File -Encoding utf8 remix-agent-${{ matrix.target }}.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: remix-agent-${{ matrix.target }}
+          path: |
+            remix-agent-${{ matrix.target }}.tar.gz
+            remix-agent-${{ matrix.target }}.zip
+            remix-agent-${{ matrix.target }}.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            remix-agent-*.tar.gz
+            remix-agent-*.zip
+            remix-agent-*.sha256
