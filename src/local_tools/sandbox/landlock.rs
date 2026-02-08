@@ -41,7 +41,6 @@ mod linux_impl {
             // Apply Landlock restrictions via pre_exec
             // SAFETY: apply_landlock_rules only calls Landlock syscalls (async-signal-safe)
             unsafe {
-                use std::os::unix::process::CommandExt;
                 let root_for_preexec = root_clone.clone();
                 cmd.pre_exec(move || apply_landlock_rules(&root_for_preexec));
             }
@@ -85,9 +84,9 @@ mod linux_impl {
 
         let ruleset = Ruleset::default()
             .handle_access(read_write_access)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+            .map_err(|e| std::io::Error::other(e.to_string()))?
             .create()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         // Read access to system dirs
         // add_rule() takes self by value and returns the modified ruleset,
@@ -99,7 +98,7 @@ mod linux_impl {
             if let Ok(fd) = PathFd::new(sys_dir) {
                 ruleset = ruleset
                     .add_rule(PathBeneath::new(fd, read_access))
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
             }
         }
 
@@ -107,12 +106,12 @@ mod linux_impl {
         if let Ok(fd) = PathFd::new(root) {
             ruleset = ruleset
                 .add_rule(PathBeneath::new(fd, read_write_access))
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
 
         ruleset
             .restrict_self()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         Ok(())
     }
