@@ -2,6 +2,8 @@ pub mod credentials;
 pub mod env;
 pub mod schema;
 
+use std::path::PathBuf;
+
 use crate::cli::RunArgs;
 use crate::error::AgentError;
 use schema::AppConfig;
@@ -68,6 +70,20 @@ pub fn load_config(args: &RunArgs) -> Result<AppConfig, AgentError> {
         config.browser.browser_path = Some(browser_path.clone());
     }
 
+    // Apply skills configuration
+    if let Some(ref skills_dir) = args.skills_dir {
+        config.skills.dirs.push(skills_dir.clone());
+    }
+    if args.no_skills {
+        config.skills.enabled = false;
+    }
+    if let Ok(val) = std::env::var("REMIX_SKILLS_DIR") {
+        let path = PathBuf::from(val);
+        if !config.skills.dirs.contains(&path) {
+            config.skills.dirs.push(path);
+        }
+    }
+
     // CLI task overrides YAML task
     if args.task.is_some() {
         config.task = args.task.clone();
@@ -97,6 +113,8 @@ mod tests {
             verbose: false,
             output: None,
             browser_path: None,
+            skills_dir: None,
+            no_skills: false,
         }
     }
 
@@ -220,6 +238,8 @@ agent:
             verbose: false,
             output: None,
             browser_path: Some("/custom/path".to_string()),
+            skills_dir: None,
+            no_skills: false,
         };
         let config = load_config(&args).unwrap();
 
@@ -415,6 +435,101 @@ task: "yaml task"
         };
         let config = load_config(&args).unwrap();
         assert_eq!(config.task.as_deref(), Some("yaml task"));
+    }
+
+    #[test]
+    fn test_skills_dir_from_cli() {
+        std::env::remove_var("REMIX_LLM_BASE_URL");
+        std::env::remove_var("REMIX_LLM_API_KEY");
+        std::env::remove_var("REMIX_LLM_MODEL");
+        std::env::remove_var("REMIX_SKILLS_DIR");
+
+        let args = RunArgs {
+            skills_dir: Some(PathBuf::from("/custom/skills")),
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert!(config
+            .skills
+            .dirs
+            .contains(&PathBuf::from("/custom/skills")));
+        assert!(config.skills.enabled);
+    }
+
+    #[test]
+    fn test_no_skills_flag() {
+        std::env::remove_var("REMIX_LLM_BASE_URL");
+        std::env::remove_var("REMIX_LLM_API_KEY");
+        std::env::remove_var("REMIX_LLM_MODEL");
+        std::env::remove_var("REMIX_SKILLS_DIR");
+
+        let args = RunArgs {
+            no_skills: true,
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert!(!config.skills.enabled);
+    }
+
+    #[test]
+    fn test_skills_dir_from_env() {
+        std::env::remove_var("REMIX_LLM_BASE_URL");
+        std::env::remove_var("REMIX_LLM_API_KEY");
+        std::env::remove_var("REMIX_LLM_MODEL");
+
+        std::env::set_var("REMIX_SKILLS_DIR", "/env/skills");
+        let args = default_run_args();
+        let config = load_config(&args).unwrap();
+        assert!(config.skills.dirs.contains(&PathBuf::from("/env/skills")));
+        std::env::remove_var("REMIX_SKILLS_DIR");
+    }
+
+    #[test]
+    fn test_skills_dir_cli_and_env_no_duplicates() {
+        std::env::remove_var("REMIX_LLM_BASE_URL");
+        std::env::remove_var("REMIX_LLM_API_KEY");
+        std::env::remove_var("REMIX_LLM_MODEL");
+
+        std::env::set_var("REMIX_SKILLS_DIR", "/same/path");
+        let args = RunArgs {
+            skills_dir: Some(PathBuf::from("/same/path")),
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        let count = config
+            .skills
+            .dirs
+            .iter()
+            .filter(|d| d == &&PathBuf::from("/same/path"))
+            .count();
+        assert_eq!(count, 1);
+        std::env::remove_var("REMIX_SKILLS_DIR");
+    }
+
+    #[test]
+    fn test_skills_config_from_yaml() {
+        std::env::remove_var("REMIX_LLM_BASE_URL");
+        std::env::remove_var("REMIX_LLM_API_KEY");
+        std::env::remove_var("REMIX_LLM_MODEL");
+        std::env::remove_var("REMIX_SKILLS_DIR");
+
+        let yaml = r#"
+task: "test"
+skills:
+  dirs:
+    - "/yaml/skills"
+  enabled: false
+  script_timeout_secs: 120
+"#;
+        let file = write_yaml_tempfile(yaml);
+        let args = RunArgs {
+            config: Some(file.path().to_path_buf()),
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert!(config.skills.dirs.contains(&PathBuf::from("/yaml/skills")));
+        assert!(!config.skills.enabled);
+        assert_eq!(config.skills.script_timeout_secs, 120);
     }
 
     #[test]

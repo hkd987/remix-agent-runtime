@@ -33,6 +33,9 @@ pub enum AgentError {
     #[error("Webhook error: {0}")]
     Webhook(String),
 
+    #[error("Skill error: {0}")]
+    Skill(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -156,6 +159,13 @@ mod tests {
         let agent_err: AgentError = io_err.into();
         assert!(matches!(agent_err, AgentError::Io(_)));
         assert!(agent_err.to_string().contains("file not found"));
+    }
+
+    #[test]
+    fn test_skill_error() {
+        let err = AgentError::Skill("skill not found".into());
+        assert_eq!(err.to_string(), "Skill error: skill not found");
+        assert_eq!(err.exit_status(), ExitStatus::AgentError);
     }
 
     #[test]

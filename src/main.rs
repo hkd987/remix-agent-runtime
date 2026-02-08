@@ -5,7 +5,7 @@ use tracing_subscriber::EnvFilter;
 use remix_agent_runtime::agent::AgentRunner;
 use remix_agent_runtime::browser::manager::BrowserManager;
 use remix_agent_runtime::browser::mcp::McpBrowserClient;
-use remix_agent_runtime::browser::ToolExecutor;
+use remix_agent_runtime::browser::mcp::ToolExecutor;
 use remix_agent_runtime::cli::{Cli, Commands};
 use remix_agent_runtime::config::credentials;
 use remix_agent_runtime::config::load_config;
@@ -96,12 +96,40 @@ async fn main() -> ExitCode {
                 }
             };
 
+            // Discover skills
+            let skill_set = if config.skills.enabled {
+                let skill_dirs =
+                    remix_agent_runtime::skills::default_skill_dirs(&config.skills.dirs);
+                match remix_agent_runtime::skills::discover_all_skills(&skill_dirs) {
+                    Ok(set) => {
+                        if !set.is_empty() {
+                            tracing::info!(count = set.len(), "Discovered skills");
+                        }
+                        set
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Skill discovery failed, continuing without skills");
+                        remix_agent_runtime::skills::SkillSet::new()
+                    }
+                }
+            } else {
+                tracing::debug!("Skills disabled");
+                remix_agent_runtime::skills::SkillSet::new()
+            };
+
+            // Wrap MCP client with skill-aware executor
+            let executor = remix_agent_runtime::skills::SkillAwareExecutor::new(
+                mcp_client,
+                skill_set.clone(),
+                config.skills.script_timeout_secs,
+            );
+
             // Run agent
-            let runner = AgentRunner::new(llm_client, mcp_client, config.agent.clone());
-            let result = runner.run(&task, &credential_set).await;
+            let runner = AgentRunner::new(llm_client, executor, config.agent.clone());
+            let result = runner.run(&task, &credential_set, &skill_set).await;
 
             // Gracefully shut down the MCP browser connection
-            runner.into_tools().shutdown();
+            runner.into_tools().into_inner().shutdown();
 
             match result {
                 Ok(agent_result) => {

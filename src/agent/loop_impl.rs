@@ -9,6 +9,7 @@ use crate::error::AgentError;
 use crate::llm::client::LlmProvider;
 use crate::llm::types::{ContentBlock, StopReason};
 use crate::output::result::{AgentResult, AgentStatus, StepRecord};
+use crate::skills::{inject_skills_into_system_prompt, SkillSet};
 
 use super::state::AgentState;
 
@@ -32,6 +33,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         &self,
         task: &str,
         credentials: &CredentialSet,
+        skill_set: &SkillSet,
     ) -> Result<AgentResult, AgentError> {
         let mut state = AgentState::new(task);
 
@@ -41,6 +43,9 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         }
         if let Some(cred_prompt) = inject_credentials_into_system_prompt(credentials) {
             system_parts.push(cred_prompt);
+        }
+        if let Some(skill_prompt) = inject_skills_into_system_prompt(skill_set) {
+            system_parts.push(skill_prompt);
         }
         let system_prompt = if system_parts.is_empty() {
             None
@@ -295,7 +300,11 @@ mod tests {
 
         let runner = AgentRunner::new(llm, tools, default_config());
         let result = runner
-            .run("Navigate to example.com", &CredentialSet::new())
+            .run(
+                "Navigate to example.com",
+                &CredentialSet::new(),
+                &SkillSet::new(),
+            )
             .await
             .unwrap();
 
@@ -321,7 +330,7 @@ mod tests {
 
         let runner = AgentRunner::new(llm, tools, default_config());
         let result = runner
-            .run("Just say hello", &CredentialSet::new())
+            .run("Just say hello", &CredentialSet::new(), &SkillSet::new())
             .await
             .unwrap();
 
@@ -353,7 +362,7 @@ mod tests {
 
         let runner = AgentRunner::new(llm, tools, config);
         let result = runner
-            .run("Loop forever", &CredentialSet::new())
+            .run("Loop forever", &CredentialSet::new(), &SkillSet::new())
             .await
             .unwrap();
 
@@ -379,7 +388,11 @@ mod tests {
 
         let runner = AgentRunner::new(llm, tools, default_config());
         let result = runner
-            .run("Navigate to bad.com", &CredentialSet::new())
+            .run(
+                "Navigate to bad.com",
+                &CredentialSet::new(),
+                &SkillSet::new(),
+            )
             .await
             .unwrap();
 
@@ -439,7 +452,7 @@ mod tests {
 
         let runner = AgentRunner::new(llm, tools, default_config());
         let result = runner
-            .run("Open two pages", &CredentialSet::new())
+            .run("Open two pages", &CredentialSet::new(), &SkillSet::new())
             .await
             .unwrap();
 
@@ -484,7 +497,7 @@ mod tests {
 
         let runner = AgentRunner::new(llm, tools, config);
         let result = runner
-            .run("Login to example.com", &credentials)
+            .run("Login to example.com", &credentials, &SkillSet::new())
             .await
             .unwrap();
 
@@ -502,7 +515,9 @@ mod tests {
         };
 
         let runner = AgentRunner::new(llm, tools, default_config());
-        let result = runner.run("Fail", &CredentialSet::new()).await;
+        let result = runner
+            .run("Fail", &CredentialSet::new(), &SkillSet::new())
+            .await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), AgentError::Llm(_)));
@@ -529,7 +544,10 @@ mod tests {
         };
 
         let runner = AgentRunner::new(llm, tools, default_config());
-        let result = runner.run("Navigate", &CredentialSet::new()).await.unwrap();
+        let result = runner
+            .run("Navigate", &CredentialSet::new(), &SkillSet::new())
+            .await
+            .unwrap();
 
         // JSON content should be parsed into a Value::Object, not a string
         assert_eq!(
@@ -581,7 +599,10 @@ mod tests {
         };
 
         let runner = AgentRunner::new(llm, tools, default_config());
-        let result = runner.run("Navigate", &CredentialSet::new()).await.unwrap();
+        let result = runner
+            .run("Navigate", &CredentialSet::new(), &SkillSet::new())
+            .await
+            .unwrap();
 
         assert_eq!(result.total_input_tokens, Some(300));
         assert_eq!(result.total_output_tokens, Some(80));
@@ -598,7 +619,10 @@ mod tests {
         };
 
         let runner = AgentRunner::new(llm, tools, default_config());
-        let result = runner.run("Hello", &CredentialSet::new()).await.unwrap();
+        let result = runner
+            .run("Hello", &CredentialSet::new(), &SkillSet::new())
+            .await
+            .unwrap();
 
         assert_eq!(result.total_input_tokens, None);
         assert_eq!(result.total_output_tokens, None);
@@ -626,7 +650,7 @@ mod tests {
 
         let runner = AgentRunner::new(llm, tools, default_config());
         let result = runner
-            .run("Do something", &CredentialSet::new())
+            .run("Do something", &CredentialSet::new(), &SkillSet::new())
             .await
             .unwrap();
 
@@ -659,7 +683,7 @@ mod tests {
 
         let runner = AgentRunner::new(llm, tools, default_config());
         let result = runner
-            .run("Empty response", &CredentialSet::new())
+            .run("Empty response", &CredentialSet::new(), &SkillSet::new())
             .await
             .unwrap();
 
@@ -683,5 +707,67 @@ mod tests {
         let recovered_tools = runner.into_tools();
         assert_eq!(recovered_tools.tool_definitions().len(), 1);
         assert_eq!(recovered_tools.tool_definitions()[0].name, "navigate");
+    }
+
+    #[tokio::test]
+    async fn test_skill_prompt_injection() {
+        use crate::skills::{SkillEntry, SkillMetadata};
+        use std::path::PathBuf;
+
+        // Capture the system prompt passed to the LLM
+        struct CapturingLlm {
+            captured_system: Arc<Mutex<Option<String>>>,
+        }
+
+        #[async_trait]
+        impl LlmProvider for CapturingLlm {
+            async fn send_messages(
+                &self,
+                system: Option<&str>,
+                _messages: &[Message],
+                _tools: Option<&[ToolDefinition]>,
+            ) -> Result<MessagesResponse, AgentError> {
+                *self.captured_system.lock().unwrap() = system.map(|s| s.to_string());
+                Ok(make_end_turn_response("Done"))
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(None));
+        let llm = CapturingLlm {
+            captured_system: captured.clone(),
+        };
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![])),
+        };
+
+        let mut skill_set = SkillSet::new();
+        skill_set
+            .insert(SkillEntry {
+                metadata: SkillMetadata {
+                    name: "test-skill".to_string(),
+                    description: "A test skill".to_string(),
+                    license: None,
+                    compatibility: vec![],
+                    metadata: Default::default(),
+                    allowed_tools: vec![],
+                },
+                body: "Instructions".to_string(),
+                dir_path: PathBuf::from("/tmp/test-skill"),
+                skill_md_path: PathBuf::from("/tmp/test-skill/SKILL.md"),
+            })
+            .unwrap();
+
+        let runner = AgentRunner::new(llm, tools, default_config());
+        runner
+            .run("Do task", &CredentialSet::new(), &skill_set)
+            .await
+            .unwrap();
+
+        let system = captured.lock().unwrap().clone().unwrap();
+        assert!(system.contains("<available_skills>"));
+        assert!(system.contains("test-skill"));
+        assert!(system.contains("A test skill"));
+        assert!(system.contains("load_skill"));
     }
 }

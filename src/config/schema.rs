@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
@@ -15,6 +16,8 @@ pub struct AppConfig {
     pub credentials: Vec<super::credentials::RawCredential>,
     pub on_complete: Option<WebhookConfig>,
     pub on_error: Option<WebhookConfig>,
+    #[serde(default)]
+    pub skills: SkillsConfig,
 }
 
 fn default_base_url() -> String {
@@ -47,6 +50,10 @@ fn default_viewport_height() -> u32 {
 
 fn default_max_iterations() -> u32 {
     50
+}
+
+fn default_script_timeout() -> u64 {
+    60
 }
 
 fn default_webhook_format() -> String {
@@ -146,6 +153,26 @@ pub struct WebhookConfig {
     pub url: String,
     #[serde(default = "default_webhook_format")]
     pub format: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillsConfig {
+    #[serde(default)]
+    pub dirs: Vec<PathBuf>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_script_timeout")]
+    pub script_timeout_secs: u64,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            dirs: Vec::new(),
+            enabled: true,
+            script_timeout_secs: 60,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -374,6 +401,7 @@ url: "https://example.com/hook"
             credentials: vec![],
             on_complete: None,
             on_error: None,
+            skills: SkillsConfig::default(),
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         let deserialized: AppConfig = serde_yaml::from_str(&yaml).unwrap();
@@ -381,5 +409,52 @@ url: "https://example.com/hook"
         assert_eq!(deserialized.llm.base_url, config.llm.base_url);
         assert_eq!(deserialized.llm.model, config.llm.model);
         assert_eq!(deserialized.llm.max_tokens, config.llm.max_tokens);
+    }
+
+    #[test]
+    fn test_skills_config_defaults() {
+        let config = SkillsConfig::default();
+        assert!(config.dirs.is_empty());
+        assert!(config.enabled);
+        assert_eq!(config.script_timeout_secs, 60);
+    }
+
+    #[test]
+    fn test_skills_config_yaml_deser() {
+        let yaml = r#"
+dirs:
+  - "/home/user/skills"
+  - "/opt/skills"
+enabled: false
+script_timeout_secs: 120
+"#;
+        let config: SkillsConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.dirs.len(), 2);
+        assert!(!config.enabled);
+        assert_eq!(config.script_timeout_secs, 120);
+    }
+
+    #[test]
+    fn test_app_config_with_skills() {
+        let yaml = r#"
+task: "test"
+skills:
+  dirs:
+    - "/custom/skills"
+  enabled: true
+  script_timeout_secs: 30
+"#;
+        let config: AppConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.skills.dirs.len(), 1);
+        assert!(config.skills.enabled);
+        assert_eq!(config.skills.script_timeout_secs, 30);
+    }
+
+    #[test]
+    fn test_app_config_defaults_include_skills() {
+        let config = AppConfig::default();
+        assert!(config.skills.enabled);
+        assert!(config.skills.dirs.is_empty());
+        assert_eq!(config.skills.script_timeout_secs, 60);
     }
 }

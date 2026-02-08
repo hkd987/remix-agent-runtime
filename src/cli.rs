@@ -66,6 +66,14 @@ pub struct RunArgs {
     /// Path to remix-browser binary
     #[arg(long, env = "REMIX_BROWSER_PATH")]
     pub browser_path: Option<String>,
+
+    /// Additional directory to scan for skills
+    #[arg(long, env = "REMIX_SKILLS_DIR")]
+    pub skills_dir: Option<PathBuf>,
+
+    /// Disable skill discovery
+    #[arg(long)]
+    pub no_skills: bool,
 }
 
 #[cfg(test)]
@@ -139,6 +147,9 @@ mod tests {
             "result.json",
             "--browser-path",
             "/usr/local/bin/remix-browser",
+            "--skills-dir",
+            "/tmp/skills",
+            "--no-skills",
             "do something",
         ]);
         match cli.command {
@@ -158,6 +169,8 @@ mod tests {
                     args.browser_path,
                     Some("/usr/local/bin/remix-browser".to_string())
                 );
+                assert_eq!(args.skills_dir, Some(PathBuf::from("/tmp/skills")));
+                assert!(args.no_skills);
             }
         }
     }
@@ -178,6 +191,28 @@ mod tests {
                 assert_eq!(args.config, Some(PathBuf::from("task.yaml")));
                 assert!(args.verbose);
                 assert_eq!(args.output, Some(PathBuf::from("out.json")));
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_run_with_skills_dir() {
+        let cli = Cli::parse_from(["remix-agent", "run", "--skills-dir", "/path/to/skills"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.skills_dir, Some(PathBuf::from("/path/to/skills")));
+                assert!(!args.no_skills);
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_run_with_no_skills() {
+        let cli = Cli::parse_from(["remix-agent", "run", "--no-skills"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert!(args.no_skills);
+                assert!(args.skills_dir.is_none());
             }
         }
     }

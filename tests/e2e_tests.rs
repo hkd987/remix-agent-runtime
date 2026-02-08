@@ -4,6 +4,7 @@ use predicates::prelude::*;
 use serde_json::Value;
 use std::io::Read;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 
 fn cmd() -> Command {
     let mut c: Command = cargo_bin_cmd!("remix-agent");
@@ -336,4 +337,218 @@ on_complete:
         .unwrap_or_else(|e| panic!("Invalid webhook JSON: {e}\nbody: {received_body}"));
 
     assert_eq!(json["status"], "success");
+}
+
+// ── Skills E2E helpers ──────────────────────────────────────────────
+
+/// Check whether any step in the JSON `steps` array used the given tool name.
+fn assert_tool_was_called(steps: &Value, tool_name: &str) -> bool {
+    steps
+        .as_array()
+        .map(|arr| arr.iter().any(|step| step["tool"] == tool_name))
+        .unwrap_or(false)
+}
+
+// ── Skills E2E tests (require API key + remix-browser) ──────────────
+
+#[test]
+#[ignore]
+fn test_e2e_skill_discovery_and_load() {
+    let tmp = tempfile::TempDir::new().expect("Failed to create temp dir");
+
+    // Create greeter skill
+    let skill_dir = tmp.path().join("greeter");
+    std::fs::create_dir_all(&skill_dir).expect("Failed to create skill dir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        r#"---
+name: greeter
+description: A skill that generates greeting messages
+---
+# Greeter Skill
+When asked to greet someone, respond with "SKILL_GREETING: Hello, {name}!"
+Always include the prefix SKILL_GREETING in your response."#,
+    )
+    .expect("Failed to write SKILL.md");
+
+    let skills_dir_path = tmp.path().to_str().unwrap().to_string();
+
+    let output = e2e_cmd()
+        .args(run_args(&[
+            "--skills-dir",
+            &skills_dir_path,
+            "--max-iterations",
+            "5",
+            "Use the greeter skill to greet the user named Alice. You must use load_skill first to load the greeter skill instructions, then follow them exactly.",
+        ]))
+        .timeout(std::time::Duration::from_secs(120))
+        .output()
+        .expect("Failed to run command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("Invalid JSON output: {e}\nstdout: {stdout}\nstderr: {stderr}"));
+
+    assert_eq!(
+        json["status"], "success",
+        "Expected status 'success', got '{}'\nstderr: {stderr}",
+        json["status"]
+    );
+
+    assert!(
+        assert_tool_was_called(&json["steps"], "load_skill"),
+        "Expected load_skill to be called in steps: {}",
+        serde_json::to_string_pretty(&json["steps"]).unwrap_or_default()
+    );
+
+    let result_text = json["result"].as_str().unwrap_or("");
+    assert!(
+        result_text.contains("SKILL_GREETING"),
+        "Expected result to contain 'SKILL_GREETING', got: {result_text}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_e2e_skill_script_execution() {
+    let tmp = tempfile::TempDir::new().expect("Failed to create temp dir");
+
+    // Create calculator skill with a script
+    let skill_dir = tmp.path().join("calculator");
+    let scripts_dir = skill_dir.join("scripts");
+    std::fs::create_dir_all(&scripts_dir).expect("Failed to create scripts dir");
+
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        r#"---
+name: calculator
+description: A skill that performs calculations using a script
+---
+# Calculator Skill
+To perform calculations, run the script `calculate.sh` with the expression as an argument.
+Always use run_skill_script to execute the calculate.sh script.
+Report the script output verbatim in your response."#,
+    )
+    .expect("Failed to write SKILL.md");
+
+    let script_path = scripts_dir.join("calculate.sh");
+    std::fs::write(&script_path, "#!/bin/bash\necho \"CALC_RESULT: 42\"\n")
+        .expect("Failed to write calculate.sh");
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+        .expect("Failed to set script permissions");
+
+    let skills_dir_path = tmp.path().to_str().unwrap().to_string();
+
+    let output = e2e_cmd()
+        .args(run_args(&[
+            "--skills-dir",
+            &skills_dir_path,
+            "--max-iterations",
+            "5",
+            "Use the calculator skill to perform a calculation. First load_skill to get instructions, then run_skill_script to execute the calculate.sh script. Report the result.",
+        ]))
+        .timeout(std::time::Duration::from_secs(120))
+        .output()
+        .expect("Failed to run command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("Invalid JSON output: {e}\nstdout: {stdout}\nstderr: {stderr}"));
+
+    assert_eq!(
+        json["status"], "success",
+        "Expected status 'success', got '{}'\nstderr: {stderr}",
+        json["status"]
+    );
+
+    assert!(
+        assert_tool_was_called(&json["steps"], "load_skill"),
+        "Expected load_skill to be called in steps: {}",
+        serde_json::to_string_pretty(&json["steps"]).unwrap_or_default()
+    );
+
+    assert!(
+        assert_tool_was_called(&json["steps"], "run_skill_script"),
+        "Expected run_skill_script to be called in steps: {}",
+        serde_json::to_string_pretty(&json["steps"]).unwrap_or_default()
+    );
+
+    let result_text = json["result"].as_str().unwrap_or("");
+    assert!(
+        result_text.contains("CALC_RESULT") || result_text.contains("42"),
+        "Expected result to contain 'CALC_RESULT' or '42', got: {result_text}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_e2e_skill_resource_read() {
+    let tmp = tempfile::TempDir::new().expect("Failed to create temp dir");
+
+    // Create knowledge-base skill with a resource file
+    let skill_dir = tmp.path().join("knowledge-base");
+    std::fs::create_dir_all(&skill_dir).expect("Failed to create skill dir");
+
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        r#"---
+name: knowledge-base
+description: A skill that provides facts from a knowledge file
+---
+# Knowledge Base Skill
+Read the file `facts.txt` using read_skill_resource to get facts.
+Always quote the facts exactly as they appear in the file."#,
+    )
+    .expect("Failed to write SKILL.md");
+
+    std::fs::write(
+        skill_dir.join("facts.txt"),
+        "FACT_42: The answer to life, the universe, and everything is 42.\n",
+    )
+    .expect("Failed to write facts.txt");
+
+    let skills_dir_path = tmp.path().to_str().unwrap().to_string();
+
+    let output = e2e_cmd()
+        .args(run_args(&[
+            "--skills-dir",
+            &skills_dir_path,
+            "--max-iterations",
+            "5",
+            "Use the knowledge-base skill. First load the skill with load_skill, then read the facts.txt resource using read_skill_resource, and report what you find verbatim.",
+        ]))
+        .timeout(std::time::Duration::from_secs(120))
+        .output()
+        .expect("Failed to run command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("Invalid JSON output: {e}\nstdout: {stdout}\nstderr: {stderr}"));
+
+    assert_eq!(
+        json["status"], "success",
+        "Expected status 'success', got '{}'\nstderr: {stderr}",
+        json["status"]
+    );
+
+    assert!(
+        assert_tool_was_called(&json["steps"], "load_skill"),
+        "Expected load_skill to be called in steps: {}",
+        serde_json::to_string_pretty(&json["steps"]).unwrap_or_default()
+    );
+
+    assert!(
+        assert_tool_was_called(&json["steps"], "read_skill_resource"),
+        "Expected read_skill_resource to be called in steps: {}",
+        serde_json::to_string_pretty(&json["steps"]).unwrap_or_default()
+    );
+
+    let result_text = json["result"].as_str().unwrap_or("");
+    assert!(
+        result_text.contains("FACT_42"),
+        "Expected result to contain 'FACT_42', got: {result_text}"
+    );
 }
