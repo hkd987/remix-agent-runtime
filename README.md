@@ -7,29 +7,38 @@ LLM-driven browser automation agent runtime. Give it a task in plain English, an
 ## How it works
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                  remix-agent-runtime                │
-│                                                     │
-│   "Log into GitHub and star the remix-browser repo" │
-│                        │                            │
-│                        ▼                            │
-│               ┌────────────────┐                    │
-│               │   Agent Loop   │◄──── Credentials   │
-│               └───────┬────────┘      (remix-       │
-│                  ▲    │               credentials)  │
-│         results  │    │ tool calls                   │
-│                  │    ▼                              │
-│  ┌───────────────┴──┐   ┌──────────────────┐        │
-│  │  LLM Provider    │   │  remix-browser   │        │
-│  │  (configurable)  │   │  (MCP Server)    │        │
-│  └──────────────────┘   └──────────────────┘        │
-│                                  │                  │
-└──────────────────────────────────┼──────────────────┘
-                                   │ CDP
-                                   ▼
-                            ┌──────────────┐
-                            │    Chrome     │
-                            └──────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                    remix-agent-runtime                   │
+│                                                         │
+│   "Log into GitHub and star the remix-browser repo"     │
+│                          │                              │
+│                          ▼                              │
+│  AGENTS.md ──► ┌────────────────┐ ◄── Credentials       │
+│  instructions  │   Agent Loop   │     (remix-           │
+│                └───────┬────────┘      credentials)     │
+│                   ▲    │                                │
+│          results  │    │ tool calls                      │
+│                   │    ▼                                │
+│    ┌──────────────┴──────────────────────┐              │
+│    │          Tool Router                 │              │
+│    │  ┌─────────┐  ┌──────┐  ┌────────┐ │              │
+│    │  │ Browser  │  │Local │  │ Skills │ │              │
+│    │  │  (MCP)   │  │Tools │  │        │ │              │
+│    │  └────┬─────┘  └──┬───┘  └────────┘ │              │
+│    └───────┼────────────┼────────────────┘              │
+│            │            │                               │
+│  ┌─────────┘     ┌──────┘                              │
+│  │               │                                      │
+│  ▼               ▼                                      │
+│  remix-browser   Sandboxed filesystem                   │
+│  (MCP Server)    (Seatbelt/Landlock)                   │
+│       │                                                 │
+└───────┼─────────────────────────────────────────────────┘
+        │ CDP
+        ▼
+  ┌──────────────┐
+  │    Chrome     │
+  └──────────────┘
 ```
 
 1. You provide a task in natural language
@@ -113,6 +122,12 @@ remix-agent run [OPTIONS] [TASK]
 | `--verbose` | `-v` | — | Debug logging to stderr |
 | `--output <PATH>` | `-o` | — | Write JSON results to file |
 | `--browser-path <PATH>` | — | `REMIX_BROWSER_PATH` | Path to remix-browser binary |
+| `--agents-md-dir <PATH>` | — | `REMIX_AGENTS_MD_DIR` | Override AGENTS.md search directory |
+| `--no-agents-md` | — | — | Disable AGENTS.md discovery |
+| `--no-local-tools` | — | — | Disable local filesystem tools |
+| `--sandbox-dir <PATH>` | — | `REMIX_SANDBOX_DIR` | Sandbox root for local tools |
+| `--skills-dir <PATH>` | — | `REMIX_SKILLS_DIR` | Additional skills directory |
+| `--no-skills` | — | — | Disable skill discovery |
 
 ### Examples
 
@@ -208,6 +223,24 @@ credentials:
     password: "${DASHBOARD_PASS}"
     url_pattern: "*.internal.company.com"
 
+agents_md:
+  enabled: true
+  search_dir: "/path/to/project"
+  max_size_bytes: 32768
+
+local_tools:
+  enabled: true
+  sandbox_dir: "/path/to/sandbox"
+  bash_timeout_secs: 120
+  read_max_bytes: 1048576
+  write_max_bytes: 10485760
+
+skills:
+  dirs:
+    - "/path/to/skills"
+  enabled: true
+  script_timeout_secs: 60
+
 on_complete:
   url: "https://hooks.slack.com/your-webhook"
   format: "json"
@@ -248,6 +281,57 @@ credentials:
 ```
 
 Supported credential types: `username_password`, `api_key`, `token`, `cookie`, `custom`.
+
+### AGENTS.md
+
+The agent supports the [AGENTS.md](https://github.com/anthropics/agents-md) standard for project-level instructions. When enabled, the agent walks from the search directory (or current working directory) up to the filesystem root, collecting all `AGENTS.md` files it finds.
+
+- Files are ordered root-to-leaf (general instructions first, project-specific last)
+- Concatenated content is capped at 32KB by default (`max_size_bytes`)
+- Injected into the system prompt wrapped in `<project_instructions>` tags
+- Override the search directory with `--agents-md-dir` or `REMIX_AGENTS_MD_DIR`
+- Disable with `--no-agents-md`
+
+### Local tools
+
+When enabled, the agent has access to six sandboxed filesystem and shell tools:
+
+| Tool | Description |
+|------|-------------|
+| `read_file` | Read file contents with optional offset/limit |
+| `write_file` | Write content to a file (creates parent dirs) |
+| `edit_file` | Find-and-replace exact string in a file |
+| `bash` | Execute a shell command in the sandbox |
+| `grep` | Regex search across files with context |
+| `glob` | Find files matching a glob pattern |
+
+All file operations are restricted to the sandbox directory. Use `--sandbox-dir` or `REMIX_SANDBOX_DIR` to set the root. Disable with `--no-local-tools`.
+
+### Sandboxing
+
+Local tools are sandboxed at the OS level:
+
+- **macOS**: Seatbelt profiles restrict file access and network to the sandbox directory
+- **Linux**: Landlock LSM restricts filesystem access (with fallback for older kernels)
+- **Path validation**: All file tool paths are resolved and checked against the sandbox root
+- **Timeouts**: Bash commands are killed after the configured timeout (default: 120s)
+
+### Skills
+
+Skills follow the [AgentSkills.io](https://agentskills.io) standard. They provide reusable instructions and scripts the agent can load on demand.
+
+Discovery searches these directories in order:
+1. `./skills/` (project-local)
+2. `~/.remix/skills/` (user-global)
+3. `--skills-dir` CLI flag or `REMIX_SKILLS_DIR` env var
+4. YAML `skills.dirs` entries
+
+Three virtual tools are added when skills are discovered:
+- `load_skill` -- Load a skill's instructions into context
+- `run_skill_script` -- Execute a script from a skill's `scripts/` directory
+- `read_skill_resource` -- Read a file from a skill's directory
+
+Disable with `--no-skills`.
 
 ### Webhooks
 
@@ -331,6 +415,9 @@ src/
 ├── main.rs                 # CLI entry point, config loading
 ├── cli.rs                  # Argument parsing (clap)
 ├── error.rs                # Error types and exit codes
+├── agents_md/
+│   ├── mod.rs              # Public API re-exports
+│   └── discovery.rs        # AGENTS.md walk + injection
 ├── agent/
 │   ├── loop_impl.rs        # Core agent loop (AgentRunner)
 │   └── state.rs            # Message history + step recording
@@ -346,6 +433,27 @@ src/
 │   ├── schema.rs           # AppConfig, LlmConfig, BrowserConfig
 │   ├── credentials.rs      # Credential adapter (RawCredential → CredentialSet)
 │   └── env.rs              # ${VAR} interpolation
+├── local_tools/
+│   ├── mod.rs              # Public API re-exports
+│   ├── executor.rs         # LocalToolsExecutor decorator
+│   ├── sandbox/
+│   │   ├── mod.rs          # BashSandbox trait + factory
+│   │   ├── path_validator.rs  # Sandbox path enforcement
+│   │   ├── seatbelt.rs     # macOS sandbox-exec wrapper
+│   │   └── landlock.rs     # Linux Landlock LSM wrapper
+│   └── tools/
+│       ├── mod.rs           # Tool module re-exports
+│       ├── read_file.rs     # read_file tool
+│       ├── write_file.rs    # write_file tool
+│       ├── edit_file.rs     # edit_file tool
+│       ├── bash.rs          # bash tool
+│       ├── grep.rs          # grep tool
+│       └── glob_tool.rs     # glob tool
+├── skills/
+│   ├── mod.rs              # Public API re-exports
+│   ├── discovery.rs        # Skill discovery + parsing
+│   ├── executor.rs         # SkillAwareExecutor decorator
+│   └── types.rs            # SkillSet, SkillEntry, SkillMetadata
 └── output/
     ├── result.rs           # AgentResult, StepRecord
     └── webhook.rs          # Webhook dispatcher

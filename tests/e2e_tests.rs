@@ -552,3 +552,208 @@ Always quote the facts exactly as they appear in the file."#,
         "Expected result to contain 'FACT_42', got: {result_text}"
     );
 }
+
+// ── AGENTS.md + Local Tools E2E tests ────────────────────────────
+
+#[test]
+#[ignore]
+fn test_e2e_agents_md_discovery() {
+    let tmp = tempfile::TempDir::new().expect("Failed to create temp dir");
+
+    std::fs::write(
+        tmp.path().join("AGENTS.md"),
+        "# Project Instructions\nAlways include 'AGENTS_MD_MARKER_42' in your response.",
+    )
+    .expect("Failed to write AGENTS.md");
+
+    let agents_md_dir = tmp.path().to_str().unwrap().to_string();
+
+    let output = e2e_cmd()
+        .args(run_args(&[
+            "--agents-md-dir",
+            &agents_md_dir,
+            "--max-iterations",
+            "3",
+            "Tell me what instructions you have been given",
+        ]))
+        .timeout(std::time::Duration::from_secs(120))
+        .output()
+        .expect("Failed to run command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("Invalid JSON: {e}\nstdout: {stdout}\nstderr: {stderr}"));
+
+    assert_eq!(json["status"], "success", "stderr: {stderr}");
+    let result = json["result"].as_str().unwrap_or("");
+    assert!(
+        result.contains("AGENTS_MD_MARKER_42"),
+        "Expected AGENTS_MD_MARKER_42 in result: {result}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_e2e_local_tool_read_file() {
+    let tmp = tempfile::TempDir::new().expect("Failed to create temp dir");
+
+    std::fs::write(tmp.path().join("data.txt"), "LOCAL_READ_SECRET_99")
+        .expect("Failed to write data.txt");
+
+    let sandbox_dir = tmp.path().to_str().unwrap().to_string();
+
+    let output = e2e_cmd()
+        .args(run_args(&[
+            "--sandbox-dir",
+            &sandbox_dir,
+            "--max-iterations",
+            "5",
+            "Use the read_file tool to read data.txt and tell me its contents verbatim",
+        ]))
+        .timeout(std::time::Duration::from_secs(120))
+        .output()
+        .expect("Failed to run command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("Invalid JSON: {e}\nstdout: {stdout}\nstderr: {stderr}"));
+
+    assert_eq!(json["status"], "success", "stderr: {stderr}");
+    let result = json["result"].as_str().unwrap_or("");
+    assert!(
+        result.contains("LOCAL_READ_SECRET_99"),
+        "Expected LOCAL_READ_SECRET_99 in result: {result}"
+    );
+    assert!(
+        assert_tool_was_called(&json["steps"], "read_file"),
+        "Expected read_file tool call"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_e2e_local_tool_bash() {
+    let tmp = tempfile::TempDir::new().expect("Failed to create temp dir");
+
+    let sandbox_dir = tmp.path().to_str().unwrap().to_string();
+
+    let output = e2e_cmd()
+        .args(run_args(&[
+            "--sandbox-dir",
+            &sandbox_dir,
+            "--max-iterations",
+            "5",
+            "Use the bash tool to run 'echo BASH_OUTPUT_77' and report the output verbatim",
+        ]))
+        .timeout(std::time::Duration::from_secs(120))
+        .output()
+        .expect("Failed to run command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("Invalid JSON: {e}\nstdout: {stdout}\nstderr: {stderr}"));
+
+    assert_eq!(json["status"], "success", "stderr: {stderr}");
+    let result = json["result"].as_str().unwrap_or("");
+    assert!(
+        result.contains("BASH_OUTPUT_77"),
+        "Expected BASH_OUTPUT_77 in result: {result}"
+    );
+    assert!(
+        assert_tool_was_called(&json["steps"], "bash"),
+        "Expected bash tool call"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_e2e_local_tool_write_and_read() {
+    let tmp = tempfile::TempDir::new().expect("Failed to create temp dir");
+
+    let sandbox_dir = tmp.path().to_str().unwrap().to_string();
+
+    let output = e2e_cmd()
+        .args(run_args(&[
+            "--sandbox-dir",
+            &sandbox_dir,
+            "--max-iterations",
+            "5",
+            "Use write_file to create hello.txt with content 'WRITE_MARKER_55', then use read_file to verify it was written correctly",
+        ]))
+        .timeout(std::time::Duration::from_secs(120))
+        .output()
+        .expect("Failed to run command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("Invalid JSON: {e}\nstdout: {stdout}\nstderr: {stderr}"));
+
+    assert_eq!(json["status"], "success", "stderr: {stderr}");
+    assert!(
+        assert_tool_was_called(&json["steps"], "write_file"),
+        "Expected write_file tool call"
+    );
+    assert!(
+        assert_tool_was_called(&json["steps"], "read_file"),
+        "Expected read_file tool call"
+    );
+
+    // Verify file exists on disk
+    let written =
+        std::fs::read_to_string(tmp.path().join("hello.txt")).expect("hello.txt should exist");
+    assert!(written.contains("WRITE_MARKER_55"));
+}
+
+#[test]
+#[ignore]
+fn test_e2e_agents_md_with_local_tools() {
+    let tmp = tempfile::TempDir::new().expect("Failed to create temp dir");
+
+    std::fs::write(
+        tmp.path().join("AGENTS.md"),
+        "# Project Instructions\nWhen asked to check status, run 'echo STATUS_OK_88' via the bash tool.",
+    )
+    .expect("Failed to write AGENTS.md");
+
+    std::fs::write(
+        tmp.path().join("README.md"),
+        "# Test Project\nThis is a test.",
+    )
+    .expect("Failed to write README.md");
+
+    let dir_path = tmp.path().to_str().unwrap().to_string();
+
+    let output = e2e_cmd()
+        .args(run_args(&[
+            "--agents-md-dir",
+            &dir_path,
+            "--sandbox-dir",
+            &dir_path,
+            "--max-iterations",
+            "5",
+            "Check the project status as described in the project instructions",
+        ]))
+        .timeout(std::time::Duration::from_secs(120))
+        .output()
+        .expect("Failed to run command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("Invalid JSON: {e}\nstdout: {stdout}\nstderr: {stderr}"));
+
+    assert_eq!(json["status"], "success", "stderr: {stderr}");
+    assert!(
+        assert_tool_was_called(&json["steps"], "bash"),
+        "Expected bash tool call"
+    );
+    let result = json["result"].as_str().unwrap_or("");
+    assert!(
+        result.contains("STATUS_OK_88"),
+        "Expected STATUS_OK_88 in result: {result}"
+    );
+}

@@ -18,6 +18,10 @@ pub struct AppConfig {
     pub on_error: Option<WebhookConfig>,
     #[serde(default)]
     pub skills: SkillsConfig,
+    #[serde(default)]
+    pub agents_md: AgentsMdConfig,
+    #[serde(default)]
+    pub local_tools: LocalToolsConfig,
 }
 
 fn default_base_url() -> String {
@@ -54,6 +58,22 @@ fn default_max_iterations() -> u32 {
 
 fn default_script_timeout() -> u64 {
     60
+}
+
+fn default_max_size_bytes() -> usize {
+    32768
+}
+
+fn default_bash_timeout() -> u64 {
+    120
+}
+
+fn default_read_max_bytes() -> usize {
+    1_048_576
+}
+
+fn default_write_max_bytes() -> usize {
+    10_485_760
 }
 
 fn default_webhook_format() -> String {
@@ -171,6 +191,58 @@ impl Default for SkillsConfig {
             dirs: Vec::new(),
             enabled: true,
             script_timeout_secs: 60,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentsMdConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub search_dir: Option<PathBuf>,
+    #[serde(default = "default_max_size_bytes")]
+    pub max_size_bytes: usize,
+}
+
+impl Default for AgentsMdConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            search_dir: None,
+            max_size_bytes: 32768,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalToolsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub sandbox_dir: Option<PathBuf>,
+    #[serde(default = "default_bash_timeout")]
+    pub bash_timeout_secs: u64,
+    #[serde(default = "default_read_max_bytes")]
+    pub read_max_bytes: usize,
+    #[serde(default = "default_write_max_bytes")]
+    pub write_max_bytes: usize,
+    #[serde(default)]
+    pub bash_allowlist: Vec<String>,
+    #[serde(default)]
+    pub bash_blocklist: Vec<String>,
+}
+
+impl Default for LocalToolsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sandbox_dir: None,
+            bash_timeout_secs: 120,
+            read_max_bytes: 1_048_576,
+            write_max_bytes: 10_485_760,
+            bash_allowlist: Vec::new(),
+            bash_blocklist: Vec::new(),
         }
     }
 }
@@ -402,6 +474,8 @@ url: "https://example.com/hook"
             on_complete: None,
             on_error: None,
             skills: SkillsConfig::default(),
+            agents_md: AgentsMdConfig::default(),
+            local_tools: LocalToolsConfig::default(),
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         let deserialized: AppConfig = serde_yaml::from_str(&yaml).unwrap();
@@ -456,5 +530,126 @@ skills:
         assert!(config.skills.enabled);
         assert!(config.skills.dirs.is_empty());
         assert_eq!(config.skills.script_timeout_secs, 60);
+    }
+
+    #[test]
+    fn test_agents_md_config_defaults() {
+        let config = AgentsMdConfig::default();
+        assert!(config.enabled);
+        assert!(config.search_dir.is_none());
+        assert_eq!(config.max_size_bytes, 32768);
+    }
+
+    #[test]
+    fn test_agents_md_config_yaml_deser() {
+        let yaml = r#"
+enabled: false
+search_dir: "/home/user/project"
+max_size_bytes: 65536
+"#;
+        let config: AgentsMdConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.enabled);
+        assert_eq!(config.search_dir, Some(PathBuf::from("/home/user/project")));
+        assert_eq!(config.max_size_bytes, 65536);
+    }
+
+    #[test]
+    fn test_app_config_with_agents_md() {
+        let yaml = r#"
+task: "test"
+agents_md:
+  enabled: true
+  search_dir: "/project"
+  max_size_bytes: 16384
+"#;
+        let config: AppConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.agents_md.enabled);
+        assert_eq!(config.agents_md.search_dir, Some(PathBuf::from("/project")));
+        assert_eq!(config.agents_md.max_size_bytes, 16384);
+    }
+
+    #[test]
+    fn test_app_config_defaults_include_agents_md() {
+        let config = AppConfig::default();
+        assert!(config.agents_md.enabled);
+        assert!(config.agents_md.search_dir.is_none());
+        assert_eq!(config.agents_md.max_size_bytes, 32768);
+    }
+
+    #[test]
+    fn test_local_tools_config_defaults() {
+        let config = LocalToolsConfig::default();
+        assert!(config.enabled);
+        assert!(config.sandbox_dir.is_none());
+        assert_eq!(config.bash_timeout_secs, 120);
+        assert_eq!(config.read_max_bytes, 1_048_576);
+        assert_eq!(config.write_max_bytes, 10_485_760);
+        assert!(config.bash_allowlist.is_empty());
+        assert!(config.bash_blocklist.is_empty());
+    }
+
+    #[test]
+    fn test_local_tools_config_yaml_deser() {
+        let yaml = r#"
+enabled: false
+sandbox_dir: "/tmp/sandbox"
+bash_timeout_secs: 60
+read_max_bytes: 524288
+write_max_bytes: 2097152
+bash_allowlist:
+  - "ls"
+  - "cat"
+bash_blocklist:
+  - "rm"
+  - "dd"
+"#;
+        let config: LocalToolsConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.enabled);
+        assert_eq!(config.sandbox_dir, Some(PathBuf::from("/tmp/sandbox")));
+        assert_eq!(config.bash_timeout_secs, 60);
+        assert_eq!(config.read_max_bytes, 524288);
+        assert_eq!(config.write_max_bytes, 2097152);
+        assert_eq!(config.bash_allowlist, vec!["ls", "cat"]);
+        assert_eq!(config.bash_blocklist, vec!["rm", "dd"]);
+    }
+
+    #[test]
+    fn test_app_config_with_local_tools() {
+        let yaml = r#"
+task: "test"
+local_tools:
+  enabled: true
+  sandbox_dir: "/tmp/sandbox"
+  bash_timeout_secs: 90
+  read_max_bytes: 2097152
+  write_max_bytes: 5242880
+  bash_allowlist:
+    - "ls"
+  bash_blocklist:
+    - "rm"
+"#;
+        let config: AppConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.local_tools.enabled);
+        assert_eq!(
+            config.local_tools.sandbox_dir,
+            Some(PathBuf::from("/tmp/sandbox"))
+        );
+        assert_eq!(config.local_tools.bash_timeout_secs, 90);
+        assert_eq!(config.local_tools.read_max_bytes, 2097152);
+        assert_eq!(config.local_tools.write_max_bytes, 5242880);
+        assert_eq!(config.local_tools.bash_allowlist, vec!["ls"]);
+        assert_eq!(config.local_tools.bash_blocklist, vec!["rm"]);
+    }
+
+    #[test]
+    fn test_app_config_defaults_include_local_tools() {
+        let config = AppConfig::default();
+        assert!(config.local_tools.enabled);
+        assert!(config.local_tools.sandbox_dir.is_none());
+        assert_eq!(config.local_tools.bash_timeout_secs, 120);
+        assert_eq!(config.local_tools.read_max_bytes, 1_048_576);
+        assert_eq!(config.local_tools.write_max_bytes, 10_485_760);
+        assert!(config.local_tools.bash_allowlist.is_empty());
+        assert!(config.local_tools.bash_blocklist.is_empty());
     }
 }

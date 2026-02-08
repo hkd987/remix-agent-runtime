@@ -117,6 +117,27 @@ async fn main() -> ExitCode {
                 remix_agent_runtime::skills::SkillSet::new()
             };
 
+            // Discover AGENTS.md
+            let agents_md = if config.agents_md.enabled {
+                match remix_agent_runtime::agents_md::discover_agents_md(&config.agents_md) {
+                    Ok(Some(content)) => {
+                        tracing::info!(
+                            sources = ?content.sources,
+                            "Discovered AGENTS.md instructions"
+                        );
+                        Some(content)
+                    }
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "AGENTS.md discovery failed, continuing without");
+                        None
+                    }
+                }
+            } else {
+                tracing::debug!("AGENTS.md discovery disabled");
+                None
+            };
+
             // Wrap MCP client with skill-aware executor
             let executor = remix_agent_runtime::skills::SkillAwareExecutor::new(
                 mcp_client,
@@ -124,12 +145,31 @@ async fn main() -> ExitCode {
                 config.skills.script_timeout_secs,
             );
 
+            // Wrap with local tools executor
+            let executor = match remix_agent_runtime::local_tools::LocalToolsExecutor::new(
+                executor,
+                config.local_tools.clone(),
+            ) {
+                Ok(e) => {
+                    if config.local_tools.enabled {
+                        tracing::info!(tools = e.tool_definitions().len(), "Local tools enabled");
+                    }
+                    e
+                }
+                Err(e) => {
+                    eprintln!("Error: Failed to initialize local tools: {e}");
+                    return ExitStatus::AgentError.into();
+                }
+            };
+
             // Run agent
             let runner = AgentRunner::new(llm_client, executor, config.agent.clone());
-            let result = runner.run(&task, &credential_set, &skill_set).await;
+            let result = runner
+                .run(&task, &credential_set, &skill_set, &agents_md)
+                .await;
 
             // Gracefully shut down the MCP browser connection
-            runner.into_tools().into_inner().shutdown();
+            runner.into_tools().into_inner().into_inner().shutdown();
 
             match result {
                 Ok(agent_result) => {

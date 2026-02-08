@@ -34,12 +34,18 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         task: &str,
         credentials: &CredentialSet,
         skill_set: &SkillSet,
+        agents_md: &Option<crate::agents_md::AgentsMdContent>,
     ) -> Result<AgentResult, AgentError> {
         let mut state = AgentState::new(task);
 
         let mut system_parts = Vec::new();
         if let Some(ref prompt) = self.config.system_prompt {
             system_parts.push(prompt.clone());
+        }
+        if let Some(agents_md_prompt) =
+            crate::agents_md::inject_agents_md_into_system_prompt(agents_md)
+        {
+            system_parts.push(agents_md_prompt);
         }
         if let Some(cred_prompt) = inject_credentials_into_system_prompt(credentials) {
             system_parts.push(cred_prompt);
@@ -304,6 +310,7 @@ mod tests {
                 "Navigate to example.com",
                 &CredentialSet::new(),
                 &SkillSet::new(),
+                &None,
             )
             .await
             .unwrap();
@@ -330,7 +337,12 @@ mod tests {
 
         let runner = AgentRunner::new(llm, tools, default_config());
         let result = runner
-            .run("Just say hello", &CredentialSet::new(), &SkillSet::new())
+            .run(
+                "Just say hello",
+                &CredentialSet::new(),
+                &SkillSet::new(),
+                &None,
+            )
             .await
             .unwrap();
 
@@ -362,7 +374,12 @@ mod tests {
 
         let runner = AgentRunner::new(llm, tools, config);
         let result = runner
-            .run("Loop forever", &CredentialSet::new(), &SkillSet::new())
+            .run(
+                "Loop forever",
+                &CredentialSet::new(),
+                &SkillSet::new(),
+                &None,
+            )
             .await
             .unwrap();
 
@@ -392,6 +409,7 @@ mod tests {
                 "Navigate to bad.com",
                 &CredentialSet::new(),
                 &SkillSet::new(),
+                &None,
             )
             .await
             .unwrap();
@@ -452,7 +470,12 @@ mod tests {
 
         let runner = AgentRunner::new(llm, tools, default_config());
         let result = runner
-            .run("Open two pages", &CredentialSet::new(), &SkillSet::new())
+            .run(
+                "Open two pages",
+                &CredentialSet::new(),
+                &SkillSet::new(),
+                &None,
+            )
             .await
             .unwrap();
 
@@ -497,7 +520,12 @@ mod tests {
 
         let runner = AgentRunner::new(llm, tools, config);
         let result = runner
-            .run("Login to example.com", &credentials, &SkillSet::new())
+            .run(
+                "Login to example.com",
+                &credentials,
+                &SkillSet::new(),
+                &None,
+            )
             .await
             .unwrap();
 
@@ -516,7 +544,7 @@ mod tests {
 
         let runner = AgentRunner::new(llm, tools, default_config());
         let result = runner
-            .run("Fail", &CredentialSet::new(), &SkillSet::new())
+            .run("Fail", &CredentialSet::new(), &SkillSet::new(), &None)
             .await;
 
         assert!(result.is_err());
@@ -545,7 +573,7 @@ mod tests {
 
         let runner = AgentRunner::new(llm, tools, default_config());
         let result = runner
-            .run("Navigate", &CredentialSet::new(), &SkillSet::new())
+            .run("Navigate", &CredentialSet::new(), &SkillSet::new(), &None)
             .await
             .unwrap();
 
@@ -600,7 +628,7 @@ mod tests {
 
         let runner = AgentRunner::new(llm, tools, default_config());
         let result = runner
-            .run("Navigate", &CredentialSet::new(), &SkillSet::new())
+            .run("Navigate", &CredentialSet::new(), &SkillSet::new(), &None)
             .await
             .unwrap();
 
@@ -620,7 +648,7 @@ mod tests {
 
         let runner = AgentRunner::new(llm, tools, default_config());
         let result = runner
-            .run("Hello", &CredentialSet::new(), &SkillSet::new())
+            .run("Hello", &CredentialSet::new(), &SkillSet::new(), &None)
             .await
             .unwrap();
 
@@ -650,7 +678,12 @@ mod tests {
 
         let runner = AgentRunner::new(llm, tools, default_config());
         let result = runner
-            .run("Do something", &CredentialSet::new(), &SkillSet::new())
+            .run(
+                "Do something",
+                &CredentialSet::new(),
+                &SkillSet::new(),
+                &None,
+            )
             .await
             .unwrap();
 
@@ -683,7 +716,12 @@ mod tests {
 
         let runner = AgentRunner::new(llm, tools, default_config());
         let result = runner
-            .run("Empty response", &CredentialSet::new(), &SkillSet::new())
+            .run(
+                "Empty response",
+                &CredentialSet::new(),
+                &SkillSet::new(),
+                &None,
+            )
             .await
             .unwrap();
 
@@ -760,7 +798,7 @@ mod tests {
 
         let runner = AgentRunner::new(llm, tools, default_config());
         runner
-            .run("Do task", &CredentialSet::new(), &skill_set)
+            .run("Do task", &CredentialSet::new(), &skill_set, &None)
             .await
             .unwrap();
 

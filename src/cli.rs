@@ -74,6 +74,22 @@ pub struct RunArgs {
     /// Disable skill discovery
     #[arg(long)]
     pub no_skills: bool,
+
+    /// Directory to search for AGENTS.md files
+    #[arg(long, env = "REMIX_AGENTS_MD_DIR")]
+    pub agents_md_dir: Option<PathBuf>,
+
+    /// Disable AGENTS.md discovery
+    #[arg(long)]
+    pub no_agents_md: bool,
+
+    /// Disable local filesystem tools
+    #[arg(long)]
+    pub no_local_tools: bool,
+
+    /// Sandbox root directory for local tools
+    #[arg(long, env = "REMIX_SANDBOX_DIR")]
+    pub sandbox_dir: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -150,6 +166,12 @@ mod tests {
             "--skills-dir",
             "/tmp/skills",
             "--no-skills",
+            "--agents-md-dir",
+            "/tmp/agents",
+            "--no-agents-md",
+            "--no-local-tools",
+            "--sandbox-dir",
+            "/tmp/sandbox",
             "do something",
         ]);
         match cli.command {
@@ -171,6 +193,10 @@ mod tests {
                 );
                 assert_eq!(args.skills_dir, Some(PathBuf::from("/tmp/skills")));
                 assert!(args.no_skills);
+                assert_eq!(args.agents_md_dir, Some(PathBuf::from("/tmp/agents")));
+                assert!(args.no_agents_md);
+                assert!(args.no_local_tools);
+                assert_eq!(args.sandbox_dir, Some(PathBuf::from("/tmp/sandbox")));
             }
         }
     }
@@ -227,5 +253,49 @@ mod tests {
     fn test_invalid_subcommand_fails() {
         let result = Cli::try_parse_from(["remix-agent", "invalid"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_run_with_agents_md_dir() {
+        let cli = Cli::parse_from(["remix-agent", "run", "--agents-md-dir", "/path/to/project"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.agents_md_dir, Some(PathBuf::from("/path/to/project")));
+                assert!(!args.no_agents_md);
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_run_with_no_agents_md() {
+        let cli = Cli::parse_from(["remix-agent", "run", "--no-agents-md"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert!(args.no_agents_md);
+                assert!(args.agents_md_dir.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_run_with_no_local_tools() {
+        let cli = Cli::parse_from(["remix-agent", "run", "--no-local-tools"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert!(args.no_local_tools);
+                assert!(args.sandbox_dir.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_run_with_sandbox_dir() {
+        let cli = Cli::parse_from(["remix-agent", "run", "--sandbox-dir", "/tmp/sandbox"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.sandbox_dir, Some(PathBuf::from("/tmp/sandbox")));
+                assert!(!args.no_local_tools);
+            }
+        }
     }
 }

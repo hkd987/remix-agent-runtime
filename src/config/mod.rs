@@ -84,6 +84,32 @@ pub fn load_config(args: &RunArgs) -> Result<AppConfig, AgentError> {
         }
     }
 
+    // Apply agents_md configuration
+    if let Some(ref dir) = args.agents_md_dir {
+        config.agents_md.search_dir = Some(dir.clone());
+    }
+    if args.no_agents_md {
+        config.agents_md.enabled = false;
+    }
+    if let Ok(val) = std::env::var("REMIX_AGENTS_MD_DIR") {
+        if config.agents_md.search_dir.is_none() {
+            config.agents_md.search_dir = Some(PathBuf::from(val));
+        }
+    }
+
+    // Apply local_tools configuration
+    if let Some(ref dir) = args.sandbox_dir {
+        config.local_tools.sandbox_dir = Some(dir.clone());
+    }
+    if args.no_local_tools {
+        config.local_tools.enabled = false;
+    }
+    if let Ok(val) = std::env::var("REMIX_SANDBOX_DIR") {
+        if config.local_tools.sandbox_dir.is_none() {
+            config.local_tools.sandbox_dir = Some(PathBuf::from(val));
+        }
+    }
+
     // CLI task overrides YAML task
     if args.task.is_some() {
         config.task = args.task.clone();
@@ -115,6 +141,10 @@ mod tests {
             browser_path: None,
             skills_dir: None,
             no_skills: false,
+            agents_md_dir: None,
+            no_agents_md: false,
+            no_local_tools: false,
+            sandbox_dir: None,
         }
     }
 
@@ -240,6 +270,10 @@ agent:
             browser_path: Some("/custom/path".to_string()),
             skills_dir: None,
             no_skills: false,
+            agents_md_dir: None,
+            no_agents_md: false,
+            no_local_tools: false,
+            sandbox_dir: None,
         };
         let config = load_config(&args).unwrap();
 
@@ -504,6 +538,74 @@ task: "yaml task"
             .count();
         assert_eq!(count, 1);
         std::env::remove_var("REMIX_SKILLS_DIR");
+    }
+
+    #[test]
+    fn test_agents_md_dir_from_cli() {
+        std::env::remove_var("REMIX_LLM_BASE_URL");
+        std::env::remove_var("REMIX_LLM_API_KEY");
+        std::env::remove_var("REMIX_LLM_MODEL");
+        std::env::remove_var("REMIX_AGENTS_MD_DIR");
+
+        let args = RunArgs {
+            agents_md_dir: Some(PathBuf::from("/custom/agents")),
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert_eq!(
+            config.agents_md.search_dir,
+            Some(PathBuf::from("/custom/agents"))
+        );
+        assert!(config.agents_md.enabled);
+    }
+
+    #[test]
+    fn test_no_agents_md_flag() {
+        std::env::remove_var("REMIX_LLM_BASE_URL");
+        std::env::remove_var("REMIX_LLM_API_KEY");
+        std::env::remove_var("REMIX_LLM_MODEL");
+        std::env::remove_var("REMIX_AGENTS_MD_DIR");
+
+        let args = RunArgs {
+            no_agents_md: true,
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert!(!config.agents_md.enabled);
+    }
+
+    #[test]
+    fn test_sandbox_dir_from_cli() {
+        std::env::remove_var("REMIX_LLM_BASE_URL");
+        std::env::remove_var("REMIX_LLM_API_KEY");
+        std::env::remove_var("REMIX_LLM_MODEL");
+        std::env::remove_var("REMIX_SANDBOX_DIR");
+
+        let args = RunArgs {
+            sandbox_dir: Some(PathBuf::from("/custom/sandbox")),
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert_eq!(
+            config.local_tools.sandbox_dir,
+            Some(PathBuf::from("/custom/sandbox"))
+        );
+        assert!(config.local_tools.enabled);
+    }
+
+    #[test]
+    fn test_no_local_tools_flag() {
+        std::env::remove_var("REMIX_LLM_BASE_URL");
+        std::env::remove_var("REMIX_LLM_API_KEY");
+        std::env::remove_var("REMIX_LLM_MODEL");
+        std::env::remove_var("REMIX_SANDBOX_DIR");
+
+        let args = RunArgs {
+            no_local_tools: true,
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert!(!config.local_tools.enabled);
     }
 
     #[test]

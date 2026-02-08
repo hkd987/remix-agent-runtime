@@ -36,6 +36,12 @@ pub enum AgentError {
     #[error("Skill error: {0}")]
     Skill(String),
 
+    #[error("AGENTS.md error: {0}")]
+    AgentsMd(String),
+
+    #[error("Local tool error: {0}")]
+    LocalTool(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -165,6 +171,20 @@ mod tests {
     fn test_skill_error() {
         let err = AgentError::Skill("skill not found".into());
         assert_eq!(err.to_string(), "Skill error: skill not found");
+        assert_eq!(err.exit_status(), ExitStatus::AgentError);
+    }
+
+    #[test]
+    fn test_agents_md_error() {
+        let err = AgentError::AgentsMd("file not readable".into());
+        assert_eq!(err.to_string(), "AGENTS.md error: file not readable");
+        assert_eq!(err.exit_status(), ExitStatus::AgentError);
+    }
+
+    #[test]
+    fn test_local_tool_error() {
+        let err = AgentError::LocalTool("path outside sandbox".into());
+        assert_eq!(err.to_string(), "Local tool error: path outside sandbox");
         assert_eq!(err.exit_status(), ExitStatus::AgentError);
     }
 
