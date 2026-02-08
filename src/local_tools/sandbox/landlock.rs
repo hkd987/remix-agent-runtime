@@ -1,7 +1,3 @@
-use std::path::PathBuf;
-
-use crate::error::AgentError;
-
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use std::path::{Path, PathBuf};
@@ -31,7 +27,6 @@ mod linux_impl {
             command: &str,
             timeout_secs: u64,
         ) -> Result<CommandOutput, AgentError> {
-            use std::os::unix::process::CommandExt;
             use std::time::Duration;
 
             let root_clone = self.root.clone();
@@ -44,7 +39,9 @@ mod linux_impl {
                 .kill_on_drop(true);
 
             // Apply Landlock restrictions via pre_exec
+            // SAFETY: apply_landlock_rules only calls Landlock syscalls (async-signal-safe)
             unsafe {
+                use std::os::unix::process::CommandExt;
                 let root_for_preexec = root_clone.clone();
                 cmd.pre_exec(move || apply_landlock_rules(&root_for_preexec));
             }
@@ -86,24 +83,31 @@ mod linux_impl {
         let read_access = AccessFs::from_read(abi);
         let read_write_access = AccessFs::from_all(abi);
 
-        let mut ruleset = Ruleset::default()
+        let ruleset = Ruleset::default()
             .handle_access(read_write_access)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
             .create()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
         // Read access to system dirs
+        // add_rule() takes self by value and returns the modified ruleset,
+        // so we chain through a mutable binding.
+        let mut ruleset = ruleset;
         for sys_dir in &[
             "/usr", "/bin", "/lib", "/lib64", "/etc", "/dev", "/sbin", "/proc",
         ] {
             if let Ok(fd) = PathFd::new(sys_dir) {
-                let _ = ruleset.add_rule(PathBeneath::new(fd, read_access));
+                ruleset = ruleset
+                    .add_rule(PathBeneath::new(fd, read_access))
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
             }
         }
 
         // Read + write access to sandbox root
         if let Ok(fd) = PathFd::new(root) {
-            let _ = ruleset.add_rule(PathBeneath::new(fd, read_write_access));
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(fd, read_write_access))
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         }
 
         ruleset
@@ -123,8 +127,8 @@ pub struct LandlockSandbox;
 
 #[cfg(not(target_os = "linux"))]
 impl LandlockSandbox {
-    pub fn new(_root: PathBuf) -> Result<Self, AgentError> {
-        Err(AgentError::LocalTool(
+    pub fn new(_root: std::path::PathBuf) -> Result<Self, crate::error::AgentError> {
+        Err(crate::error::AgentError::LocalTool(
             "Landlock is only available on Linux".to_string(),
         ))
     }
