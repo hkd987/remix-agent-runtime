@@ -90,6 +90,42 @@ pub struct RunArgs {
     /// Sandbox root directory for local tools
     #[arg(long, env = "REMIX_SANDBOX_DIR")]
     pub sandbox_dir: Option<PathBuf>,
+
+    /// Disable all plugin discovery
+    #[arg(long)]
+    pub no_plugins: bool,
+
+    /// Additional directory to scan for plugins
+    #[arg(long, env = "REMIX_PLUGINS_DIR")]
+    pub plugins_dir: Option<PathBuf>,
+
+    /// Disable Claude Code plugin cache discovery
+    #[arg(long)]
+    pub no_claude_plugins: bool,
+
+    /// Resume an existing session by ID
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    /// Fork from an existing session
+    #[arg(long)]
+    pub fork_session: Option<String>,
+
+    /// Override session storage directory
+    #[arg(long, env = "REMIX_SESSION_DIR")]
+    pub session_dir: Option<PathBuf>,
+
+    /// Permission mode (default, accept_edits, bypass_permissions, plan)
+    #[arg(long)]
+    pub permission_mode: Option<String>,
+
+    /// Allow specific tool patterns (repeatable)
+    #[arg(long)]
+    pub allow_tool: Vec<String>,
+
+    /// Deny specific tool patterns (repeatable)
+    #[arg(long)]
+    pub deny_tool: Vec<String>,
 }
 
 #[cfg(test)]
@@ -172,6 +208,24 @@ mod tests {
             "--no-local-tools",
             "--sandbox-dir",
             "/tmp/sandbox",
+            "--no-plugins",
+            "--plugins-dir",
+            "/tmp/plugins",
+            "--no-claude-plugins",
+            "--session-id",
+            "abc-123",
+            "--fork-session",
+            "def-456",
+            "--session-dir",
+            "/tmp/sessions",
+            "--permission-mode",
+            "plan",
+            "--allow-tool",
+            "navigate",
+            "--allow-tool",
+            "click",
+            "--deny-tool",
+            "bash",
             "do something",
         ]);
         match cli.command {
@@ -197,6 +251,15 @@ mod tests {
                 assert!(args.no_agents_md);
                 assert!(args.no_local_tools);
                 assert_eq!(args.sandbox_dir, Some(PathBuf::from("/tmp/sandbox")));
+                assert!(args.no_plugins);
+                assert_eq!(args.plugins_dir, Some(PathBuf::from("/tmp/plugins")));
+                assert!(args.no_claude_plugins);
+                assert_eq!(args.session_id, Some("abc-123".to_string()));
+                assert_eq!(args.fork_session, Some("def-456".to_string()));
+                assert_eq!(args.session_dir, Some(PathBuf::from("/tmp/sessions")));
+                assert_eq!(args.permission_mode, Some("plan".to_string()));
+                assert_eq!(args.allow_tool, vec!["navigate", "click"]);
+                assert_eq!(args.deny_tool, vec!["bash"]);
             }
         }
     }
@@ -239,6 +302,40 @@ mod tests {
             Commands::Run(args) => {
                 assert!(args.no_skills);
                 assert!(args.skills_dir.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_run_with_no_plugins() {
+        let cli = Cli::parse_from(["remix-agent", "run", "--no-plugins"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert!(args.no_plugins);
+                assert!(args.plugins_dir.is_none());
+                assert!(!args.no_claude_plugins);
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_run_with_plugins_dir() {
+        let cli = Cli::parse_from(["remix-agent", "run", "--plugins-dir", "/path/to/plugins"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.plugins_dir, Some(PathBuf::from("/path/to/plugins")));
+                assert!(!args.no_plugins);
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_run_with_no_claude_plugins() {
+        let cli = Cli::parse_from(["remix-agent", "run", "--no-claude-plugins"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert!(args.no_claude_plugins);
+                assert!(!args.no_plugins);
             }
         }
     }
@@ -295,6 +392,68 @@ mod tests {
             Commands::Run(args) => {
                 assert_eq!(args.sandbox_dir, Some(PathBuf::from("/tmp/sandbox")));
                 assert!(!args.no_local_tools);
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_run_with_session_id() {
+        let cli = Cli::parse_from(["remix-agent", "run", "--session-id", "abc-123"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.session_id, Some("abc-123".to_string()));
+                assert!(args.fork_session.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_run_with_fork_session() {
+        let cli = Cli::parse_from(["remix-agent", "run", "--fork-session", "def-456"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.fork_session, Some("def-456".to_string()));
+                assert!(args.session_id.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_run_with_session_dir() {
+        let cli = Cli::parse_from(["remix-agent", "run", "--session-dir", "/tmp/sessions"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.session_dir, Some(PathBuf::from("/tmp/sessions")));
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_run_with_permission_mode() {
+        let cli = Cli::parse_from(["remix-agent", "run", "--permission-mode", "plan"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.permission_mode, Some("plan".to_string()));
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_run_with_allow_deny_tools() {
+        let cli = Cli::parse_from([
+            "remix-agent",
+            "run",
+            "--allow-tool",
+            "navigate",
+            "--allow-tool",
+            "click",
+            "--deny-tool",
+            "bash",
+        ]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.allow_tool, vec!["navigate", "click"]);
+                assert_eq!(args.deny_tool, vec!["bash"]);
             }
         }
     }

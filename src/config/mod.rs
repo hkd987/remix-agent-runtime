@@ -110,6 +110,75 @@ pub fn load_config(args: &RunArgs) -> Result<AppConfig, AgentError> {
         }
     }
 
+    // Apply plugins configuration
+    if let Some(ref dir) = args.plugins_dir {
+        config.plugins.sources.push(schema::PluginSourceConfig {
+            path: Some(dir.clone()),
+            github: None,
+            git_ref: None,
+        });
+    }
+    if args.no_plugins {
+        config.plugins.enabled = false;
+    }
+    if args.no_claude_plugins {
+        config.plugins.claude_code_cache = false;
+    }
+    if let Ok(val) = std::env::var("REMIX_PLUGINS_DIR") {
+        let path = PathBuf::from(val);
+        let already_present = config
+            .plugins
+            .sources
+            .iter()
+            .any(|s| s.path.as_ref() == Some(&path));
+        if !already_present {
+            config.plugins.sources.push(schema::PluginSourceConfig {
+                path: Some(path),
+                github: None,
+                git_ref: None,
+            });
+        }
+    }
+
+    // Apply session configuration
+    if let Some(ref dir) = args.session_dir {
+        config.session.storage_dir = dir.clone();
+    }
+    if let Ok(val) = std::env::var("REMIX_SESSION_DIR") {
+        if args.session_dir.is_none() {
+            config.session.storage_dir = PathBuf::from(val);
+        }
+    }
+
+    // Apply permissions configuration
+    if let Some(ref mode_str) = args.permission_mode {
+        match mode_str.as_str() {
+            "default" => config.permissions.mode = schema::PermissionModeConfig::Default,
+            "accept_edits" => config.permissions.mode = schema::PermissionModeConfig::AcceptEdits,
+            "bypass_permissions" => {
+                config.permissions.mode = schema::PermissionModeConfig::BypassPermissions
+            }
+            "plan" => config.permissions.mode = schema::PermissionModeConfig::Plan,
+            _ => {
+                return Err(AgentError::Config(format!(
+                    "Invalid permission mode: '{mode_str}'. Must be: default, accept_edits, bypass_permissions, plan"
+                )));
+            }
+        }
+    }
+    if !args.allow_tool.is_empty() {
+        config
+            .permissions
+            .allowed_tools
+            .extend(args.allow_tool.clone());
+    }
+    if !args.deny_tool.is_empty() {
+        config
+            .permissions
+            .denied_tools
+            .extend(args.deny_tool.clone());
+    }
+
     // CLI task overrides YAML task
     if args.task.is_some() {
         config.task = args.task.clone();
@@ -145,6 +214,15 @@ mod tests {
             no_agents_md: false,
             no_local_tools: false,
             sandbox_dir: None,
+            no_plugins: false,
+            plugins_dir: None,
+            no_claude_plugins: false,
+            session_id: None,
+            fork_session: None,
+            session_dir: None,
+            permission_mode: None,
+            allow_tool: Vec::new(),
+            deny_tool: Vec::new(),
         }
     }
 
@@ -274,6 +352,15 @@ agent:
             no_agents_md: false,
             no_local_tools: false,
             sandbox_dir: None,
+            no_plugins: false,
+            plugins_dir: None,
+            no_claude_plugins: false,
+            session_id: None,
+            fork_session: None,
+            session_dir: None,
+            permission_mode: None,
+            allow_tool: Vec::new(),
+            deny_tool: Vec::new(),
         };
         let config = load_config(&args).unwrap();
 
@@ -647,5 +734,176 @@ skills:
         let config = load_config(&args).unwrap();
         assert_eq!(config.browser.timeout_secs, 999);
         assert_eq!(config.agent.timeout_secs, 999);
+    }
+
+    #[test]
+    fn test_no_plugins_flag() {
+        std::env::remove_var("REMIX_LLM_BASE_URL");
+        std::env::remove_var("REMIX_LLM_API_KEY");
+        std::env::remove_var("REMIX_LLM_MODEL");
+        std::env::remove_var("REMIX_PLUGINS_DIR");
+
+        let args = RunArgs {
+            no_plugins: true,
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert!(!config.plugins.enabled);
+    }
+
+    #[test]
+    fn test_no_claude_plugins_flag() {
+        std::env::remove_var("REMIX_LLM_BASE_URL");
+        std::env::remove_var("REMIX_LLM_API_KEY");
+        std::env::remove_var("REMIX_LLM_MODEL");
+        std::env::remove_var("REMIX_PLUGINS_DIR");
+
+        let args = RunArgs {
+            no_claude_plugins: true,
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert!(!config.plugins.claude_code_cache);
+        assert!(config.plugins.enabled);
+    }
+
+    #[test]
+    fn test_plugins_dir_from_cli() {
+        std::env::remove_var("REMIX_LLM_BASE_URL");
+        std::env::remove_var("REMIX_LLM_API_KEY");
+        std::env::remove_var("REMIX_LLM_MODEL");
+        std::env::remove_var("REMIX_PLUGINS_DIR");
+
+        let args = RunArgs {
+            plugins_dir: Some(PathBuf::from("/custom/plugins")),
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert!(config
+            .plugins
+            .sources
+            .iter()
+            .any(|s| s.path == Some(PathBuf::from("/custom/plugins"))));
+    }
+
+    #[test]
+    fn test_plugins_dir_from_env() {
+        std::env::remove_var("REMIX_LLM_BASE_URL");
+        std::env::remove_var("REMIX_LLM_API_KEY");
+        std::env::remove_var("REMIX_LLM_MODEL");
+
+        std::env::set_var("REMIX_PLUGINS_DIR", "/env/plugins");
+        let args = default_run_args();
+        let config = load_config(&args).unwrap();
+        assert!(config
+            .plugins
+            .sources
+            .iter()
+            .any(|s| s.path == Some(PathBuf::from("/env/plugins"))));
+        std::env::remove_var("REMIX_PLUGINS_DIR");
+    }
+
+    #[test]
+    fn test_plugins_config_from_yaml() {
+        std::env::remove_var("REMIX_LLM_BASE_URL");
+        std::env::remove_var("REMIX_LLM_API_KEY");
+        std::env::remove_var("REMIX_LLM_MODEL");
+        std::env::remove_var("REMIX_PLUGINS_DIR");
+
+        let yaml = r#"
+task: "test"
+plugins:
+  enabled: true
+  claude_code_cache: false
+  sources:
+    - path: "/yaml/plugins"
+    - github: "owner/repo"
+      git_ref: "main"
+  components:
+    skills: true
+    mcp_servers: false
+    hooks: true
+    agents: false
+"#;
+        let file = write_yaml_tempfile(yaml);
+        let args = RunArgs {
+            config: Some(file.path().to_path_buf()),
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert!(config.plugins.enabled);
+        assert!(!config.plugins.claude_code_cache);
+        assert_eq!(config.plugins.sources.len(), 2);
+        assert!(config.plugins.components.skills);
+        assert!(!config.plugins.components.mcp_servers);
+    }
+
+    #[test]
+    fn test_session_dir_from_cli() {
+        std::env::remove_var("REMIX_LLM_BASE_URL");
+        std::env::remove_var("REMIX_LLM_API_KEY");
+        std::env::remove_var("REMIX_LLM_MODEL");
+        std::env::remove_var("REMIX_SESSION_DIR");
+
+        let args = RunArgs {
+            session_dir: Some(PathBuf::from("/custom/sessions")),
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert_eq!(
+            config.session.storage_dir,
+            PathBuf::from("/custom/sessions")
+        );
+    }
+
+    #[test]
+    fn test_permission_mode_from_cli() {
+        std::env::remove_var("REMIX_LLM_BASE_URL");
+        std::env::remove_var("REMIX_LLM_API_KEY");
+        std::env::remove_var("REMIX_LLM_MODEL");
+
+        let args = RunArgs {
+            permission_mode: Some("bypass_permissions".to_string()),
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert_eq!(
+            config.permissions.mode,
+            schema::PermissionModeConfig::BypassPermissions
+        );
+    }
+
+    #[test]
+    fn test_invalid_permission_mode_error() {
+        std::env::remove_var("REMIX_LLM_BASE_URL");
+        std::env::remove_var("REMIX_LLM_API_KEY");
+        std::env::remove_var("REMIX_LLM_MODEL");
+
+        let args = RunArgs {
+            permission_mode: Some("invalid_mode".to_string()),
+            ..default_run_args()
+        };
+        let result = load_config(&args);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid permission mode"));
+    }
+
+    #[test]
+    fn test_allow_deny_tools_from_cli() {
+        std::env::remove_var("REMIX_LLM_BASE_URL");
+        std::env::remove_var("REMIX_LLM_API_KEY");
+        std::env::remove_var("REMIX_LLM_MODEL");
+
+        let args = RunArgs {
+            allow_tool: vec!["navigate".to_string(), "click".to_string()],
+            deny_tool: vec!["bash".to_string()],
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert_eq!(config.permissions.allowed_tools, vec!["navigate", "click"]);
+        assert_eq!(config.permissions.denied_tools, vec!["bash"]);
     }
 }

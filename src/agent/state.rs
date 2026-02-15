@@ -2,6 +2,7 @@ use std::time::Instant;
 
 use crate::llm::types::{ContentBlock, Message, Role};
 use crate::output::result::{AgentResult, AgentStatus, StepRecord};
+use crate::session::types::SessionSnapshot;
 
 pub struct AgentState {
     messages: Vec<Message>,
@@ -26,6 +27,18 @@ impl AgentState {
             start_time: Instant::now(),
             total_input_tokens: 0,
             total_output_tokens: 0,
+        }
+    }
+
+    /// Restore state from a session snapshot (used when resuming a session).
+    pub fn from_snapshot(snapshot: &SessionSnapshot) -> Self {
+        Self {
+            messages: snapshot.messages.clone(),
+            steps: snapshot.steps.clone(),
+            iteration: snapshot.iteration,
+            start_time: Instant::now(),
+            total_input_tokens: snapshot.metadata.total_input_tokens.unwrap_or(0),
+            total_output_tokens: snapshot.metadata.total_output_tokens.unwrap_or(0),
         }
     }
 
@@ -68,6 +81,37 @@ impl AgentState {
             self.total_input_tokens += u.input_tokens;
             self.total_output_tokens += u.output_tokens;
         }
+    }
+
+    pub fn total_input_tokens(&self) -> u32 {
+        self.total_input_tokens
+    }
+
+    pub fn total_output_tokens(&self) -> u32 {
+        self.total_output_tokens
+    }
+
+    pub fn steps(&self) -> &[StepRecord] {
+        &self.steps
+    }
+
+    /// Compact the message history by replacing older messages with a summary.
+    /// Preserves the most recent `preserve_n` messages.
+    pub fn compact(&mut self, summary: &str, preserve_n: usize) {
+        if self.messages.len() <= preserve_n {
+            return;
+        }
+        let preserve_start = self.messages.len() - preserve_n;
+        let preserved: Vec<Message> = self.messages.drain(preserve_start..).collect();
+        self.messages.clear();
+        // Insert summary as the first message
+        self.messages.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: format!("<summary>\n{summary}\n</summary>"),
+            }],
+        });
+        self.messages.extend(preserved);
     }
 
     pub fn into_result(self, status: AgentStatus, final_text: Option<String>) -> AgentResult {
@@ -301,5 +345,163 @@ mod tests {
         let result = state.into_result(AgentStatus::Success, Some("done".to_string()));
         assert_eq!(result.total_input_tokens, None);
         assert_eq!(result.total_output_tokens, None);
+    }
+
+    #[test]
+    fn test_compact_replaces_old_messages_with_summary() {
+        let mut state = AgentState::new("initial task");
+        // Add some messages: initial user + 4 more
+        state.add_assistant_message(vec![ContentBlock::Text {
+            text: "response 1".to_string(),
+        }]);
+        state.add_tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: "t1".to_string(),
+            content: "result 1".to_string(),
+            is_error: None,
+        }]);
+        state.add_assistant_message(vec![ContentBlock::Text {
+            text: "response 2".to_string(),
+        }]);
+        state.add_tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: "t2".to_string(),
+            content: "result 2".to_string(),
+            is_error: None,
+        }]);
+        // Total: 5 messages
+        assert_eq!(state.messages().len(), 5);
+
+        state.compact("This is a summary of the conversation", 2);
+
+        // Should have: 1 summary + 2 preserved = 3
+        assert_eq!(state.messages().len(), 3);
+        // First message should be summary
+        match &state.messages()[0].content[0] {
+            ContentBlock::Text { text } => {
+                assert!(text.contains("<summary>"));
+                assert!(text.contains("This is a summary"));
+            }
+            _ => panic!("Expected Text content block"),
+        }
+    }
+
+    #[test]
+    fn test_compact_noop_when_few_messages() {
+        let mut state = AgentState::new("task");
+        state.add_assistant_message(vec![ContentBlock::Text {
+            text: "resp".to_string(),
+        }]);
+        // 2 messages, preserve_n=4 → no compaction
+        state.compact("summary", 4);
+        assert_eq!(state.messages().len(), 2);
+    }
+
+    #[test]
+    fn test_total_input_tokens_accessor() {
+        let mut state = AgentState::new("task");
+        assert_eq!(state.total_input_tokens(), 0);
+        state.accumulate_usage(Some(&crate::llm::types::Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+        }));
+        assert_eq!(state.total_input_tokens(), 100);
+        assert_eq!(state.total_output_tokens(), 50);
+    }
+
+    #[test]
+    fn test_steps_accessor() {
+        let mut state = AgentState::new("task");
+        assert!(state.steps().is_empty());
+        state.record_step(StepRecord {
+            iteration: 1,
+            tool: "test".to_string(),
+            input: json!({}),
+            output: json!({}),
+            duration_ms: 0,
+            is_error: None,
+        });
+        assert_eq!(state.steps().len(), 1);
+    }
+
+    #[test]
+    fn test_from_snapshot_restores_state() {
+        use crate::llm::types::Role;
+        use crate::session::types::{SessionId, SessionMetadata, SessionSnapshot, SessionStatus};
+        use chrono::Utc;
+
+        let now = Utc::now();
+        let snapshot = SessionSnapshot {
+            metadata: SessionMetadata {
+                id: SessionId("test-session".to_string()),
+                created_at: now,
+                updated_at: now,
+                task: "original task".to_string(),
+                status: SessionStatus::InProgress,
+                total_input_tokens: Some(500),
+                total_output_tokens: Some(200),
+                parent_session_id: None,
+            },
+            messages: vec![
+                crate::llm::types::Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: "original task".to_string(),
+                    }],
+                },
+                crate::llm::types::Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "response".to_string(),
+                    }],
+                },
+            ],
+            steps: vec![StepRecord {
+                iteration: 1,
+                tool: "navigate".to_string(),
+                input: json!({"url": "https://example.com"}),
+                output: json!({"success": true}),
+                duration_ms: 100,
+                is_error: None,
+            }],
+            system_prompt: Some("system prompt".to_string()),
+            iteration: 3,
+        };
+
+        let state = AgentState::from_snapshot(&snapshot);
+        assert_eq!(state.messages().len(), 2);
+        assert_eq!(state.steps().len(), 1);
+        assert_eq!(state.current_iteration(), 3);
+        assert_eq!(state.total_input_tokens(), 500);
+        assert_eq!(state.total_output_tokens(), 200);
+    }
+
+    #[test]
+    fn test_from_snapshot_empty() {
+        use crate::session::types::{SessionId, SessionMetadata, SessionSnapshot, SessionStatus};
+        use chrono::Utc;
+
+        let now = Utc::now();
+        let snapshot = SessionSnapshot {
+            metadata: SessionMetadata {
+                id: SessionId("empty-session".to_string()),
+                created_at: now,
+                updated_at: now,
+                task: "empty".to_string(),
+                status: SessionStatus::InProgress,
+                total_input_tokens: None,
+                total_output_tokens: None,
+                parent_session_id: None,
+            },
+            messages: vec![],
+            steps: vec![],
+            system_prompt: None,
+            iteration: 0,
+        };
+
+        let state = AgentState::from_snapshot(&snapshot);
+        assert!(state.messages().is_empty());
+        assert!(state.steps().is_empty());
+        assert_eq!(state.current_iteration(), 0);
+        assert_eq!(state.total_input_tokens(), 0);
+        assert_eq!(state.total_output_tokens(), 0);
     }
 }

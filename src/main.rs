@@ -12,6 +12,17 @@ use remix_agent_runtime::config::load_config;
 use remix_agent_runtime::error::ExitStatus;
 use remix_agent_runtime::llm::client::AnthropicClient;
 use remix_agent_runtime::output::webhook::WebhookDispatcher;
+use remix_agent_runtime::permissions::{PermissionAwareExecutor, PermissionMode, PermissionPolicy};
+use remix_agent_runtime::plugins::components::agents::{
+    discover_agents_in_files, inject_agents_into_system_prompt,
+};
+use remix_agent_runtime::plugins::components::hooks::HookRegistry;
+use remix_agent_runtime::plugins::components::mcp::{build_mcp_command, parse_mcp_config};
+use remix_agent_runtime::plugins::components::skills::merge_plugin_skills;
+use remix_agent_runtime::plugins::discovery::discover_all_plugins;
+use remix_agent_runtime::plugins::{CompositeToolExecutor, HookAwareExecutor};
+use remix_agent_runtime::session::SessionStore;
+use remix_agent_runtime::subagent::SubagentExecutor;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -138,9 +149,109 @@ async fn main() -> ExitCode {
                 None
             };
 
-            // Wrap MCP client with skill-aware executor
+            // Discover plugins
+            let plugin_set = match discover_all_plugins(&config.plugins) {
+                Ok(set) => {
+                    if !set.is_empty() {
+                        tracing::info!(count = set.len(), "Discovered plugins");
+                    }
+                    set
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Plugin discovery failed, continuing without plugins");
+                    remix_agent_runtime::plugins::PluginSet::new()
+                }
+            };
+
+            // Merge plugin skills into the skill set
+            let mut skill_set = skill_set;
+            if config.plugins.components.skills {
+                if let Err(e) = merge_plugin_skills(&plugin_set, &mut skill_set) {
+                    tracing::warn!(error = %e, "Failed to merge plugin skills, continuing");
+                }
+            }
+
+            // Build hook registry from plugin hooks
+            let mut hook_registry = HookRegistry::new();
+            if config.plugins.components.hooks {
+                for (plugin, hooks_path) in plugin_set.all_hook_configs() {
+                    if let Err(e) = hook_registry.load_from_file(hooks_path, &plugin.root_path) {
+                        tracing::warn!(
+                            plugin = %plugin.name,
+                            error = %e,
+                            "Failed to load plugin hooks, skipping"
+                        );
+                    }
+                }
+            }
+
+            // Discover plugin agents and inject into system prompt
+            let mut agent_config = config.agent.clone();
+            if config.plugins.components.agents {
+                let agent_file_refs: Vec<&std::path::PathBuf> = plugin_set
+                    .all_agent_files()
+                    .into_iter()
+                    .map(|(_, f)| f)
+                    .collect();
+                let plugin_agents = discover_agents_in_files(&agent_file_refs);
+                if !plugin_agents.is_empty() {
+                    tracing::info!(count = plugin_agents.len(), "Discovered plugin agents");
+                    if let Some(agents_prompt) = inject_agents_into_system_prompt(&plugin_agents) {
+                        let existing = agent_config.system_prompt.take().unwrap_or_default();
+                        agent_config.system_prompt = if existing.is_empty() {
+                            Some(agents_prompt)
+                        } else {
+                            Some(format!("{existing}\n\n{agents_prompt}"))
+                        };
+                    }
+                }
+            }
+
+            // Build CompositeToolExecutor with browser + plugin MCP servers
+            let mut composite = CompositeToolExecutor::new();
+            composite.add_backend(Box::new(mcp_client));
+
+            if config.plugins.components.mcp_servers {
+                for (plugin, config_path) in plugin_set.all_mcp_configs() {
+                    match parse_mcp_config(config_path, &plugin.root_path) {
+                        Ok(mcp_config) => {
+                            for (server_name, server_config) in &mcp_config.mcpServers {
+                                let cmd = build_mcp_command(server_config, &plugin.root_path);
+                                match McpBrowserClient::connect(cmd).await {
+                                    Ok(client) => {
+                                        tracing::info!(
+                                            plugin = %plugin.name,
+                                            server = %server_name,
+                                            tools = client.tool_definitions().len(),
+                                            "Connected plugin MCP server"
+                                        );
+                                        composite.add_backend(Box::new(client));
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            plugin = %plugin.name,
+                                            server = %server_name,
+                                            error = %e,
+                                            "Failed to connect plugin MCP server, skipping"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                plugin = %plugin.name,
+                                error = %e,
+                                "Failed to parse plugin .mcp.json, skipping"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Wrap composite executor with skill-aware executor
             let executor = remix_agent_runtime::skills::SkillAwareExecutor::new(
-                mcp_client,
+                composite,
                 skill_set.clone(),
                 config.skills.script_timeout_secs,
             );
@@ -162,14 +273,124 @@ async fn main() -> ExitCode {
                 }
             };
 
-            // Run agent
-            let runner = AgentRunner::new(llm_client, executor, config.agent.clone());
-            let result = runner
-                .run(&task, &credential_set, &skill_set, &agents_md)
-                .await;
+            // Wrap with hook-aware executor
+            let executor =
+                HookAwareExecutor::new(executor, hook_registry, config.plugins.hook_timeout_secs);
 
-            // Gracefully shut down the MCP browser connection
-            runner.into_tools().into_inner().into_inner().shutdown();
+            // Wrap with permission-aware executor
+            let permission_mode = match config.permissions.mode {
+                remix_agent_runtime::config::schema::PermissionModeConfig::Default => {
+                    PermissionMode::Default
+                }
+                remix_agent_runtime::config::schema::PermissionModeConfig::AcceptEdits => {
+                    PermissionMode::AcceptEdits
+                }
+                remix_agent_runtime::config::schema::PermissionModeConfig::BypassPermissions => {
+                    PermissionMode::BypassPermissions
+                }
+                remix_agent_runtime::config::schema::PermissionModeConfig::Plan => {
+                    PermissionMode::Plan
+                }
+            };
+            let permission_policy = PermissionPolicy {
+                mode: permission_mode,
+                allowed_tools: config.permissions.allowed_tools.clone(),
+                denied_tools: config.permissions.denied_tools.clone(),
+            };
+            let executor = PermissionAwareExecutor::new(executor, permission_policy);
+
+            // Wrap with subagent executor
+            let executor = SubagentExecutor::new(executor, config.subagent.clone());
+
+            // Set up session store
+            let session_store = if config.session.enabled {
+                Some(SessionStore::new(
+                    config.session.storage_dir.clone(),
+                    config.session.max_sessions,
+                ))
+            } else {
+                None
+            };
+
+            // Set up compaction config
+            let compaction_config = if config.compaction.enabled {
+                Some(config.compaction.clone())
+            } else {
+                None
+            };
+
+            // Handle session resume/fork
+            let runner = AgentRunner::new(llm_client, executor, agent_config);
+            let result = if let Some(ref session_id) = args.session_id {
+                // Resume existing session
+                let store = session_store.as_ref().unwrap_or_else(|| {
+                    eprintln!("Error: --session-id requires sessions to be enabled");
+                    std::process::exit(2);
+                });
+                let sid = remix_agent_runtime::session::SessionId(session_id.clone());
+                runner
+                    .resume(
+                        store,
+                        &sid,
+                        &credential_set,
+                        &skill_set,
+                        &agents_md,
+                        compaction_config.as_ref(),
+                    )
+                    .await
+            } else if let Some(ref fork_id) = args.fork_session {
+                // Fork from existing session, then run fresh with forked state
+                let store = session_store.as_ref().unwrap_or_else(|| {
+                    eprintln!("Error: --fork-session requires sessions to be enabled");
+                    std::process::exit(2);
+                });
+                let source_id = remix_agent_runtime::session::SessionId(fork_id.clone());
+                match store.fork(&source_id) {
+                    Ok(forked_metadata) => {
+                        tracing::info!(
+                            forked_session = %forked_metadata.id,
+                            source = %source_id,
+                            "Forked session"
+                        );
+                        runner
+                            .resume(
+                                store,
+                                &forked_metadata.id,
+                                &credential_set,
+                                &skill_set,
+                                &agents_md,
+                                compaction_config.as_ref(),
+                            )
+                            .await
+                    }
+                    Err(e) => {
+                        eprintln!("Error: Failed to fork session: {e}");
+                        return ExitStatus::AgentError.into();
+                    }
+                }
+            } else {
+                runner
+                    .run_with_options(
+                        &task,
+                        &credential_set,
+                        &skill_set,
+                        &agents_md,
+                        session_store.as_ref(),
+                        compaction_config.as_ref(),
+                    )
+                    .await
+            };
+
+            // Gracefully shut down all MCP connections
+            // Chain: SubagentExecutor -> PermissionAwareExecutor -> HookAwareExecutor -> LocalToolsExecutor -> SkillAwareExecutor -> CompositeToolExecutor
+            runner
+                .into_tools()
+                .into_inner()
+                .into_inner()
+                .into_inner()
+                .into_inner()
+                .into_inner()
+                .shutdown_all();
 
             match result {
                 Ok(agent_result) => {

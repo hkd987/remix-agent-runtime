@@ -7,44 +7,56 @@ LLM-driven browser automation agent runtime. Give it a task in plain English, an
 ## How it works
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    remix-agent-runtime                   │
-│                                                         │
-│   "Log into GitHub and star the remix-browser repo"     │
-│                          │                              │
-│                          ▼                              │
-│  AGENTS.md ──► ┌────────────────┐ ◄── Credentials       │
-│  instructions  │   Agent Loop   │     (remix-           │
-│                └───────┬────────┘      credentials)     │
-│                   ▲    │                                │
-│          results  │    │ tool calls                      │
-│                   │    ▼                                │
-│    ┌──────────────┴──────────────────────┐              │
-│    │          Tool Router                 │              │
-│    │  ┌─────────┐  ┌──────┐  ┌────────┐ │              │
-│    │  │ Browser  │  │Local │  │ Skills │ │              │
-│    │  │  (MCP)   │  │Tools │  │        │ │              │
-│    │  └────┬─────┘  └──┬───┘  └────────┘ │              │
-│    └───────┼────────────┼────────────────┘              │
-│            │            │                               │
-│  ┌─────────┘     ┌──────┘                              │
-│  │               │                                      │
-│  ▼               ▼                                      │
-│  remix-browser   Sandboxed filesystem                   │
-│  (MCP Server)    (Seatbelt/Landlock)                   │
-│       │                                                 │
-└───────┼─────────────────────────────────────────────────┘
-        │ CDP
-        ▼
-  ┌──────────────┐
-  │    Chrome     │
-  └──────────────┘
+                         remix-agent-runtime
+ ┌───────────────────────────────────────────────────────────┐
+ │                                                           │
+ │   "Log into GitHub and star the remix-browser repo"       │
+ │                          │                                │
+ │                          ▼                                │
+ │  AGENTS.md ──► ┌────────────────┐ ◄── Credentials         │
+ │  instructions  │   Agent Loop   │     (remix-credentials) │
+ │                └───────┬────────┘                         │
+ │                   ▲    │                                  │
+ │          results  │    │ tool calls                        │
+ │                   │    ▼                                  │
+ │    ┌──────────────┴──────────────────────────────────┐    │
+ │    │             Decorator Chain                      │    │
+ │    │                                                  │    │
+ │    │  ┌─────────────────────────────────────────┐    │    │
+ │    │  │ HookAwareExecutor (pre/post tool hooks) │    │    │
+ │    │  └──────────────────┬──────────────────────┘    │    │
+ │    │                     │                            │    │
+ │    │  ┌──────────────────┴──────────────────────┐    │    │
+ │    │  │ LocalToolsExecutor (6 sandboxed tools)  │    │    │
+ │    │  └──────────────────┬──────────────────────┘    │    │
+ │    │                     │                            │    │
+ │    │  ┌──────────────────┴──────────────────────┐    │    │
+ │    │  │ SkillAwareExecutor (3 skill tools)      │    │    │
+ │    │  └──────────────────┬──────────────────────┘    │    │
+ │    │                     │                            │    │
+ │    │  ┌──────────────────┴──────────────────────┐    │    │
+ │    │  │ CompositeToolExecutor (MCP backends)    │    │    │
+ │    │  └────┬────────────────────────────────────┘    │    │
+ │    └───────┼────────────────────────────────────────┘    │
+ │            │                                             │
+ │  ┌─────────┘     ┌──────────────────────┐                │
+ │  │               │ Sandboxed filesystem │                │
+ │  ▼               │ (Seatbelt/Landlock)  │                │
+ │  remix-browser   └──────────────────────┘                │
+ │  (MCP Server)                                            │
+ │       │                                                  │
+ └───────┼──────────────────────────────────────────────────┘
+         │ CDP
+         ▼
+   ┌──────────────┐
+   │    Chrome     │
+   └──────────────┘
 ```
 
 1. You provide a task in natural language
-2. The agent sends the task + available browser tools to the LLM
-3. The LLM decides which tools to call (navigate, click, type, screenshot, etc.)
-4. The agent executes those tools against a real Chrome browser via [remix-browser](https://github.com/hkd987/remix-browser)
+2. The agent sends the task + available tools to the LLM
+3. The LLM decides which tools to call (navigate, click, type, read_file, bash, etc.)
+4. Tool calls pass through the decorator chain: hooks fire, local tools and skills are intercepted, everything else routes to the browser MCP backend
 5. Results go back to the LLM, which decides the next action
 6. Loop continues until the task is complete or a stopping condition is hit
 7. Structured JSON output with every step recorded
@@ -53,9 +65,9 @@ LLM-driven browser automation agent runtime. Give it a task in plain English, an
 
 | Project | Role |
 |---------|------|
-| [remix-browser](https://github.com/hkd987/remix-browser) | Rust-native MCP server for Chrome automation — 18+ tools for navigation, clicking, typing, screenshots, network monitoring, and more |
+| [remix-browser](https://github.com/hkd987/remix-browser) | Rust-native MCP server for Chrome automation -- 18+ tools for navigation, clicking, typing, screenshots, network monitoring, and more |
 | [remix-credentials](https://github.com/hkd987/remix-credentials) | Secure credential management with AES-256-GCM encryption, Argon2id key derivation, and zeroizable memory |
-| **remix-agent-runtime** (this project) | The agent loop that ties it all together — connects an LLM to browser tools and runs autonomously |
+| **remix-agent-runtime** (this project) | The agent loop that ties it all together -- connects an LLM to browser tools and runs autonomously |
 
 ## Quick start
 
@@ -66,7 +78,7 @@ LLM-driven browser automation agent runtime. Give it a task in plain English, an
 
 ### Install
 
-One command installs both `remix-agent` and `remix-browser` — no Rust toolchain needed:
+One command installs both `remix-agent` and `remix-browser` -- no Rust toolchain needed:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hkd987/remix-agent-runtime/main/scripts/install.sh | sh
@@ -111,23 +123,26 @@ remix-agent run [OPTIONS] [TASK]
 
 | Flag | Short | Env Var | Description |
 |------|-------|---------|-------------|
-| `--config <PATH>` | `-c` | — | Path to YAML configuration file |
-| `--api-key <KEY>` | — | `REMIX_LLM_API_KEY` | LLM provider API key |
-| `--base-url <URL>` | — | `REMIX_LLM_BASE_URL` | LLM provider base URL (default: Anthropic) |
-| `--model <NAME>` | — | `REMIX_LLM_MODEL` | Model ID (default: `claude-sonnet-4-20250514`) |
-| `--max-tokens <N>` | — | — | Max tokens per response (default: 8192) |
-| `--timeout <SECS>` | — | — | Max duration in seconds |
-| `--max-iterations <N>` | — | — | Max agent loop iterations (default: 50) |
-| `--headed` | — | — | Show the browser window |
-| `--verbose` | `-v` | — | Debug logging to stderr |
-| `--output <PATH>` | `-o` | — | Write JSON results to file |
-| `--browser-path <PATH>` | — | `REMIX_BROWSER_PATH` | Path to remix-browser binary |
-| `--agents-md-dir <PATH>` | — | `REMIX_AGENTS_MD_DIR` | Override AGENTS.md search directory |
-| `--no-agents-md` | — | — | Disable AGENTS.md discovery |
-| `--no-local-tools` | — | — | Disable local filesystem tools |
-| `--sandbox-dir <PATH>` | — | `REMIX_SANDBOX_DIR` | Sandbox root for local tools |
-| `--skills-dir <PATH>` | — | `REMIX_SKILLS_DIR` | Additional skills directory |
-| `--no-skills` | — | — | Disable skill discovery |
+| `--config <PATH>` | `-c` | -- | Path to YAML configuration file |
+| `--api-key <KEY>` | -- | `REMIX_LLM_API_KEY` | LLM provider API key |
+| `--base-url <URL>` | -- | `REMIX_LLM_BASE_URL` | LLM provider base URL (default: Anthropic) |
+| `--model <NAME>` | -- | `REMIX_LLM_MODEL` | Model ID (default: `claude-sonnet-4-20250514`) |
+| `--max-tokens <N>` | -- | -- | Max tokens per response (default: 8192) |
+| `--timeout <SECS>` | -- | -- | Max duration in seconds |
+| `--max-iterations <N>` | -- | -- | Max agent loop iterations (default: 50) |
+| `--headed` | -- | -- | Show the browser window |
+| `--verbose` | `-v` | -- | Debug logging to stderr |
+| `--output <PATH>` | `-o` | -- | Write JSON results to file |
+| `--browser-path <PATH>` | -- | `REMIX_BROWSER_PATH` | Path to remix-browser binary |
+| `--agents-md-dir <PATH>` | -- | `REMIX_AGENTS_MD_DIR` | Override AGENTS.md search directory |
+| `--no-agents-md` | -- | -- | Disable AGENTS.md discovery |
+| `--no-local-tools` | -- | -- | Disable local filesystem tools |
+| `--sandbox-dir <PATH>` | -- | `REMIX_SANDBOX_DIR` | Sandbox root for local tools |
+| `--skills-dir <PATH>` | -- | `REMIX_SKILLS_DIR` | Additional skills directory |
+| `--no-skills` | -- | -- | Disable skill discovery |
+| `--no-plugins` | -- | -- | Disable all plugin discovery |
+| `--plugins-dir <PATH>` | -- | `REMIX_PLUGINS_DIR` | Additional plugin directory |
+| `--no-claude-plugins` | -- | -- | Disable Claude Code plugin cache |
 
 ### Examples
 
@@ -146,6 +161,9 @@ remix-agent run --output results.json "Find the price of item X on site Y"
 
 # Full config file
 remix-agent run --config task.yaml --verbose
+
+# With a local plugin
+remix-agent run --plugins-dir ./my-plugin "Run my custom workflow"
 ```
 
 ### Using different LLM providers
@@ -241,6 +259,20 @@ skills:
   enabled: true
   script_timeout_secs: 60
 
+plugins:
+  enabled: true
+  claude_code_cache: true
+  hook_timeout_secs: 30
+  sources:
+    - path: "/path/to/local-plugin"
+    - github: "owner/repo"
+      git_ref: "v1.0"
+  components:
+    skills: true
+    mcp_servers: true
+    hooks: true
+    agents: true
+
 on_complete:
   url: "https://hooks.slack.com/your-webhook"
   format: "json"
@@ -254,7 +286,7 @@ Environment variables can be interpolated in YAML using `${VAR_NAME}` syntax.
 
 ### Credentials
 
-Credentials are securely managed via [remix-credentials](https://github.com/hkd987/remix-credentials) — values use zeroizable memory and are redacted from logs.
+Credentials are securely managed via [remix-credentials](https://github.com/hkd987/remix-credentials) -- values use zeroizable memory and are redacted from logs.
 
 ```yaml
 credentials:
@@ -325,6 +357,7 @@ Discovery searches these directories in order:
 2. `~/.remix/skills/` (user-global)
 3. `--skills-dir` CLI flag or `REMIX_SKILLS_DIR` env var
 4. YAML `skills.dirs` entries
+5. Skills contributed by plugins
 
 Three virtual tools are added when skills are discovered:
 - `load_skill` -- Load a skill's instructions into context
@@ -332,6 +365,81 @@ Three virtual tools are added when skills are discovered:
 - `read_skill_resource` -- Read a file from a skill's directory
 
 Disable with `--no-skills`.
+
+### Plugins
+
+The plugin system extends the agent with additional skills, MCP servers, hooks, and agents from external sources. Plugins are discovered from three sources:
+
+1. **Claude Code cache** (`~/.claude/plugins/installed_plugins.json`) -- automatically discovers plugins installed by Claude Code
+2. **Local directories** -- point to a plugin directory on disk via config or `--plugins-dir`
+3. **GitHub repositories** -- clone and cache a plugin repo via config
+
+A plugin is a directory containing any combination of:
+
+```
+my-plugin/
+├── skills/           # Skill definitions (merged into SkillSet)
+│   └── my-skill/
+│       └── SKILL.md
+├── hooks/            # Pre/post tool-use hooks
+│   └── hooks.json
+├── agents/           # Agent definitions (injected into system prompt)
+│   └── researcher.md
+└── .mcp.json         # MCP server configuration
+```
+
+Each component type can be individually enabled or disabled via `plugins.components` in the YAML config.
+
+#### Hooks
+
+Hooks fire shell commands before and/or after tool calls. They receive JSON context via stdin containing the tool name, input arguments, and (for post-hooks) the tool output. Hook failures are logged and never block the agent loop.
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "navigate|click",
+        "hooks": [{ "type": "command", "command": "echo pre-hook ran" }]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "screenshot",
+        "hooks": [{ "type": "command", "command": "./process-screenshot.sh" }]
+      }
+    ]
+  }
+}
+```
+
+Matchers use regex patterns (pipe-separated alternatives, anchored to full tool name).
+
+#### Plugin agents
+
+Agent definitions are markdown files with YAML frontmatter. Discovered agents are injected into the system prompt so the LLM knows they are available:
+
+```markdown
+---
+name: researcher
+description: Searches the web for information
+model: claude-sonnet-4-20250514
+tools:
+  - web_search
+  - read_file
+---
+# Researcher Agent
+
+You are a research specialist...
+```
+
+#### CLI flags
+
+| Flag | Env Var | Description |
+|------|---------|-------------|
+| `--no-plugins` | -- | Disable all plugin discovery |
+| `--plugins-dir <PATH>` | `REMIX_PLUGINS_DIR` | Additional plugin directory |
+| `--no-claude-plugins` | -- | Disable Claude Code plugin cache discovery |
 
 ### Webhooks
 
@@ -410,56 +518,78 @@ cargo fmt --check
 
 ## Architecture
 
+The runtime uses a **decorator chain** pattern where each layer intercepts tool calls it owns and delegates everything else to the next layer:
+
 ```
-src/
-├── main.rs                 # CLI entry point, config loading
-├── cli.rs                  # Argument parsing (clap)
-├── error.rs                # Error types and exit codes
-├── agents_md/
-│   ├── mod.rs              # Public API re-exports
-│   └── discovery.rs        # AGENTS.md walk + injection
-├── agent/
-│   ├── loop_impl.rs        # Core agent loop (AgentRunner)
-│   └── state.rs            # Message history + step recording
-├── browser/
-│   ├── mcp.rs              # MCP client (tool discovery + execution)
-│   ├── manager.rs          # Browser process lifecycle
-│   └── convert.rs          # MCP → Anthropic schema conversion
-├── llm/
-│   ├── client.rs           # Anthropic HTTP client with retry
-│   └── types.rs            # Message, ContentBlock, ToolDefinition
-├── config/
-│   ├── mod.rs              # Config merging (CLI > env > YAML > defaults)
-│   ├── schema.rs           # AppConfig, LlmConfig, BrowserConfig
-│   ├── credentials.rs      # Credential adapter (RawCredential → CredentialSet)
-│   └── env.rs              # ${VAR} interpolation
-├── local_tools/
-│   ├── mod.rs              # Public API re-exports
-│   ├── executor.rs         # LocalToolsExecutor decorator
-│   ├── sandbox/
-│   │   ├── mod.rs          # BashSandbox trait + factory
-│   │   ├── path_validator.rs  # Sandbox path enforcement
-│   │   ├── seatbelt.rs     # macOS sandbox-exec wrapper
-│   │   └── landlock.rs     # Linux Landlock LSM wrapper
-│   └── tools/
-│       ├── mod.rs           # Tool module re-exports
-│       ├── read_file.rs     # read_file tool
-│       ├── write_file.rs    # write_file tool
-│       ├── edit_file.rs     # edit_file tool
-│       ├── bash.rs          # bash tool
-│       ├── grep.rs          # grep tool
-│       └── glob_tool.rs     # glob tool
-├── skills/
-│   ├── mod.rs              # Public API re-exports
-│   ├── discovery.rs        # Skill discovery + parsing
-│   ├── executor.rs         # SkillAwareExecutor decorator
-│   └── types.rs            # SkillSet, SkillEntry, SkillMetadata
-└── output/
-    ├── result.rs           # AgentResult, StepRecord
-    └── webhook.rs          # Webhook dispatcher
+HookAwareExecutor          ← fires pre/post hooks around every tool call
+  └─ LocalToolsExecutor    ← intercepts read_file, write_file, edit_file, bash, grep, glob
+       └─ SkillAwareExecutor  ← intercepts load_skill, run_skill_script, read_skill_resource
+            └─ CompositeToolExecutor  ← routes to MCP backends (remix-browser, plugins)
 ```
 
-The agent loop uses `LlmProvider` and `ToolExecutor` traits, making every component independently testable with mocks.
+All components implement the `ToolExecutor` trait, making every layer independently testable with mocks. The `LlmProvider` trait abstracts the LLM HTTP client for the same reason.
+
+```
+src/
+├── main.rs                    # CLI entry point, decorator chain wiring
+├── cli.rs                     # Argument parsing (clap)
+├── lib.rs                     # Public module re-exports
+├── error.rs                   # Error types and exit codes
+├── agent/
+│   ├── loop_impl.rs           # Core agent loop (AgentRunner)
+│   └── state.rs               # Message history + step recording
+├── agents_md/
+│   ├── mod.rs                 # Public API re-exports
+│   └── discovery.rs           # AGENTS.md walk + injection
+├── browser/
+│   ├── mcp.rs                 # MCP client + ToolExecutor trait definition
+│   ├── manager.rs             # Browser process lifecycle
+│   └── convert.rs             # MCP → Anthropic schema conversion
+├── config/
+│   ├── mod.rs                 # Config merging (CLI > env > YAML > defaults)
+│   ├── schema.rs              # AppConfig, LlmConfig, PluginsConfig, etc.
+│   ├── credentials.rs         # Credential adapter (RawCredential → CredentialSet)
+│   └── env.rs                 # ${VAR} interpolation
+├── llm/
+│   ├── client.rs              # Anthropic HTTP client with retry
+│   └── types.rs               # Message, ContentBlock, ToolDefinition
+├── local_tools/
+│   ├── mod.rs                 # Public API re-exports
+│   ├── executor.rs            # LocalToolsExecutor decorator
+│   ├── sandbox/
+│   │   ├── mod.rs             # BashSandbox trait + factory
+│   │   ├── path_validator.rs  # Sandbox path enforcement
+│   │   ├── seatbelt.rs        # macOS sandbox-exec wrapper
+│   │   └── landlock.rs        # Linux Landlock LSM wrapper
+│   └── tools/
+│       ├── mod.rs             # Tool module re-exports
+│       ├── read_file.rs       # read_file tool
+│       ├── write_file.rs      # write_file tool
+│       ├── edit_file.rs       # edit_file tool
+│       ├── bash.rs            # bash tool
+│       ├── grep.rs            # grep tool
+│       └── glob_tool.rs       # glob tool
+├── output/
+│   ├── result.rs              # AgentResult, StepRecord
+│   └── webhook.rs             # Webhook dispatcher
+├── plugins/
+│   ├── mod.rs                 # Public re-exports
+│   ├── types.rs               # PluginSet, ResolvedPlugin, PluginComponents
+│   ├── discovery.rs           # discover_all_plugins, resolve_local_dir
+│   ├── github.rs              # Git clone/update for GitHub plugins
+│   ├── composite_executor.rs  # CompositeToolExecutor (multi-backend routing)
+│   ├── hook_executor.rs       # HookAwareExecutor decorator
+│   └── components/
+│       ├── skills.rs          # merge_plugin_skills into SkillSet
+│       ├── hooks.rs           # HookRegistry, hooks.json parsing
+│       ├── agents.rs          # Agent .md parsing + system prompt injection
+│       └── mcp.rs             # Plugin MCP server configuration
+└── skills/
+    ├── mod.rs                 # Public API re-exports
+    ├── discovery.rs           # Skill discovery + SKILL.md parsing
+    ├── executor.rs            # SkillAwareExecutor decorator
+    └── types.rs               # SkillSet, SkillEntry, SkillMetadata
+```
 
 ## License
 

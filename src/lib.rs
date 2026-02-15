@@ -7,4 +7,8 @@ pub mod error;
 pub mod llm;
 pub mod local_tools;
 pub mod output;
+pub mod permissions;
+pub mod plugins;
+pub mod session;
 pub mod skills;
+pub mod subagent;

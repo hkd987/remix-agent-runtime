@@ -22,6 +22,10 @@ pub trait ToolExecutor: Send + Sync {
         name: &str,
         arguments: Value,
     ) -> Result<ToolExecutionResult, AgentError>;
+
+    /// Gracefully shut down this executor and release resources.
+    /// Default implementation does nothing.
+    fn shutdown(self: Box<Self>) {}
 }
 
 /// MCP client that connects to remix-browser and executes browser tools.
@@ -83,6 +87,10 @@ impl McpBrowserClient {
 impl ToolExecutor for McpBrowserClient {
     fn tool_definitions(&self) -> &[ToolDefinition] {
         &self.tools
+    }
+
+    fn shutdown(self: Box<Self>) {
+        self.cancel_token.cancel();
     }
 
     async fn execute_tool(

@@ -757,3 +757,432 @@ fn test_e2e_agents_md_with_local_tools() {
         "Expected STATUS_OK_88 in result: {result}"
     );
 }
+
+// ── Session E2E tests ──────────────────────────────────────────────
+
+#[test]
+#[ignore]
+fn test_e2e_session_persistence() {
+    let session_dir = tempfile::TempDir::new().expect("Failed to create session dir");
+    let sandbox_dir = tempfile::TempDir::new().expect("Failed to create sandbox dir");
+
+    std::fs::write(sandbox_dir.path().join("data.txt"), "SESSION_TEST_DATA_42")
+        .expect("Failed to write data.txt");
+
+    let session_path = session_dir.path().to_str().unwrap().to_string();
+    let sandbox_path = sandbox_dir.path().to_str().unwrap().to_string();
+
+    let output = e2e_cmd()
+        .args(run_args(&[
+            "--session-dir",
+            &session_path,
+            "--sandbox-dir",
+            &sandbox_path,
+            "--max-iterations",
+            "5",
+            "Use read_file to read data.txt and report its contents verbatim",
+        ]))
+        .timeout(std::time::Duration::from_secs(120))
+        .output()
+        .expect("Failed to run command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("Invalid JSON: {e}\nstdout: {stdout}\nstderr: {stderr}"));
+
+    assert_eq!(json["status"], "success", "stderr: {stderr}");
+
+    // Verify session files were created on disk
+    let session_entries: Vec<_> = std::fs::read_dir(session_dir.path())
+        .expect("Failed to read session dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+        .collect();
+
+    assert!(
+        !session_entries.is_empty(),
+        "Expected at least one session directory, found none"
+    );
+
+    let first_session = &session_entries[0].path();
+    assert!(
+        first_session.join("metadata.json").exists(),
+        "metadata.json should exist in session dir"
+    );
+    assert!(
+        first_session.join("messages.jsonl").exists(),
+        "messages.jsonl should exist in session dir"
+    );
+    assert!(
+        first_session.join("steps.json").exists(),
+        "steps.json should exist in session dir"
+    );
+
+    // Verify metadata contains expected fields
+    let metadata_content = std::fs::read_to_string(first_session.join("metadata.json"))
+        .expect("Failed to read metadata.json");
+    let metadata: Value =
+        serde_json::from_str(&metadata_content).expect("metadata.json should be valid JSON");
+    assert!(metadata["id"].is_string(), "Session should have an ID");
+    assert_eq!(
+        metadata["status"], "completed",
+        "Session should be completed"
+    );
+    assert!(
+        metadata["task"].as_str().is_some(),
+        "Session should have a task"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_e2e_session_yaml_config() {
+    let session_dir = tempfile::TempDir::new().expect("Failed to create session dir");
+    let sandbox_dir = tempfile::TempDir::new().expect("Failed to create sandbox dir");
+
+    std::fs::write(
+        sandbox_dir.path().join("info.txt"),
+        "YAML_SESSION_MARKER_99",
+    )
+    .expect("Failed to write info.txt");
+
+    let model_line = model()
+        .map(|m| format!("\n  model: \"{m}\""))
+        .unwrap_or_default();
+    let yaml_content = format!(
+        r#"
+task: "Use read_file to read info.txt and report its contents verbatim"
+llm:
+  api_key: "{api_key}"
+  base_url: "{base_url}"{model_line}
+agent:
+  max_iterations: 5
+session:
+  enabled: true
+  storage_dir: "{session_dir}"
+  max_sessions: 10
+local_tools:
+  sandbox_dir: "{sandbox_dir}"
+"#,
+        api_key = api_key(),
+        base_url = base_url(),
+        model_line = model_line,
+        session_dir = session_dir.path().to_str().unwrap(),
+        sandbox_dir = sandbox_dir.path().to_str().unwrap(),
+    );
+
+    let mut tmp =
+        tempfile::NamedTempFile::with_suffix(".yaml").expect("Failed to create temp file");
+    tmp.write_all(yaml_content.as_bytes())
+        .expect("Failed to write YAML config");
+    tmp.flush().expect("Failed to flush");
+
+    let config_path = tmp.path().to_str().unwrap().to_string();
+
+    let output = e2e_cmd()
+        .args(run_args(&["--config", &config_path]))
+        .timeout(std::time::Duration::from_secs(120))
+        .output()
+        .expect("Failed to run command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("Invalid JSON: {e}\nstdout: {stdout}\nstderr: {stderr}"));
+
+    assert_eq!(json["status"], "success", "stderr: {stderr}");
+    let result = json["result"].as_str().unwrap_or("");
+    assert!(
+        result.contains("YAML_SESSION_MARKER_99"),
+        "Expected YAML_SESSION_MARKER_99 in result: {result}"
+    );
+
+    // Verify session directory was created
+    let session_entries: Vec<_> = std::fs::read_dir(session_dir.path())
+        .expect("Failed to read session dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+        .collect();
+    assert!(
+        !session_entries.is_empty(),
+        "Session directory should have been created via YAML config"
+    );
+}
+
+// ── Permissions E2E tests ──────────────────────────────────────────
+
+#[test]
+fn test_e2e_invalid_permission_mode_error() {
+    cmd()
+        .args(["run", "--permission-mode", "invalid_mode", "test task"])
+        .env("REMIX_LLM_API_KEY", "fake-key")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Invalid permission mode"));
+}
+
+#[test]
+#[ignore]
+fn test_e2e_permission_bypass_mode() {
+    let tmp = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let sandbox_dir = tmp.path().to_str().unwrap().to_string();
+
+    let output = e2e_cmd()
+        .args(run_args(&[
+            "--permission-mode",
+            "bypass_permissions",
+            "--sandbox-dir",
+            &sandbox_dir,
+            "--max-iterations",
+            "5",
+            "Use the bash tool to run 'echo BYPASS_MARKER_33' and report the output verbatim",
+        ]))
+        .timeout(std::time::Duration::from_secs(120))
+        .output()
+        .expect("Failed to run command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("Invalid JSON: {e}\nstdout: {stdout}\nstderr: {stderr}"));
+
+    assert_eq!(json["status"], "success", "stderr: {stderr}");
+    let result = json["result"].as_str().unwrap_or("");
+    assert!(
+        result.contains("BYPASS_MARKER_33"),
+        "Expected BYPASS_MARKER_33 in result: {result}"
+    );
+    assert!(
+        assert_tool_was_called(&json["steps"], "bash"),
+        "Expected bash tool call in bypass mode"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_e2e_permission_deny_tool() {
+    let tmp = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let sandbox_dir = tmp.path().to_str().unwrap().to_string();
+
+    std::fs::write(tmp.path().join("allowed.txt"), "DENY_TEST_DATA_66")
+        .expect("Failed to write allowed.txt");
+
+    let output = e2e_cmd()
+        .args(run_args(&[
+            "--deny-tool",
+            "bash",
+            "--sandbox-dir",
+            &sandbox_dir,
+            "--max-iterations",
+            "5",
+            "Read the file allowed.txt using read_file and report its contents. Do NOT use the bash tool.",
+        ]))
+        .timeout(std::time::Duration::from_secs(120))
+        .output()
+        .expect("Failed to run command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("Invalid JSON: {e}\nstdout: {stdout}\nstderr: {stderr}"));
+
+    assert_eq!(json["status"], "success", "stderr: {stderr}");
+    let result = json["result"].as_str().unwrap_or("");
+    assert!(
+        result.contains("DENY_TEST_DATA_66"),
+        "Expected DENY_TEST_DATA_66 in result: {result}"
+    );
+    assert!(
+        assert_tool_was_called(&json["steps"], "read_file"),
+        "Expected read_file tool call"
+    );
+
+    // Verify bash was NOT called (since it was denied)
+    let bash_called = assert_tool_was_called(&json["steps"], "bash");
+    if bash_called {
+        // If bash was called, verify it returned an error
+        let steps = json["steps"].as_array().unwrap();
+        for step in steps {
+            if step["tool"] == "bash" {
+                assert_eq!(
+                    step["is_error"], true,
+                    "bash tool call should have been denied with is_error=true"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn test_e2e_permission_plan_mode_read_only() {
+    let tmp = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let sandbox_dir = tmp.path().to_str().unwrap().to_string();
+
+    std::fs::write(tmp.path().join("readable.txt"), "PLAN_MODE_DATA_11")
+        .expect("Failed to write readable.txt");
+
+    let output = e2e_cmd()
+        .args(run_args(&[
+            "--permission-mode",
+            "plan",
+            "--sandbox-dir",
+            &sandbox_dir,
+            "--max-iterations",
+            "5",
+            "Read the file readable.txt using read_file and report its contents verbatim",
+        ]))
+        .timeout(std::time::Duration::from_secs(120))
+        .output()
+        .expect("Failed to run command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("Invalid JSON: {e}\nstdout: {stdout}\nstderr: {stderr}"));
+
+    let status = json["status"].as_str().unwrap_or("");
+    assert!(
+        status == "success" || status == "max_iterations",
+        "Expected success or max_iterations in plan mode, got: {status}\nstderr: {stderr}"
+    );
+
+    // In plan mode, only read_file, grep, glob, load_skill, read_skill_resource are allowed
+    // Verify no write tools were called successfully
+    if let Some(steps) = json["steps"].as_array() {
+        for step in steps {
+            let tool = step["tool"].as_str().unwrap_or("");
+            if tool == "write_file" || tool == "bash" || tool == "edit_file" {
+                assert_eq!(
+                    step["is_error"], true,
+                    "Write tool '{tool}' should have been denied in plan mode"
+                );
+            }
+        }
+    }
+}
+
+// ── Subagent E2E tests ──────────────────────────────────────────────
+
+#[test]
+#[ignore]
+fn test_e2e_spawn_agent_tool_available() {
+    let tmp = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let sandbox_dir = tmp.path().to_str().unwrap().to_string();
+
+    let output = e2e_cmd()
+        .args(run_args(&[
+            "--sandbox-dir",
+            &sandbox_dir,
+            "--max-iterations",
+            "3",
+            "You have a spawn_agent tool available. Call spawn_agent with name='test_worker' and task='say hello'. Report the result you get back from spawn_agent verbatim.",
+        ]))
+        .timeout(std::time::Duration::from_secs(120))
+        .output()
+        .expect("Failed to run command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("Invalid JSON: {e}\nstdout: {stdout}\nstderr: {stderr}"));
+
+    let status = json["status"].as_str().unwrap_or("");
+    assert!(
+        status == "success" || status == "max_iterations",
+        "Expected success or max_iterations, got: {status}\nstderr: {stderr}"
+    );
+
+    // Verify spawn_agent was called
+    assert!(
+        assert_tool_was_called(&json["steps"], "spawn_agent"),
+        "Expected spawn_agent tool call in steps: {}",
+        serde_json::to_string_pretty(&json["steps"]).unwrap_or_default()
+    );
+
+    // Verify the spawn_agent call was not an error
+    if let Some(steps) = json["steps"].as_array() {
+        for step in steps {
+            if step["tool"] == "spawn_agent" {
+                assert!(
+                    step["is_error"].is_null() || step["is_error"] == false,
+                    "spawn_agent should not have returned an error: {}",
+                    serde_json::to_string_pretty(step).unwrap_or_default()
+                );
+            }
+        }
+    }
+}
+
+// ── Session + Permissions combined E2E test ──────────────────────────
+
+#[test]
+#[ignore]
+fn test_e2e_session_with_bypass_permissions() {
+    let session_dir = tempfile::TempDir::new().expect("Failed to create session dir");
+    let sandbox_dir = tempfile::TempDir::new().expect("Failed to create sandbox dir");
+
+    let session_path = session_dir.path().to_str().unwrap().to_string();
+    let sandbox_path = sandbox_dir.path().to_str().unwrap().to_string();
+
+    let output = e2e_cmd()
+        .args(run_args(&[
+            "--session-dir",
+            &session_path,
+            "--sandbox-dir",
+            &sandbox_path,
+            "--permission-mode",
+            "bypass_permissions",
+            "--max-iterations",
+            "5",
+            "Use bash to run 'echo COMBO_TEST_77' and report the output verbatim",
+        ]))
+        .timeout(std::time::Duration::from_secs(120))
+        .output()
+        .expect("Failed to run command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("Invalid JSON: {e}\nstdout: {stdout}\nstderr: {stderr}"));
+
+    assert_eq!(json["status"], "success", "stderr: {stderr}");
+    let result = json["result"].as_str().unwrap_or("");
+    assert!(
+        result.contains("COMBO_TEST_77"),
+        "Expected COMBO_TEST_77 in result: {result}"
+    );
+
+    // Verify session was persisted
+    let session_entries: Vec<_> = std::fs::read_dir(session_dir.path())
+        .expect("Failed to read session dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+        .collect();
+    assert!(
+        !session_entries.is_empty(),
+        "Session should have been persisted"
+    );
+
+    // Verify session metadata shows completed status
+    let first_session = &session_entries[0].path();
+    let metadata_content = std::fs::read_to_string(first_session.join("metadata.json"))
+        .expect("Failed to read metadata.json");
+    let metadata: Value =
+        serde_json::from_str(&metadata_content).expect("metadata.json should be valid JSON");
+    assert_eq!(
+        metadata["status"], "completed",
+        "Session should be completed"
+    );
+
+    // Verify steps were recorded
+    let steps_content = std::fs::read_to_string(first_session.join("steps.json"))
+        .expect("Failed to read steps.json");
+    let steps: Value =
+        serde_json::from_str(&steps_content).expect("steps.json should be valid JSON");
+    assert!(
+        steps.as_array().map(|a| !a.is_empty()).unwrap_or(false),
+        "Steps should not be empty"
+    );
+}

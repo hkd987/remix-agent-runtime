@@ -1,3 +1,5 @@
+pub mod compaction;
+pub mod compaction_prompt;
 pub mod loop_impl;
 pub mod state;
 

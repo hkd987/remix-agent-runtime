@@ -42,6 +42,18 @@ pub enum AgentError {
     #[error("Local tool error: {0}")]
     LocalTool(String),
 
+    #[error("Plugin error: {0}")]
+    Plugin(String),
+
+    #[error("Session error: {0}")]
+    Session(String),
+
+    #[error("Permission denied: {0}")]
+    Permission(String),
+
+    #[error("Subagent error: {0}")]
+    Subagent(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -185,6 +197,34 @@ mod tests {
     fn test_local_tool_error() {
         let err = AgentError::LocalTool("path outside sandbox".into());
         assert_eq!(err.to_string(), "Local tool error: path outside sandbox");
+        assert_eq!(err.exit_status(), ExitStatus::AgentError);
+    }
+
+    #[test]
+    fn test_plugin_error() {
+        let err = AgentError::Plugin("plugin not found".into());
+        assert_eq!(err.to_string(), "Plugin error: plugin not found");
+        assert_eq!(err.exit_status(), ExitStatus::AgentError);
+    }
+
+    #[test]
+    fn test_session_error() {
+        let err = AgentError::Session("session not found".into());
+        assert_eq!(err.to_string(), "Session error: session not found");
+        assert_eq!(err.exit_status(), ExitStatus::AgentError);
+    }
+
+    #[test]
+    fn test_permission_error() {
+        let err = AgentError::Permission("tool not allowed".into());
+        assert_eq!(err.to_string(), "Permission denied: tool not allowed");
+        assert_eq!(err.exit_status(), ExitStatus::AgentError);
+    }
+
+    #[test]
+    fn test_subagent_error() {
+        let err = AgentError::Subagent("child agent failed".into());
+        assert_eq!(err.to_string(), "Subagent error: child agent failed");
         assert_eq!(err.exit_status(), ExitStatus::AgentError);
     }
 

@@ -4,13 +4,17 @@ use tracing::{debug, info, warn};
 
 use crate::browser::mcp::ToolExecutor;
 use crate::config::credentials::{inject_credentials_into_system_prompt, CredentialSet};
-use crate::config::schema::AgentConfig;
+use crate::config::schema::{AgentConfig, CompactionConfig};
 use crate::error::AgentError;
 use crate::llm::client::LlmProvider;
 use crate::llm::types::{ContentBlock, StopReason};
 use crate::output::result::{AgentResult, AgentStatus, StepRecord};
+use crate::session::types::{SessionId, SessionStatus};
+use crate::session::SessionStore;
 use crate::skills::{inject_skills_into_system_prompt, SkillSet};
 
+use super::compaction;
+use super::compaction_prompt::COMPACTION_SYSTEM_PROMPT;
 use super::state::AgentState;
 
 pub struct AgentRunner<L: LlmProvider, T: ToolExecutor> {
@@ -36,7 +40,37 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         skill_set: &SkillSet,
         agents_md: &Option<crate::agents_md::AgentsMdContent>,
     ) -> Result<AgentResult, AgentError> {
+        self.run_with_options(task, credentials, skill_set, agents_md, None, None)
+            .await
+    }
+
+    /// Run the agent loop with optional session persistence and context compaction.
+    pub async fn run_with_options(
+        &self,
+        task: &str,
+        credentials: &CredentialSet,
+        skill_set: &SkillSet,
+        agents_md: &Option<crate::agents_md::AgentsMdContent>,
+        session_store: Option<&SessionStore>,
+        compaction_config: Option<&CompactionConfig>,
+    ) -> Result<AgentResult, AgentError> {
         let mut state = AgentState::new(task);
+
+        // Create session if store is provided
+        let session_metadata = if let Some(store) = session_store {
+            match store.create(task) {
+                Ok(metadata) => {
+                    info!(session_id = %metadata.id, "Created new session");
+                    Some(metadata)
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to create session, continuing without persistence");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let mut system_parts = Vec::new();
         if let Some(ref prompt) = self.config.system_prompt {
@@ -68,12 +102,69 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     iterations = state.current_iteration(),
                     "Max iterations reached"
                 );
+                self.finalize_session(
+                    session_store,
+                    &session_metadata,
+                    &state,
+                    SessionStatus::Completed,
+                );
                 return Ok(state.into_result(AgentStatus::MaxIterations, None));
             }
 
             if state.elapsed_ms() >= timeout_ms {
                 info!(elapsed_ms = state.elapsed_ms(), "Timeout reached");
+                self.finalize_session(
+                    session_store,
+                    &session_metadata,
+                    &state,
+                    SessionStatus::Completed,
+                );
                 return Ok(state.into_result(AgentStatus::Timeout, None));
+            }
+
+            // Check if compaction is needed before sending to LLM
+            if let Some(compact_config) = compaction_config {
+                if compaction::should_compact(compact_config, state.total_input_tokens()) {
+                    info!(
+                        input_tokens = state.total_input_tokens(),
+                        "Triggering context compaction"
+                    );
+                    let (compact_end, _) = compaction::compute_compaction_split(
+                        state.messages().len(),
+                        compact_config.preserve_recent_n,
+                    );
+                    if compact_end > 0 {
+                        let messages_to_compact = &state.messages()[..compact_end];
+                        let compaction_messages =
+                            compaction::build_compaction_request(messages_to_compact);
+                        match self
+                            .llm
+                            .send_messages(
+                                Some(COMPACTION_SYSTEM_PROMPT),
+                                &compaction_messages,
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(summary_response) => {
+                                let summary_text = summary_response
+                                    .content
+                                    .iter()
+                                    .filter_map(|b| match b {
+                                        ContentBlock::Text { text } => Some(text.clone()),
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                state.compact(&summary_text, compact_config.preserve_recent_n);
+                                info!("Context compacted successfully");
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Context compaction failed, continuing without");
+                            }
+                        }
+                    }
+                }
             }
 
             state.increment_iteration();
@@ -105,6 +196,12 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                             .collect::<Vec<_>>()
                             .join("\n");
                         state.add_assistant_message(assistant_content);
+                        self.finalize_session(
+                            session_store,
+                            &session_metadata,
+                            &state,
+                            SessionStatus::Completed,
+                        );
                         return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                     }
 
@@ -163,6 +260,9 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     }
 
                     state.add_tool_results(tool_results);
+
+                    // Persist to session after each tool use iteration
+                    self.persist_session_iteration(session_store, &session_metadata, &state);
                 }
                 StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
                     let final_text = response
@@ -177,8 +277,270 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
 
                     state.add_assistant_message(response.content);
 
+                    self.finalize_session(
+                        session_store,
+                        &session_metadata,
+                        &state,
+                        SessionStatus::Completed,
+                    );
                     return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                 }
+            }
+        }
+    }
+
+    /// Resume an existing session and continue the agent loop.
+    pub async fn resume(
+        &self,
+        session_store: &SessionStore,
+        session_id: &SessionId,
+        credentials: &CredentialSet,
+        skill_set: &SkillSet,
+        agents_md: &Option<crate::agents_md::AgentsMdContent>,
+        compaction_config: Option<&CompactionConfig>,
+    ) -> Result<AgentResult, AgentError> {
+        let snapshot = session_store.load(session_id)?;
+        info!(
+            session_id = %session_id,
+            iteration = snapshot.iteration,
+            messages = snapshot.messages.len(),
+            "Resuming session"
+        );
+
+        // Restore state from snapshot
+        let mut state = AgentState::from_snapshot(&snapshot);
+
+        let mut system_parts = Vec::new();
+        if let Some(ref prompt) = snapshot.system_prompt {
+            system_parts.push(prompt.clone());
+        } else if let Some(ref prompt) = self.config.system_prompt {
+            system_parts.push(prompt.clone());
+        }
+        if let Some(agents_md_prompt) =
+            crate::agents_md::inject_agents_md_into_system_prompt(agents_md)
+        {
+            system_parts.push(agents_md_prompt);
+        }
+        if let Some(cred_prompt) = inject_credentials_into_system_prompt(credentials) {
+            system_parts.push(cred_prompt);
+        }
+        if let Some(skill_prompt) = inject_skills_into_system_prompt(skill_set) {
+            system_parts.push(skill_prompt);
+        }
+        let system_prompt = if system_parts.is_empty() {
+            None
+        } else {
+            Some(system_parts.join("\n\n"))
+        };
+
+        let tool_defs = self.tools.tool_definitions();
+        let timeout_ms = self.config.timeout_secs * 1000;
+        let session_metadata = session_store.load_metadata(session_id).ok();
+
+        loop {
+            if state.current_iteration() >= self.config.max_iterations {
+                self.finalize_session(
+                    Some(session_store),
+                    &session_metadata,
+                    &state,
+                    SessionStatus::Completed,
+                );
+                return Ok(state.into_result(AgentStatus::MaxIterations, None));
+            }
+
+            if state.elapsed_ms() >= timeout_ms {
+                self.finalize_session(
+                    Some(session_store),
+                    &session_metadata,
+                    &state,
+                    SessionStatus::Completed,
+                );
+                return Ok(state.into_result(AgentStatus::Timeout, None));
+            }
+
+            // Check compaction
+            if let Some(compact_config) = compaction_config {
+                if compaction::should_compact(compact_config, state.total_input_tokens()) {
+                    let (compact_end, _) = compaction::compute_compaction_split(
+                        state.messages().len(),
+                        compact_config.preserve_recent_n,
+                    );
+                    if compact_end > 0 {
+                        let messages_to_compact = &state.messages()[..compact_end];
+                        let compaction_messages =
+                            compaction::build_compaction_request(messages_to_compact);
+                        if let Ok(summary_response) = self
+                            .llm
+                            .send_messages(
+                                Some(COMPACTION_SYSTEM_PROMPT),
+                                &compaction_messages,
+                                None,
+                            )
+                            .await
+                        {
+                            let summary_text = summary_response
+                                .content
+                                .iter()
+                                .filter_map(|b| match b {
+                                    ContentBlock::Text { text } => Some(text.clone()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            state.compact(&summary_text, compact_config.preserve_recent_n);
+                        }
+                    }
+                }
+            }
+
+            state.increment_iteration();
+            let response = self
+                .llm
+                .send_messages(system_prompt.as_deref(), state.messages(), Some(tool_defs))
+                .await?;
+
+            state.accumulate_usage(response.usage.as_ref());
+
+            match response.stop_reason {
+                StopReason::ToolUse => {
+                    let assistant_content = response.content.clone();
+                    let has_tool_use = assistant_content
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+                    if !has_tool_use {
+                        let final_text = assistant_content
+                            .iter()
+                            .filter_map(|block| match block {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        state.add_assistant_message(assistant_content);
+                        self.finalize_session(
+                            Some(session_store),
+                            &session_metadata,
+                            &state,
+                            SessionStatus::Completed,
+                        );
+                        return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
+                    }
+
+                    state.add_assistant_message(assistant_content.clone());
+                    let mut tool_results = Vec::new();
+                    for block in &assistant_content {
+                        if let ContentBlock::ToolUse { id, name, input } = block {
+                            let step_start = Instant::now();
+                            let exec_result = self.tools.execute_tool(name, input.clone()).await;
+                            let step_duration = step_start.elapsed().as_millis() as u64;
+                            match exec_result {
+                                Ok(result) => {
+                                    state.record_step(StepRecord {
+                                        iteration: state.current_iteration(),
+                                        tool: name.clone(),
+                                        input: input.clone(),
+                                        output: serde_json::from_str(&result.content)
+                                            .unwrap_or_else(|_| {
+                                                Value::String(result.content.clone())
+                                            }),
+                                        duration_ms: step_duration,
+                                        is_error: if result.is_error { Some(true) } else { None },
+                                    });
+                                    tool_results.push(ContentBlock::ToolResult {
+                                        tool_use_id: id.clone(),
+                                        content: result.content,
+                                        is_error: if result.is_error { Some(true) } else { None },
+                                    });
+                                }
+                                Err(e) => {
+                                    let error_msg = e.to_string();
+                                    state.record_step(StepRecord {
+                                        iteration: state.current_iteration(),
+                                        tool: name.clone(),
+                                        input: input.clone(),
+                                        output: Value::String(error_msg.clone()),
+                                        duration_ms: step_duration,
+                                        is_error: Some(true),
+                                    });
+                                    tool_results.push(ContentBlock::ToolResult {
+                                        tool_use_id: id.clone(),
+                                        content: error_msg,
+                                        is_error: Some(true),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    state.add_tool_results(tool_results);
+                    self.persist_session_iteration(Some(session_store), &session_metadata, &state);
+                }
+                StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
+                    let final_text = response
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    state.add_assistant_message(response.content);
+                    self.finalize_session(
+                        Some(session_store),
+                        &session_metadata,
+                        &state,
+                        SessionStatus::Completed,
+                    );
+                    return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
+                }
+            }
+        }
+    }
+
+    /// Persist session state after each iteration (best-effort, failures logged and ignored).
+    fn persist_session_iteration(
+        &self,
+        session_store: Option<&SessionStore>,
+        session_metadata: &Option<crate::session::types::SessionMetadata>,
+        state: &AgentState,
+    ) {
+        if let (Some(store), Some(metadata)) = (session_store, session_metadata) {
+            if let Err(e) = store.append_messages(&metadata.id, state.messages()) {
+                warn!(error = %e, "Failed to persist session messages");
+            }
+            if let Err(e) = store.save_steps(&metadata.id, state.steps()) {
+                warn!(error = %e, "Failed to persist session steps");
+            }
+        }
+    }
+
+    /// Finalize session with final status (best-effort).
+    fn finalize_session(
+        &self,
+        session_store: Option<&SessionStore>,
+        session_metadata: &Option<crate::session::types::SessionMetadata>,
+        state: &AgentState,
+        status: SessionStatus,
+    ) {
+        if let (Some(store), Some(metadata)) = (session_store, session_metadata) {
+            let mut updated = metadata.clone();
+            updated.status = status;
+            updated.updated_at = chrono::Utc::now();
+            updated.total_input_tokens = if state.total_input_tokens() > 0 {
+                Some(state.total_input_tokens())
+            } else {
+                None
+            };
+            updated.total_output_tokens = if state.total_output_tokens() > 0 {
+                Some(state.total_output_tokens())
+            } else {
+                None
+            };
+            if let Err(e) = store.save_metadata(&updated) {
+                warn!(error = %e, "Failed to finalize session");
+            }
+            if let Err(e) = store.save_steps(&metadata.id, state.steps()) {
+                warn!(error = %e, "Failed to save final steps");
             }
         }
     }
