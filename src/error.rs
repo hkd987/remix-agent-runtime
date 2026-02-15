@@ -54,6 +54,9 @@ pub enum AgentError {
     #[error("Subagent error: {0}")]
     Subagent(String),
 
+    #[error("Coordination error: {0}")]
+    Coordination(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -225,6 +228,13 @@ mod tests {
     fn test_subagent_error() {
         let err = AgentError::Subagent("child agent failed".into());
         assert_eq!(err.to_string(), "Subagent error: child agent failed");
+        assert_eq!(err.exit_status(), ExitStatus::AgentError);
+    }
+
+    #[test]
+    fn test_coordination_error() {
+        let err = AgentError::Coordination("task not found".into());
+        assert_eq!(err.to_string(), "Coordination error: task not found");
         assert_eq!(err.exit_status(), ExitStatus::AgentError);
     }
 

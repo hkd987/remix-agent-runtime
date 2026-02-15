@@ -126,6 +126,18 @@ pub struct RunArgs {
     /// Deny specific tool patterns (repeatable)
     #[arg(long)]
     pub deny_tool: Vec<String>,
+
+    /// Disable multi-agent coordination
+    #[arg(long)]
+    pub no_coordination: bool,
+
+    /// Maximum concurrent worker agents
+    #[arg(long)]
+    pub max_workers: Option<u32>,
+
+    /// Override coordination storage directory
+    #[arg(long, env = "REMIX_COORDINATION_DIR")]
+    pub coordination_dir: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -226,6 +238,11 @@ mod tests {
             "click",
             "--deny-tool",
             "bash",
+            "--no-coordination",
+            "--max-workers",
+            "10",
+            "--coordination-dir",
+            "/tmp/coordination",
             "do something",
         ]);
         match cli.command {
@@ -260,6 +277,12 @@ mod tests {
                 assert_eq!(args.permission_mode, Some("plan".to_string()));
                 assert_eq!(args.allow_tool, vec!["navigate", "click"]);
                 assert_eq!(args.deny_tool, vec!["bash"]);
+                assert!(args.no_coordination);
+                assert_eq!(args.max_workers, Some(10));
+                assert_eq!(
+                    args.coordination_dir,
+                    Some(PathBuf::from("/tmp/coordination"))
+                );
             }
         }
     }
@@ -434,6 +457,47 @@ mod tests {
         match cli.command {
             Commands::Run(args) => {
                 assert_eq!(args.permission_mode, Some("plan".to_string()));
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_run_with_no_coordination() {
+        let cli = Cli::parse_from(["remix-agent", "run", "--no-coordination"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert!(args.no_coordination);
+                assert!(args.max_workers.is_none());
+                assert!(args.coordination_dir.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_run_with_max_workers() {
+        let cli = Cli::parse_from(["remix-agent", "run", "--max-workers", "8"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.max_workers, Some(8));
+                assert!(!args.no_coordination);
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_run_with_coordination_dir() {
+        let cli = Cli::parse_from([
+            "remix-agent",
+            "run",
+            "--coordination-dir",
+            "/tmp/coordination",
+        ]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(
+                    args.coordination_dir,
+                    Some(PathBuf::from("/tmp/coordination"))
+                );
             }
         }
     }

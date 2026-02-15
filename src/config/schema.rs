@@ -32,6 +32,8 @@ pub struct AppConfig {
     pub permissions: PermissionsConfig,
     #[serde(default)]
     pub subagent: SubagentConfig,
+    #[serde(default)]
+    pub coordination: CoordinationConfig,
 }
 
 fn default_base_url() -> String {
@@ -166,6 +168,12 @@ pub struct AgentConfig {
     pub system_prompt: Option<String>,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    #[serde(default = "default_coordination_config")]
+    pub coordination_config: Option<CoordinationConfig>,
+}
+
+fn default_coordination_config() -> Option<CoordinationConfig> {
+    Some(CoordinationConfig::default())
 }
 
 impl Default for AgentConfig {
@@ -174,6 +182,7 @@ impl Default for AgentConfig {
             max_iterations: default_max_iterations(),
             system_prompt: None,
             timeout_secs: default_timeout(),
+            coordination_config: Some(CoordinationConfig::default()),
         }
     }
 }
@@ -363,6 +372,18 @@ fn default_subagent_timeout() -> u64 {
     120
 }
 
+fn default_max_workers() -> u32 {
+    5
+}
+
+fn default_coordination_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(".remix").join("coordination")
+    } else {
+        PathBuf::from(".remix").join("coordination")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
     #[serde(default = "default_true")]
@@ -456,6 +477,32 @@ impl Default for SubagentConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoordinationConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_subagent_max_iterations")]
+    pub max_worker_iterations: u32,
+    #[serde(default = "default_subagent_timeout")]
+    pub worker_timeout_secs: u64,
+    #[serde(default = "default_max_workers")]
+    pub max_workers: u32,
+    #[serde(default = "default_coordination_dir")]
+    pub storage_dir: PathBuf,
+}
+
+impl Default for CoordinationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_worker_iterations: 10,
+            worker_timeout_secs: 120,
+            max_workers: 5,
+            storage_dir: default_coordination_dir(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +533,7 @@ mod tests {
         assert_eq!(config.max_iterations, 50);
         assert_eq!(config.timeout_secs, 300);
         assert!(config.system_prompt.is_none());
+        assert!(config.coordination_config.is_some());
     }
 
     #[test]
@@ -690,6 +738,7 @@ url: "https://example.com/hook"
             compaction: CompactionConfig::default(),
             permissions: PermissionsConfig::default(),
             subagent: SubagentConfig::default(),
+            coordination: CoordinationConfig::default(),
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         let deserialized: AppConfig = serde_yaml::from_str(&yaml).unwrap();
@@ -1080,5 +1129,56 @@ subagent:
         assert_eq!(config.permissions.mode, PermissionModeConfig::Plan);
         assert_eq!(config.permissions.denied_tools, vec!["bash"]);
         assert_eq!(config.subagent.max_iterations, 20);
+    }
+
+    #[test]
+    fn test_coordination_config_defaults() {
+        let config = CoordinationConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.max_worker_iterations, 10);
+        assert_eq!(config.worker_timeout_secs, 120);
+        assert_eq!(config.max_workers, 5);
+        assert!(config.storage_dir.ends_with("coordination"));
+    }
+
+    #[test]
+    fn test_coordination_config_yaml_deser() {
+        let yaml = r#"
+enabled: false
+max_worker_iterations: 20
+worker_timeout_secs: 300
+max_workers: 10
+storage_dir: "/tmp/coordination"
+"#;
+        let config: CoordinationConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.enabled);
+        assert_eq!(config.max_worker_iterations, 20);
+        assert_eq!(config.worker_timeout_secs, 300);
+        assert_eq!(config.max_workers, 10);
+        assert_eq!(config.storage_dir, PathBuf::from("/tmp/coordination"));
+    }
+
+    #[test]
+    fn test_app_config_with_coordination() {
+        let yaml = r#"
+task: "test"
+coordination:
+  enabled: true
+  max_workers: 8
+  max_worker_iterations: 15
+"#;
+        let config: AppConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.coordination.enabled);
+        assert_eq!(config.coordination.max_workers, 8);
+        assert_eq!(config.coordination.max_worker_iterations, 15);
+    }
+
+    #[test]
+    fn test_app_config_defaults_include_coordination() {
+        let config = AppConfig::default();
+        assert!(config.coordination.enabled);
+        assert_eq!(config.coordination.max_workers, 5);
+        assert_eq!(config.coordination.max_worker_iterations, 10);
+        assert_eq!(config.coordination.worker_timeout_secs, 120);
     }
 }

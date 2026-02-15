@@ -15,6 +15,18 @@ pub trait LlmProvider: Send + Sync {
     ) -> Result<MessagesResponse, AgentError>;
 }
 
+#[async_trait]
+impl<L: LlmProvider> LlmProvider for std::sync::Arc<L> {
+    async fn send_messages(
+        &self,
+        system: Option<&str>,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+    ) -> Result<MessagesResponse, AgentError> {
+        (**self).send_messages(system, messages, tools).await
+    }
+}
+
 pub struct AnthropicClient {
     client: reqwest::Client,
     base_url: String,
@@ -691,5 +703,72 @@ mod tests {
         );
 
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_arc_llm_provider_delegates() {
+        use std::sync::{Arc, Mutex};
+
+        struct MockLlmProvider {
+            call_count: Mutex<u32>,
+        }
+
+        #[async_trait]
+        impl LlmProvider for MockLlmProvider {
+            async fn send_messages(
+                &self,
+                system: Option<&str>,
+                _messages: &[Message],
+                _tools: Option<&[ToolDefinition]>,
+            ) -> Result<MessagesResponse, AgentError> {
+                *self.call_count.lock().unwrap() += 1;
+                Ok(MessagesResponse {
+                    id: "msg_mock".to_string(),
+                    content: vec![ContentBlock::Text {
+                        text: system.unwrap_or("no system").to_string(),
+                    }],
+                    model: "mock".to_string(),
+                    stop_reason: StopReason::EndTurn,
+                    usage: None,
+                })
+            }
+        }
+
+        let provider = Arc::new(MockLlmProvider {
+            call_count: Mutex::new(0),
+        });
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "Hello".to_string(),
+            }],
+        }];
+
+        // Call through Arc
+        let result = provider
+            .send_messages(Some("test system"), &messages, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.id, "msg_mock");
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        assert!(matches!(
+            &result.content[0],
+            ContentBlock::Text { text } if text == "test system"
+        ));
+        assert_eq!(*provider.call_count.lock().unwrap(), 1);
+
+        // Call again to verify repeated delegation
+        let _ = provider.send_messages(None, &messages, None).await.unwrap();
+        assert_eq!(*provider.call_count.lock().unwrap(), 2);
+
+        // Verify a clone of the Arc also works
+        let provider2 = provider.clone();
+        let _ = provider2
+            .send_messages(None, &messages, None)
+            .await
+            .unwrap();
+        assert_eq!(*provider.call_count.lock().unwrap(), 3);
     }
 }

@@ -95,6 +95,16 @@ impl AgentState {
         &self.steps
     }
 
+    /// Inject a system notification as a user message (e.g., inbox messages).
+    pub fn inject_system_notification(&mut self, notification: &str) {
+        self.messages.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: notification.to_string(),
+            }],
+        });
+    }
+
     /// Compact the message history by replacing older messages with a summary.
     /// Preserves the most recent `preserve_n` messages.
     pub fn compact(&mut self, summary: &str, preserve_n: usize) {
@@ -472,6 +482,22 @@ mod tests {
         assert_eq!(state.current_iteration(), 3);
         assert_eq!(state.total_input_tokens(), 500);
         assert_eq!(state.total_output_tokens(), 200);
+    }
+
+    #[test]
+    fn test_inject_system_notification() {
+        let mut state = AgentState::new("task");
+        assert_eq!(state.messages().len(), 1);
+        state.inject_system_notification("<inbox_messages>\nHello from worker\n</inbox_messages>");
+        assert_eq!(state.messages().len(), 2);
+        assert!(matches!(state.messages()[1].role, Role::User));
+        match &state.messages()[1].content[0] {
+            ContentBlock::Text { text } => {
+                assert!(text.contains("inbox_messages"));
+                assert!(text.contains("Hello from worker"));
+            }
+            _ => panic!("Expected Text content block"),
+        }
     }
 
     #[test]

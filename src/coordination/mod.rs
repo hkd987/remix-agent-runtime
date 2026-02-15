@@ -1,0 +1,25 @@
+pub mod context;
+pub mod default_spawner;
+pub mod executor;
+pub mod inbox_store;
+pub mod inbox_types;
+pub mod prompt;
+pub mod shared_executor;
+pub mod spawn_handler;
+pub mod task_store;
+pub mod task_types;
+pub mod team_store;
+pub mod team_types;
+
+pub use context::CoordinationContext;
+pub use default_spawner::DefaultSpawnHandler;
+pub use executor::CoordinationExecutor;
+pub use inbox_store::InboxStore;
+pub use inbox_types::{InboxMessage, MessageId, MessageType, SendMessageParams};
+pub use prompt::inject_coordination_into_system_prompt;
+pub use shared_executor::SharedToolExecutor;
+pub use spawn_handler::{ChildHandle, SpawnDefinition, SpawnHandler};
+pub use task_store::TaskStore;
+pub use task_types::{Task, TaskCreateParams, TaskId, TaskStatus, TaskSummary, TaskUpdateParams};
+pub use team_store::TeamStore;
+pub use team_types::{MemberStatus, TeamConfig, TeamCreateParams, TeamId, TeamMember};

@@ -179,6 +179,22 @@ pub fn load_config(args: &RunArgs) -> Result<AppConfig, AgentError> {
             .extend(args.deny_tool.clone());
     }
 
+    // Apply coordination configuration
+    if args.no_coordination {
+        config.coordination.enabled = false;
+    }
+    if let Some(max_workers) = args.max_workers {
+        config.coordination.max_workers = max_workers;
+    }
+    if let Some(ref dir) = args.coordination_dir {
+        config.coordination.storage_dir = dir.clone();
+    }
+    if let Ok(val) = std::env::var("REMIX_COORDINATION_DIR") {
+        if args.coordination_dir.is_none() {
+            config.coordination.storage_dir = PathBuf::from(val);
+        }
+    }
+
     // CLI task overrides YAML task
     if args.task.is_some() {
         config.task = args.task.clone();
@@ -223,6 +239,9 @@ mod tests {
             permission_mode: None,
             allow_tool: Vec::new(),
             deny_tool: Vec::new(),
+            no_coordination: false,
+            max_workers: None,
+            coordination_dir: None,
         }
     }
 
@@ -361,6 +380,9 @@ agent:
             permission_mode: None,
             allow_tool: Vec::new(),
             deny_tool: Vec::new(),
+            no_coordination: false,
+            max_workers: None,
+            coordination_dir: None,
         };
         let config = load_config(&args).unwrap();
 

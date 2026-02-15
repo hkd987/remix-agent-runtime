@@ -9,6 +9,9 @@ use remix_agent_runtime::browser::mcp::ToolExecutor;
 use remix_agent_runtime::cli::{Cli, Commands};
 use remix_agent_runtime::config::credentials;
 use remix_agent_runtime::config::load_config;
+use remix_agent_runtime::coordination::{
+    CoordinationContext, CoordinationExecutor, DefaultSpawnHandler,
+};
 use remix_agent_runtime::error::ExitStatus;
 use remix_agent_runtime::llm::client::AnthropicClient;
 use remix_agent_runtime::output::webhook::WebhookDispatcher;
@@ -22,7 +25,6 @@ use remix_agent_runtime::plugins::components::skills::merge_plugin_skills;
 use remix_agent_runtime::plugins::discovery::discover_all_plugins;
 use remix_agent_runtime::plugins::{CompositeToolExecutor, HookAwareExecutor};
 use remix_agent_runtime::session::SessionStore;
-use remix_agent_runtime::subagent::SubagentExecutor;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -70,14 +72,14 @@ async fn main() -> ExitCode {
 
             tracing::info!("Starting agent with config: {}", config.llm);
 
-            // Create LLM client
-            let llm_client = AnthropicClient::new(
+            // Create LLM client (wrapped in Arc for sharing with child agents)
+            let llm_client = std::sync::Arc::new(AnthropicClient::new(
                 config.llm.base_url.clone(),
                 config.llm.api_key.clone(),
                 config.llm.model.clone(),
                 config.llm.max_tokens,
                 config.llm.custom_headers.clone(),
-            );
+            ));
 
             // Spawn browser and connect via MCP
             let command = BrowserManager::build_command(&config.browser);
@@ -187,6 +189,11 @@ async fn main() -> ExitCode {
 
             // Discover plugin agents and inject into system prompt
             let mut agent_config = config.agent.clone();
+            agent_config.coordination_config = if config.coordination.enabled {
+                Some(config.coordination.clone())
+            } else {
+                None
+            };
             if config.plugins.components.agents {
                 let agent_file_refs: Vec<&std::path::PathBuf> = plugin_set
                     .all_agent_files()
@@ -299,8 +306,25 @@ async fn main() -> ExitCode {
             };
             let executor = PermissionAwareExecutor::new(executor, permission_policy);
 
-            // Wrap with subagent executor
-            let executor = SubagentExecutor::new(executor, config.subagent.clone());
+            // Wrap with coordination executor (supersedes SubagentExecutor)
+            let coordination_context =
+                std::sync::Arc::new(CoordinationContext::from_config(&config.coordination));
+            let spawn_handler = std::sync::Arc::new(DefaultSpawnHandler::new(
+                llm_client.clone(),
+                config.browser.clone(),
+                config.local_tools.clone(),
+                config.skills.clone(),
+                skill_set.clone(),
+                config.coordination.clone(),
+                coordination_context.clone(),
+            ));
+            let executor = CoordinationExecutor::new(
+                executor,
+                config.coordination.clone(),
+                coordination_context,
+                "lead".to_string(),
+            )
+            .with_spawn_handler(spawn_handler);
 
             // Set up session store
             let session_store = if config.session.enabled {
@@ -381,8 +405,24 @@ async fn main() -> ExitCode {
                     .await
             };
 
+            // Wait for any spawned child agents to complete
+            let child_results = runner
+                .tools_ref()
+                .wait_for_children(std::time::Duration::from_secs(
+                    config.coordination.worker_timeout_secs,
+                ))
+                .await;
+            for (name, child_result) in &child_results {
+                match child_result {
+                    Ok(r) => {
+                        tracing::info!(agent = %name, status = ?r.status, "Child agent completed")
+                    }
+                    Err(e) => tracing::warn!(agent = %name, error = %e, "Child agent failed"),
+                }
+            }
+
             // Gracefully shut down all MCP connections
-            // Chain: SubagentExecutor -> PermissionAwareExecutor -> HookAwareExecutor -> LocalToolsExecutor -> SkillAwareExecutor -> CompositeToolExecutor
+            // Chain: CoordinationExecutor -> PermissionAwareExecutor -> HookAwareExecutor -> LocalToolsExecutor -> SkillAwareExecutor -> CompositeToolExecutor
             runner
                 .into_tools()
                 .into_inner()

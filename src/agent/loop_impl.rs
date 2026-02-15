@@ -33,6 +33,11 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         self.tools
     }
 
+    /// Get a reference to the inner tool executor (non-consuming).
+    pub fn tools_ref(&self) -> &T {
+        &self.tools
+    }
+
     pub async fn run(
         &self,
         task: &str,
@@ -83,6 +88,13 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         }
         if let Some(cred_prompt) = inject_credentials_into_system_prompt(credentials) {
             system_parts.push(cred_prompt);
+        }
+        if let Some(ref coord_config) = self.config.coordination_config {
+            if let Some(coord_prompt) =
+                crate::coordination::inject_coordination_into_system_prompt(coord_config)
+            {
+                system_parts.push(coord_prompt);
+            }
         }
         if let Some(skill_prompt) = inject_skills_into_system_prompt(skill_set) {
             system_parts.push(skill_prompt);
@@ -263,6 +275,17 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
 
                     // Persist to session after each tool use iteration
                     self.persist_session_iteration(session_store, &session_metadata, &state);
+
+                    // Check for inter-agent messages
+                    if let Some(messages) = self.tools.check_inbox().await {
+                        if !messages.is_empty() {
+                            let inbox_text = format!(
+                                "<inbox_messages>\n{}\n</inbox_messages>",
+                                messages.join("\n---\n")
+                            );
+                            state.inject_system_notification(&inbox_text);
+                        }
+                    }
                 }
                 StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
                     let final_text = response
@@ -323,6 +346,13 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         }
         if let Some(cred_prompt) = inject_credentials_into_system_prompt(credentials) {
             system_parts.push(cred_prompt);
+        }
+        if let Some(ref coord_config) = self.config.coordination_config {
+            if let Some(coord_prompt) =
+                crate::coordination::inject_coordination_into_system_prompt(coord_config)
+            {
+                system_parts.push(coord_prompt);
+            }
         }
         if let Some(skill_prompt) = inject_skills_into_system_prompt(skill_set) {
             system_parts.push(skill_prompt);
@@ -473,6 +503,17 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     }
                     state.add_tool_results(tool_results);
                     self.persist_session_iteration(Some(session_store), &session_metadata, &state);
+
+                    // Check for inter-agent messages
+                    if let Some(messages) = self.tools.check_inbox().await {
+                        if !messages.is_empty() {
+                            let inbox_text = format!(
+                                "<inbox_messages>\n{}\n</inbox_messages>",
+                                messages.join("\n---\n")
+                            );
+                            state.inject_system_notification(&inbox_text);
+                        }
+                    }
                 }
                 StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
                     let final_text = response
@@ -635,6 +676,7 @@ mod tests {
             max_iterations: 10,
             system_prompt: None,
             timeout_secs: 300,
+            coordination_config: None,
         }
     }
 
@@ -720,6 +762,7 @@ mod tests {
             max_iterations: 2,
             system_prompt: None,
             timeout_secs: 300,
+            coordination_config: None,
         };
 
         // LLM always returns tool_use, so we hit max_iterations
@@ -854,6 +897,7 @@ mod tests {
             max_iterations: 10,
             system_prompt: Some("You are a browser agent.".to_string()),
             timeout_secs: 300,
+            coordination_config: None,
         };
 
         let llm_responses = Arc::new(Mutex::new(vec![make_end_turn_response("Done")]));

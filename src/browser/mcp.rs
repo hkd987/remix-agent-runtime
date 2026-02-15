@@ -26,6 +26,11 @@ pub trait ToolExecutor: Send + Sync {
     /// Gracefully shut down this executor and release resources.
     /// Default implementation does nothing.
     fn shutdown(self: Box<Self>) {}
+
+    /// Check for inter-agent inbox messages. Returns None if not supported.
+    async fn check_inbox(&self) -> Option<Vec<String>> {
+        None
+    }
 }
 
 /// MCP client that connects to remix-browser and executes browser tools.
@@ -132,6 +137,33 @@ impl ToolExecutor for McpBrowserClient {
             content: content_text,
             is_error: result.is_error.unwrap_or(false),
         })
+    }
+}
+
+/// Blanket implementation so `Box<dyn ToolExecutor>` can be used as a generic
+/// `T: ToolExecutor` parameter (e.g. in `CoordinationExecutor<Box<dyn ToolExecutor>>`).
+#[async_trait]
+impl ToolExecutor for Box<dyn ToolExecutor> {
+    fn tool_definitions(&self) -> &[ToolDefinition] {
+        (**self).tool_definitions()
+    }
+
+    async fn execute_tool(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<ToolExecutionResult, AgentError> {
+        (**self).execute_tool(name, arguments).await
+    }
+
+    fn shutdown(self: Box<Self>) {
+        // Cannot call `shutdown(self: Box<Self>)` on the inner trait object
+        // because of double-boxing ownership rules. Child process cleanup
+        // happens via Drop on the underlying transport.
+    }
+
+    async fn check_inbox(&self) -> Option<Vec<String>> {
+        (**self).check_inbox().await
     }
 }
 

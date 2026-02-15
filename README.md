@@ -23,6 +23,14 @@ LLM-driven browser automation agent runtime. Give it a task in plain English, an
  │    │             Decorator Chain                      │    │
  │    │                                                  │    │
  │    │  ┌─────────────────────────────────────────┐    │    │
+ │    │  │ CoordinationExecutor (7 coord tools)    │    │    │
+ │    │  └──────────────────┬──────────────────────┘    │    │
+ │    │                     │                            │    │
+ │    │  ┌──────────────────┴──────────────────────┐    │    │
+ │    │  │ PermissionAwareExecutor (4 modes)       │    │    │
+ │    │  └──────────────────┬──────────────────────┘    │    │
+ │    │                     │                            │    │
+ │    │  ┌──────────────────┴──────────────────────┐    │    │
  │    │  │ HookAwareExecutor (pre/post tool hooks) │    │    │
  │    │  └──────────────────┬──────────────────────┘    │    │
  │    │                     │                            │    │
@@ -143,6 +151,15 @@ remix-agent run [OPTIONS] [TASK]
 | `--no-plugins` | -- | -- | Disable all plugin discovery |
 | `--plugins-dir <PATH>` | -- | `REMIX_PLUGINS_DIR` | Additional plugin directory |
 | `--no-claude-plugins` | -- | -- | Disable Claude Code plugin cache |
+| `--session-id <ID>` | -- | -- | Resume an existing session |
+| `--fork-session <ID>` | -- | -- | Fork from an existing session |
+| `--session-dir <PATH>` | -- | `REMIX_SESSION_DIR` | Override session storage directory |
+| `--permission-mode <MODE>` | -- | -- | Permission mode: `default`, `accept_edits`, `bypass_permissions`, `plan` |
+| `--allow-tool <PATTERN>` | -- | -- | Regex pattern for auto-allowed tools (repeatable) |
+| `--deny-tool <PATTERN>` | -- | -- | Regex pattern for denied tools (repeatable) |
+| `--no-coordination` | -- | -- | Disable multi-agent coordination |
+| `--max-workers <N>` | -- | -- | Maximum concurrent worker agents (default: 5) |
+| `--coordination-dir <PATH>` | -- | `REMIX_COORDINATION_DIR` | Override coordination storage directory |
 
 ### Examples
 
@@ -272,6 +289,31 @@ plugins:
     mcp_servers: true
     hooks: true
     agents: true
+
+session:
+  enabled: true
+  storage_dir: "~/.remix/sessions"
+  max_sessions: 100
+
+compaction:
+  enabled: true
+  trigger_threshold: 0.95
+  context_window_tokens: 200000
+  preserve_recent_n: 4
+
+permissions:
+  mode: default
+  allowed_tools:
+    - "navigate|click|screenshot"
+  denied_tools:
+    - "bash"
+
+coordination:
+  enabled: true
+  max_workers: 5
+  max_worker_iterations: 10
+  worker_timeout_secs: 120
+  storage_dir: "~/.remix/coordination"
 
 on_complete:
   url: "https://hooks.slack.com/your-webhook"
@@ -441,6 +483,106 @@ You are a research specialist...
 | `--plugins-dir <PATH>` | `REMIX_PLUGINS_DIR` | Additional plugin directory |
 | `--no-claude-plugins` | -- | Disable Claude Code plugin cache discovery |
 
+### Multi-agent coordination
+
+The agent can spawn and coordinate multiple child agents to work on tasks in parallel. A lead agent breaks work into subtasks, assigns them to workers, and collects results -- all through seven virtual tools:
+
+| Tool | Description |
+|------|-------------|
+| `task_create` | Create a new task with subject, description, and metadata |
+| `task_list` | List all tasks with their status and ownership |
+| `task_get` | Get full details for a specific task |
+| `task_update` | Update task status, subject, description, or dependencies |
+| `team_create` | Create a named team of agents |
+| `send_message` | Send a message to another agent's inbox |
+| `spawn_agent` | Spawn a new worker agent with a name, task, and optional tool filter |
+
+**Workflow**: The lead agent creates a team, creates tasks, spawns workers to claim and execute them, communicates via `send_message`, and workers mark tasks complete when done. Workers check their inbox between loop iterations and receive messages as injected context.
+
+All coordination state (tasks, teams, inboxes) is persisted to disk with atomic writes for crash safety.
+
+```yaml
+coordination:
+  enabled: true
+  max_workers: 5
+  max_worker_iterations: 10
+  worker_timeout_secs: 120
+  storage_dir: ~/.remix/coordination
+```
+
+Disable with `--no-coordination`. Override worker limits with `--max-workers` and storage location with `--coordination-dir`.
+
+### Sessions
+
+Sessions persist the full conversation history so you can resume or fork previous runs.
+
+Each session is stored at `~/.remix/sessions/{session_id}/` containing:
+- `metadata.json` -- session ID, status, timestamps, task description
+- `messages.jsonl` -- append-only log of all LLM messages
+- `steps.json` -- structured record of every tool call and result
+
+| Action | CLI |
+|--------|-----|
+| Resume a session | `remix-agent run --session-id <ID> "continue the task"` |
+| Fork from a session | `remix-agent run --fork-session <ID> "try a different approach"` |
+| Custom storage dir | `remix-agent run --session-dir /path/to/sessions` |
+
+```yaml
+session:
+  enabled: true
+  storage_dir: ~/.remix/sessions
+  max_sessions: 100
+```
+
+### Permissions
+
+Permissions control which tools the agent can call without user confirmation.
+
+| Mode | Description |
+|------|-------------|
+| `default` | Ask the user before each tool call |
+| `accept_edits` | Auto-allow write tools (write_file, edit_file, bash), ask for others |
+| `bypass_permissions` | Allow all tools without asking |
+| `plan` | Read-only mode -- only allows read_file, grep, glob, load_skill, read_skill_resource |
+
+Policy evaluation order: `bypass_permissions` > `plan` mode > `denied_tools` (regex) > `allowed_tools` (regex) > ask user.
+
+```bash
+# Run in plan mode (read-only exploration)
+remix-agent run --permission-mode plan "Analyze the codebase structure"
+
+# Auto-allow specific tools
+remix-agent run --allow-tool "navigate|click|screenshot" "Take screenshots of each page"
+
+# Deny dangerous tools
+remix-agent run --deny-tool "bash|write_file" "Read and summarize the logs"
+```
+
+```yaml
+permissions:
+  mode: default
+  allowed_tools:
+    - "navigate|click|screenshot"
+  denied_tools:
+    - "bash"
+```
+
+### Context compaction
+
+When the conversation approaches the model's context window limit, the agent automatically compacts older messages into a summary. This allows long-running tasks to continue without hitting token limits.
+
+- **Trigger**: When `total_input_tokens >= trigger_threshold * context_window_tokens`
+- **Process**: Older messages are summarized by the LLM and replaced with a compact `<summary>` block
+- **Preservation**: The most recent N messages are always kept intact
+
+```yaml
+compaction:
+  enabled: true
+  trigger_threshold: 0.95
+  context_window_tokens: 200000
+  preserve_recent_n: 4
+```
+
 ### Webhooks
 
 Get notified when tasks complete or fail:
@@ -521,10 +663,12 @@ cargo fmt --check
 The runtime uses a **decorator chain** pattern where each layer intercepts tool calls it owns and delegates everything else to the next layer:
 
 ```
-HookAwareExecutor          ← fires pre/post hooks around every tool call
-  └─ LocalToolsExecutor    ← intercepts read_file, write_file, edit_file, bash, grep, glob
-       └─ SkillAwareExecutor  ← intercepts load_skill, run_skill_script, read_skill_resource
-            └─ CompositeToolExecutor  ← routes to MCP backends (remix-browser, plugins)
+CoordinationExecutor          ← multi-agent coordination (7 tools)
+  └─ PermissionAwareExecutor  ← permission checking (4 modes)
+       └─ HookAwareExecutor   ← fires pre/post hooks around every tool call
+            └─ LocalToolsExecutor  ← intercepts read_file, write_file, edit_file, bash, grep, glob
+                 └─ SkillAwareExecutor  ← intercepts load_skill, run_skill_script, read_skill_resource
+                      └─ CompositeToolExecutor  ← routes to MCP backends (remix-browser, plugins)
 ```
 
 All components implement the `ToolExecutor` trait, making every layer independently testable with mocks. The `LlmProvider` trait abstracts the LLM HTTP client for the same reason.
@@ -537,7 +681,9 @@ src/
 ├── error.rs                   # Error types and exit codes
 ├── agent/
 │   ├── loop_impl.rs           # Core agent loop (AgentRunner)
-│   └── state.rs               # Message history + step recording
+│   ├── state.rs               # Message history + step recording
+│   ├── compaction.rs          # Context compaction logic
+│   └── compaction_prompt.rs   # Compaction system prompt
 ├── agents_md/
 │   ├── mod.rs                 # Public API re-exports
 │   └── discovery.rs           # AGENTS.md walk + injection
@@ -550,6 +696,17 @@ src/
 │   ├── schema.rs              # AppConfig, LlmConfig, PluginsConfig, etc.
 │   ├── credentials.rs         # Credential adapter (RawCredential → CredentialSet)
 │   └── env.rs                 # ${VAR} interpolation
+├── coordination/
+│   ├── mod.rs                 # Public API re-exports
+│   ├── context.rs             # CoordinationContext (shared state)
+│   ├── executor.rs            # CoordinationExecutor decorator
+│   ├── shared_executor.rs     # SharedToolExecutor for worker agents
+│   ├── task_types.rs          # Task, TaskStatus, TaskId
+│   ├── task_store.rs          # TaskStore (RwLock + file persistence)
+│   ├── team_types.rs          # Team, TeamId, WorkerInfo
+│   ├── team_store.rs          # TeamStore (RwLock + file persistence)
+│   ├── inbox_types.rs         # InboxMessage, InboxId
+│   └── inbox_store.rs         # InboxStore (RwLock + file persistence)
 ├── llm/
 │   ├── client.rs              # Anthropic HTTP client with retry
 │   └── types.rs               # Message, ContentBlock, ToolDefinition
@@ -572,6 +729,10 @@ src/
 ├── output/
 │   ├── result.rs              # AgentResult, StepRecord
 │   └── webhook.rs             # Webhook dispatcher
+├── permissions/
+│   ├── mod.rs                 # Public re-exports
+│   ├── types.rs               # PermissionMode, PermissionPolicy
+│   └── executor.rs            # PermissionAwareExecutor decorator
 ├── plugins/
 │   ├── mod.rs                 # Public re-exports
 │   ├── types.rs               # PluginSet, ResolvedPlugin, PluginComponents
@@ -584,11 +745,20 @@ src/
 │       ├── hooks.rs           # HookRegistry, hooks.json parsing
 │       ├── agents.rs          # Agent .md parsing + system prompt injection
 │       └── mcp.rs             # Plugin MCP server configuration
-└── skills/
-    ├── mod.rs                 # Public API re-exports
-    ├── discovery.rs           # Skill discovery + SKILL.md parsing
-    ├── executor.rs            # SkillAwareExecutor decorator
-    └── types.rs               # SkillSet, SkillEntry, SkillMetadata
+├── session/
+│   ├── mod.rs                 # Public re-exports
+│   ├── types.rs               # SessionId, SessionMetadata, SessionSnapshot
+│   └── store.rs               # SessionStore (create, load, fork, append)
+├── skills/
+│   ├── mod.rs                 # Public API re-exports
+│   ├── discovery.rs           # Skill discovery + SKILL.md parsing
+│   ├── executor.rs            # SkillAwareExecutor decorator
+│   └── types.rs               # SkillSet, SkillEntry, SkillMetadata
+└── subagent/
+    ├── mod.rs                 # Public re-exports
+    ├── types.rs               # SubagentDefinition, SpawnRequest
+    ├── executor.rs            # SubagentExecutor decorator
+    └── filtered_executor.rs   # FilteredToolExecutor (regex tool filtering)
 ```
 
 ## License
