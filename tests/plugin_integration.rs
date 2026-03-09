@@ -49,6 +49,7 @@ impl MockBackend {
                 name: name.to_string(),
                 description: format!("{prefix} tool: {name}"),
                 input_schema: json!({"type": "object"}),
+                cache_control: None,
             })
             .collect();
         Self {
@@ -89,6 +90,7 @@ impl ShutdownTrackingBackend {
                 name: name.to_string(),
                 description: format!("tracked: {name}"),
                 input_schema: json!({"type": "object"}),
+                cache_control: None,
             }],
             shutdown_flag: flag,
         }

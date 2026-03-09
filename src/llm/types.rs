@@ -9,10 +9,71 @@ pub enum Role {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CacheControl {
+    #[serde(rename = "type")]
+    pub cache_type: String,
+}
+
+impl CacheControl {
+    pub fn ephemeral() -> Self {
+        Self {
+            cache_type: "ephemeral".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SystemContent {
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
+}
+
+impl SystemContent {
+    pub fn text(text: impl Into<String>) -> Self {
+        SystemContent::Text {
+            text: text.into(),
+            cache_control: None,
+        }
+    }
+
+    pub fn text_cached(text: impl Into<String>) -> Self {
+        SystemContent::Text {
+            text: text.into(),
+            cache_control: Some(CacheControl::ephemeral()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum ToolResultContent {
+    Text(String),
+    Blocks(Vec<ContentBlock>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ImageSource {
+    #[serde(rename = "type")]
+    pub source_type: String,
+    pub media_type: String,
+    pub data: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text {
         text: String,
+    },
+    Image {
+        source: ImageSource,
+    },
+    Thinking {
+        thinking: String,
     },
     ToolUse {
         id: String,
@@ -21,7 +82,7 @@ pub enum ContentBlock {
     },
     ToolResult {
         tool_use_id: String,
-        content: String,
+        content: ToolResultContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
@@ -33,11 +94,29 @@ pub struct Message {
     pub content: Vec<ContentBlock>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ThinkingConfig {
+    #[serde(rename = "type")]
+    pub thinking_type: String,
+    pub budget_tokens: u32,
+}
+
+impl ThinkingConfig {
+    pub fn enabled(budget_tokens: u32) -> Self {
+        Self {
+            thinking_type: "enabled".to_string(),
+            budget_tokens,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,10 +124,14 @@ pub struct MessagesRequest {
     pub model: String,
     pub max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub system: Option<String>,
+    pub system: Option<Vec<SystemContent>>,
     pub messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolDefinition>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -64,6 +147,10 @@ pub enum StopReason {
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,7 +242,7 @@ mod tests {
     fn test_content_block_tool_result_roundtrip() {
         let block = ContentBlock::ToolResult {
             tool_use_id: "toolu_01A".to_string(),
-            content: "Page loaded successfully".to_string(),
+            content: ToolResultContent::Text("Page loaded successfully".to_string()),
             is_error: None,
         };
         let json = serde_json::to_value(&block).unwrap();
@@ -172,7 +259,7 @@ mod tests {
     fn test_content_block_tool_result_with_error() {
         let block = ContentBlock::ToolResult {
             tool_use_id: "toolu_01B".to_string(),
-            content: "Navigation failed".to_string(),
+            content: ToolResultContent::Text("Navigation failed".to_string()),
             is_error: Some(true),
         };
         let json = serde_json::to_value(&block).unwrap();
@@ -221,7 +308,9 @@ mod tests {
         let request = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 8192,
-            system: Some("You are a browser automation agent.".to_string()),
+            system: Some(vec![SystemContent::text(
+                "You are a browser automation agent.",
+            )]),
             messages: vec![Message {
                 role: Role::User,
                 content: vec![ContentBlock::Text {
@@ -229,18 +318,26 @@ mod tests {
                 }],
             }],
             tools: None,
+            thinking: None,
+            stream: None,
         };
 
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["model"], "claude-sonnet-4-5-20250929");
         assert_eq!(json["max_tokens"], 8192);
-        assert_eq!(json["system"], "You are a browser automation agent.");
+        assert_eq!(json["system"][0]["type"], "text");
+        assert_eq!(
+            json["system"][0]["text"],
+            "You are a browser automation agent."
+        );
         assert_eq!(json["messages"][0]["role"], "user");
         assert_eq!(
             json["messages"][0]["content"][0]["text"],
             "Navigate to example.com"
         );
         assert!(json.get("tools").is_none());
+        assert!(json.get("thinking").is_none());
+        assert!(json.get("stream").is_none());
     }
 
     #[test]
@@ -260,7 +357,10 @@ mod tests {
                     },
                     "required": ["url"]
                 }),
+                cache_control: None,
             }]),
+            thinking: None,
+            stream: None,
         };
 
         let json = serde_json::to_value(&request).unwrap();
@@ -274,7 +374,7 @@ mod tests {
         let request = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 8192,
-            system: Some("System prompt".to_string()),
+            system: Some(vec![SystemContent::text("System prompt")]),
             messages: vec![
                 Message {
                     role: Role::User,
@@ -290,13 +390,14 @@ mod tests {
                 },
             ],
             tools: None,
+            thinking: None,
+            stream: None,
         };
 
         let json_str = serde_json::to_string(&request).unwrap();
         let deserialized: MessagesRequest = serde_json::from_str(&json_str).unwrap();
         assert_eq!(deserialized.model, request.model);
         assert_eq!(deserialized.max_tokens, request.max_tokens);
-        assert_eq!(deserialized.system, request.system);
         assert_eq!(deserialized.messages.len(), 2);
     }
 
@@ -340,10 +441,14 @@ mod tests {
         let usage = Usage {
             input_tokens: 100,
             output_tokens: 250,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         };
         let json = serde_json::to_value(&usage).unwrap();
         assert_eq!(json["input_tokens"], 100);
         assert_eq!(json["output_tokens"], 250);
+        assert!(json.get("cache_creation_input_tokens").is_none());
+        assert!(json.get("cache_read_input_tokens").is_none());
 
         let deserialized: Usage = serde_json::from_value(json).unwrap();
         assert_eq!(deserialized.input_tokens, 100);
@@ -470,6 +575,7 @@ mod tests {
                 "properties": {},
                 "required": []
             }),
+            cache_control: None,
         };
 
         let json_str = serde_json::to_string(&tool).unwrap();
@@ -538,5 +644,262 @@ mod tests {
         let cost = compute_cost("claude-haiku-3-20240307", 10000, 5000);
         let expected = 0.0025 + 0.00625;
         assert!((cost - expected).abs() < 1e-10);
+    }
+
+    // --- New tests for added types ---
+
+    #[test]
+    fn test_image_source_serde_roundtrip() {
+        let source = ImageSource {
+            source_type: "base64".to_string(),
+            media_type: "image/png".to_string(),
+            data: "iVBORw0KGgo=".to_string(),
+        };
+        let json = serde_json::to_value(&source).unwrap();
+        assert_eq!(json["type"], "base64");
+        assert_eq!(json["media_type"], "image/png");
+        assert_eq!(json["data"], "iVBORw0KGgo=");
+
+        let deserialized: ImageSource = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized, source);
+    }
+
+    #[test]
+    fn test_content_block_image_roundtrip() {
+        let block = ContentBlock::Image {
+            source: ImageSource {
+                source_type: "base64".to_string(),
+                media_type: "image/jpeg".to_string(),
+                data: "abc123".to_string(),
+            },
+        };
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "image");
+        assert_eq!(json["source"]["type"], "base64");
+        assert_eq!(json["source"]["media_type"], "image/jpeg");
+
+        let deserialized: ContentBlock = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized, block);
+    }
+
+    #[test]
+    fn test_content_block_thinking_roundtrip() {
+        let block = ContentBlock::Thinking {
+            thinking: "Let me reason about this...".to_string(),
+        };
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "thinking");
+        assert_eq!(json["thinking"], "Let me reason about this...");
+
+        let deserialized: ContentBlock = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized, block);
+    }
+
+    #[test]
+    fn test_tool_result_content_text_serializes_to_string() {
+        let content = ToolResultContent::Text("hello".to_string());
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json, json!("hello"));
+    }
+
+    #[test]
+    fn test_tool_result_content_blocks_serializes_to_array() {
+        let content = ToolResultContent::Blocks(vec![
+            ContentBlock::Text {
+                text: "result text".to_string(),
+            },
+            ContentBlock::Image {
+                source: ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: "data123".to_string(),
+                },
+            },
+        ]);
+        let json = serde_json::to_value(&content).unwrap();
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 2);
+        assert_eq!(json[0]["type"], "text");
+        assert_eq!(json[1]["type"], "image");
+    }
+
+    #[test]
+    fn test_tool_result_content_deserialize_from_string() {
+        let content: ToolResultContent = serde_json::from_str("\"hello world\"").unwrap();
+        assert_eq!(content, ToolResultContent::Text("hello world".to_string()));
+    }
+
+    #[test]
+    fn test_tool_result_content_deserialize_from_array() {
+        let json = json!([{"type": "text", "text": "block content"}]);
+        let content: ToolResultContent = serde_json::from_value(json).unwrap();
+        match content {
+            ToolResultContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                assert!(
+                    matches!(&blocks[0], ContentBlock::Text { text } if text == "block content")
+                );
+            }
+            _ => panic!("Expected Blocks variant"),
+        }
+    }
+
+    #[test]
+    fn test_thinking_config_serde_roundtrip() {
+        let config = ThinkingConfig {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: 10000,
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["type"], "enabled");
+        assert_eq!(json["budget_tokens"], 10000);
+
+        let deserialized: ThinkingConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized, config);
+    }
+
+    #[test]
+    fn test_thinking_config_enabled_constructor() {
+        let config = ThinkingConfig::enabled(5000);
+        assert_eq!(config.thinking_type, "enabled");
+        assert_eq!(config.budget_tokens, 5000);
+    }
+
+    #[test]
+    fn test_system_content_text_roundtrip() {
+        let content = SystemContent::text("You are an agent.");
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json["type"], "text");
+        assert_eq!(json["text"], "You are an agent.");
+        assert!(json.get("cache_control").is_none());
+
+        let deserialized: SystemContent = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized, content);
+    }
+
+    #[test]
+    fn test_system_content_text_cached_roundtrip() {
+        let content = SystemContent::text_cached("Cached system prompt");
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json["type"], "text");
+        assert_eq!(json["text"], "Cached system prompt");
+        assert_eq!(json["cache_control"]["type"], "ephemeral");
+
+        let deserialized: SystemContent = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized, content);
+    }
+
+    #[test]
+    fn test_system_content_text_constructor() {
+        let content = SystemContent::text("hello");
+        match &content {
+            SystemContent::Text {
+                text,
+                cache_control,
+            } => {
+                assert_eq!(text, "hello");
+                assert!(cache_control.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn test_system_content_text_cached_constructor() {
+        let content = SystemContent::text_cached("cached");
+        match &content {
+            SystemContent::Text {
+                text,
+                cache_control,
+            } => {
+                assert_eq!(text, "cached");
+                assert!(cache_control.is_some());
+                assert_eq!(cache_control.as_ref().unwrap().cache_type, "ephemeral");
+            }
+        }
+    }
+
+    #[test]
+    fn test_cache_control_ephemeral_constructor() {
+        let cc = CacheControl::ephemeral();
+        assert_eq!(cc.cache_type, "ephemeral");
+    }
+
+    #[test]
+    fn test_cache_control_serde_roundtrip() {
+        let cc = CacheControl::ephemeral();
+        let json = serde_json::to_value(&cc).unwrap();
+        assert_eq!(json["type"], "ephemeral");
+
+        let deserialized: CacheControl = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized, cc);
+    }
+
+    #[test]
+    fn test_messages_request_with_thinking() {
+        let request = MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 16000,
+            system: None,
+            messages: vec![],
+            tools: None,
+            thinking: Some(ThinkingConfig::enabled(10000)),
+            stream: None,
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["thinking"]["type"], "enabled");
+        assert_eq!(json["thinking"]["budget_tokens"], 10000);
+        assert!(json.get("stream").is_none());
+    }
+
+    #[test]
+    fn test_messages_request_with_stream() {
+        let request = MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 4096,
+            system: None,
+            messages: vec![],
+            tools: None,
+            thinking: None,
+            stream: Some(true),
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["stream"], true);
+        assert!(json.get("thinking").is_none());
+    }
+
+    #[test]
+    fn test_usage_with_cache_tokens() {
+        let usage_json = json!({
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_creation_input_tokens": 2000,
+            "cache_read_input_tokens": 500
+        });
+        let usage: Usage = serde_json::from_value(usage_json).unwrap();
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(usage.cache_creation_input_tokens, Some(2000));
+        assert_eq!(usage.cache_read_input_tokens, Some(500));
+
+        let json = serde_json::to_value(&usage).unwrap();
+        assert_eq!(json["cache_creation_input_tokens"], 2000);
+        assert_eq!(json["cache_read_input_tokens"], 500);
+    }
+
+    #[test]
+    fn test_tool_definition_with_cache_control() {
+        let tool = ToolDefinition {
+            name: "navigate".to_string(),
+            description: "Navigate to a URL".to_string(),
+            input_schema: json!({"type": "object", "properties": {}}),
+            cache_control: Some(CacheControl::ephemeral()),
+        };
+        let json = serde_json::to_value(&tool).unwrap();
+        assert_eq!(json["cache_control"]["type"], "ephemeral");
+
+        let deserialized: ToolDefinition =
+            serde_json::from_str(&serde_json::to_string(&tool).unwrap()).unwrap();
+        assert_eq!(deserialized.name, "navigate");
+        assert!(deserialized.cache_control.is_some());
     }
 }

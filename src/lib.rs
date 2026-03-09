@@ -13,3 +13,4 @@ pub mod plugins;
 pub mod session;
 pub mod skills;
 pub mod subagent;
+pub mod tenant;

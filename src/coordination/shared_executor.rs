@@ -88,11 +88,13 @@ mod tests {
                     name: "navigate".to_string(),
                     description: "Navigate".to_string(),
                     input_schema: json!({"type": "object"}),
+                    cache_control: None,
                 },
                 ToolDefinition {
                     name: "click".to_string(),
                     description: "Click".to_string(),
                     input_schema: json!({"type": "object"}),
+                    cache_control: None,
                 },
             ],
         };
@@ -109,6 +111,7 @@ mod tests {
                 name: "navigate".to_string(),
                 description: "Navigate".to_string(),
                 input_schema: json!({"type": "object"}),
+                cache_control: None,
             }],
         };
         let shared = SharedToolExecutor::new(Arc::new(mock));
@@ -135,6 +138,7 @@ mod tests {
                 name: "test".to_string(),
                 description: "Test".to_string(),
                 input_schema: json!({"type": "object"}),
+                cache_control: None,
             }],
         };
         let shared = SharedToolExecutor::new(Arc::new(mock));
@@ -150,6 +154,7 @@ mod tests {
                 name: "navigate".to_string(),
                 description: "Navigate".to_string(),
                 input_schema: json!({"type": "object"}),
+                cache_control: None,
             }],
         };
         let inner: Arc<dyn ToolExecutor> = Arc::new(mock);

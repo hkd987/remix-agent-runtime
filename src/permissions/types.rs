@@ -96,9 +96,7 @@ impl PermissionPolicy {
             PermissionMode::AcceptEdits => {
                 if let Some(pattern) = self.matches_denied(tool_name) {
                     return PermissionDecision::Deny {
-                        reason: format!(
-                            "Tool '{tool_name}' matches denied pattern '{pattern}'"
-                        ),
+                        reason: format!("Tool '{tool_name}' matches denied pattern '{pattern}'"),
                     };
                 }
 
@@ -117,9 +115,7 @@ impl PermissionPolicy {
             PermissionMode::Default | PermissionMode::DontAsk => {
                 if let Some(pattern) = self.matches_denied(tool_name) {
                     return PermissionDecision::Deny {
-                        reason: format!(
-                            "Tool '{tool_name}' matches denied pattern '{pattern}'"
-                        ),
+                        reason: format!("Tool '{tool_name}' matches denied pattern '{pattern}'"),
                     };
                 }
 

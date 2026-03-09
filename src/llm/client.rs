@@ -1,7 +1,10 @@
 use async_trait::async_trait;
+use futures_core::Stream;
 use std::collections::HashMap;
+use std::pin::Pin;
 use tracing::{debug, error, warn};
 
+use super::stream::{SseParser, StreamEvent};
 use super::types::*;
 use crate::error::AgentError;
 
@@ -9,7 +12,7 @@ use crate::error::AgentError;
 pub trait LlmProvider: Send + Sync {
     async fn send_messages(
         &self,
-        system: Option<&str>,
+        system: Option<&[SystemContent]>,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
     ) -> Result<MessagesResponse, AgentError>;
@@ -19,11 +22,39 @@ pub trait LlmProvider: Send + Sync {
 impl<L: LlmProvider> LlmProvider for std::sync::Arc<L> {
     async fn send_messages(
         &self,
-        system: Option<&str>,
+        system: Option<&[SystemContent]>,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
     ) -> Result<MessagesResponse, AgentError> {
         (**self).send_messages(system, messages, tools).await
+    }
+}
+
+/// Extension trait for LLM providers that support streaming responses.
+///
+/// This is a separate trait from LlmProvider so non-streaming backends
+/// don't need to implement it.
+pub trait StreamingLlmProvider: LlmProvider {
+    /// Send a messages request and return a stream of events.
+    ///
+    /// The stream yields `StreamEvent` items as they arrive from the API.
+    /// Events follow the Anthropic SSE streaming protocol.
+    fn send_messages_stream<'a>(
+        &'a self,
+        system: Option<&'a [SystemContent]>,
+        messages: &'a [Message],
+        tools: Option<&'a [ToolDefinition]>,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, AgentError>> + Send + 'a>>;
+}
+
+impl<L: StreamingLlmProvider> StreamingLlmProvider for std::sync::Arc<L> {
+    fn send_messages_stream<'a>(
+        &'a self,
+        system: Option<&'a [SystemContent]>,
+        messages: &'a [Message],
+        tools: Option<&'a [ToolDefinition]>,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, AgentError>> + Send + 'a>> {
+        (**self).send_messages_stream(system, messages, tools)
     }
 }
 
@@ -34,6 +65,8 @@ pub struct AnthropicClient {
     model: String,
     max_tokens: u32,
     custom_headers: HashMap<String, String>,
+    thinking: Option<ThinkingConfig>,
+    enable_prompt_caching: bool,
 }
 
 impl AnthropicClient {
@@ -43,6 +76,8 @@ impl AnthropicClient {
         model: String,
         max_tokens: u32,
         custom_headers: HashMap<String, String>,
+        thinking: Option<ThinkingConfig>,
+        enable_prompt_caching: bool,
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -51,6 +86,8 @@ impl AnthropicClient {
             model,
             max_tokens,
             custom_headers,
+            thinking,
+            enable_prompt_caching,
         }
     }
 
@@ -62,6 +99,10 @@ impl AnthropicClient {
             .header("x-api-key", &self.api_key)
             .header("content-type", "application/json")
             .header("anthropic-version", "2023-06-01");
+
+        if self.enable_prompt_caching {
+            builder = builder.header("anthropic-beta", "prompt-caching-2024-07-31");
+        }
 
         for (key, value) in &self.custom_headers {
             builder = builder.header(key, value);
@@ -75,16 +116,18 @@ impl AnthropicClient {
 impl LlmProvider for AnthropicClient {
     async fn send_messages(
         &self,
-        system: Option<&str>,
+        system: Option<&[SystemContent]>,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
     ) -> Result<MessagesResponse, AgentError> {
         let request = MessagesRequest {
             model: self.model.clone(),
             max_tokens: self.max_tokens,
-            system: system.map(String::from),
+            system: system.map(|s| s.to_vec()),
             messages: messages.to_vec(),
             tools: tools.map(|t| t.to_vec()),
+            thinking: self.thinking.clone(),
+            stream: None,
         };
 
         let max_retries: u32 = 3;
@@ -159,6 +202,107 @@ impl LlmProvider for AnthropicClient {
     }
 }
 
+impl StreamingLlmProvider for AnthropicClient {
+    fn send_messages_stream<'a>(
+        &'a self,
+        system: Option<&'a [SystemContent]>,
+        messages: &'a [Message],
+        tools: Option<&'a [ToolDefinition]>,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, AgentError>> + Send + 'a>> {
+        let request = MessagesRequest {
+            model: self.model.clone(),
+            max_tokens: self.max_tokens,
+            system: system.map(|s| s.to_vec()),
+            messages: messages.to_vec(),
+            tools: tools.map(|t| t.to_vec()),
+            thinking: self.thinking.clone(),
+            stream: Some(true),
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamEvent, AgentError>>(32);
+        let client = self.client.clone();
+        let url = format!("{}/v1/messages", self.base_url);
+        let api_key = self.api_key.clone();
+        let custom_headers = self.custom_headers.clone();
+        let enable_prompt_caching = self.enable_prompt_caching;
+
+        tokio::spawn(async move {
+            let mut builder = client
+                .post(&url)
+                .header("x-api-key", &api_key)
+                .header("content-type", "application/json")
+                .header("anthropic-version", "2023-06-01");
+
+            if enable_prompt_caching {
+                builder = builder.header("anthropic-beta", "prompt-caching-2024-07-31");
+            }
+
+            for (key, value) in &custom_headers {
+                builder = builder.header(key, value);
+            }
+
+            let response = match builder.json(&request).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(AgentError::Http(e))).await;
+                    return;
+                }
+            };
+
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                let err = if status == reqwest::StatusCode::UNAUTHORIZED
+                    || status == reqwest::StatusCode::FORBIDDEN
+                {
+                    AgentError::LlmAuth(body)
+                } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    AgentError::LlmRateLimited
+                } else {
+                    AgentError::Llm(format!("HTTP {}: {}", status.as_u16(), body))
+                };
+                let _ = tx.send(Err(err)).await;
+                return;
+            }
+
+            let mut byte_stream = response.bytes_stream();
+            let mut parser = SseParser::new();
+
+            use tokio_stream::StreamExt as _;
+            while let Some(chunk_result) = byte_stream.next().await {
+                match chunk_result {
+                    Ok(bytes) => {
+                        let events = parser.feed(&bytes);
+                        for (event_type, data) in events {
+                            match SseParser::parse_event(&event_type, &data) {
+                                Ok(event) => {
+                                    if tx.send(Ok(event)).await.is_err() {
+                                        return; // Receiver dropped
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        event_type = %event_type,
+                                        "Failed to parse stream event"
+                                    );
+                                    // Continue parsing, don't break on individual event parse errors
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(AgentError::Http(e))).await;
+                        return;
+                    }
+                }
+            }
+        });
+
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +369,8 @@ mod tests {
             "test-model".to_string(),
             8192,
             Default::default(),
+            None,
+            false,
         );
 
         let messages = vec![Message {
@@ -235,7 +381,11 @@ mod tests {
         }];
 
         let result = client
-            .send_messages(Some("system prompt"), &messages, None)
+            .send_messages(
+                Some(&[SystemContent::text("system prompt")]),
+                &messages,
+                None,
+            )
             .await;
 
         assert!(result.is_ok());
@@ -270,6 +420,8 @@ mod tests {
             "test-model".to_string(),
             8192,
             Default::default(),
+            None,
+            false,
         );
 
         let messages = vec![Message {
@@ -310,6 +462,8 @@ mod tests {
             "test-model".to_string(),
             8192,
             Default::default(),
+            None,
+            false,
         );
 
         let messages = vec![Message {
@@ -345,6 +499,8 @@ mod tests {
             "test-model".to_string(),
             8192,
             Default::default(),
+            None,
+            false,
         );
 
         let messages = vec![Message {
@@ -380,6 +536,8 @@ mod tests {
             "test-model".to_string(),
             8192,
             Default::default(),
+            None,
+            false,
         );
 
         let messages = vec![Message {
@@ -430,6 +588,8 @@ mod tests {
             "test-model".to_string(),
             8192,
             Default::default(),
+            None,
+            false,
         );
 
         let messages = vec![Message {
@@ -469,6 +629,8 @@ mod tests {
             "test-model".to_string(),
             8192,
             Default::default(),
+            None,
+            false,
         );
 
         let messages = vec![Message {
@@ -520,6 +682,8 @@ mod tests {
             "test-model".to_string(),
             8192,
             Default::default(),
+            None,
+            false,
         );
 
         let messages = vec![Message {
@@ -559,6 +723,8 @@ mod tests {
             "test-model".to_string(),
             8192,
             Default::default(),
+            None,
+            false,
         );
 
         let messages = vec![Message {
@@ -601,6 +767,8 @@ mod tests {
             "my-model".to_string(),
             4096,
             Default::default(),
+            None,
+            false,
         );
 
         let tools = vec![ToolDefinition {
@@ -613,6 +781,7 @@ mod tests {
                 },
                 "required": ["url"]
             }),
+            cache_control: None,
         }];
 
         let messages = vec![Message {
@@ -623,7 +792,11 @@ mod tests {
         }];
 
         let result = client
-            .send_messages(Some("You are a helper"), &messages, Some(&tools))
+            .send_messages(
+                Some(&[SystemContent::text("You are a helper")]),
+                &messages,
+                Some(&tools),
+            )
             .await;
 
         assert!(result.is_ok());
@@ -653,6 +826,8 @@ mod tests {
             "test-model".to_string(),
             8192,
             custom_headers,
+            None,
+            false,
         );
 
         let messages = vec![Message {
@@ -686,6 +861,8 @@ mod tests {
             "test-model".to_string(),
             8192,
             Default::default(),
+            None,
+            false,
         );
 
         let messages = vec![Message {
@@ -717,7 +894,7 @@ mod tests {
         impl LlmProvider for MockLlmProvider {
             async fn send_messages(
                 &self,
-                system: Option<&str>,
+                system: Option<&[SystemContent]>,
                 _messages: &[Message],
                 _tools: Option<&[ToolDefinition]>,
             ) -> Result<MessagesResponse, AgentError> {
@@ -725,7 +902,12 @@ mod tests {
                 Ok(MessagesResponse {
                     id: "msg_mock".to_string(),
                     content: vec![ContentBlock::Text {
-                        text: system.unwrap_or("no system").to_string(),
+                        text: system
+                            .and_then(|s| s.first())
+                            .map(|sc| match sc {
+                                SystemContent::Text { text, .. } => text.clone(),
+                            })
+                            .unwrap_or_else(|| "no system".to_string()),
                     }],
                     model: "mock".to_string(),
                     stop_reason: StopReason::EndTurn,
@@ -747,7 +929,7 @@ mod tests {
 
         // Call through Arc
         let result = provider
-            .send_messages(Some("test system"), &messages, None)
+            .send_messages(Some(&[SystemContent::text("test system")]), &messages, None)
             .await
             .unwrap();
 
@@ -770,5 +952,117 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(*provider.call_count.lock().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_prompt_caching_header_sent_when_enabled() {
+        let mut server = mockito::Server::new_async().await;
+        let response_json = make_success_response_json();
+
+        let mock = server
+            .mock("POST", "/v1/messages")
+            .match_header("anthropic-beta", "prompt-caching-2024-07-31")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&response_json).unwrap())
+            .create_async()
+            .await;
+
+        let client = AnthropicClient::new(
+            server.url(),
+            "test-api-key".to_string(),
+            "test-model".to_string(),
+            8192,
+            Default::default(),
+            None,
+            true,
+        );
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "Hello".to_string(),
+            }],
+        }];
+
+        let result = client.send_messages(None, &messages, None).await;
+        assert!(result.is_ok());
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_prompt_caching_header_not_sent_when_disabled() {
+        let mut server = mockito::Server::new_async().await;
+        let response_json = make_success_response_json();
+
+        let mock = server
+            .mock("POST", "/v1/messages")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&response_json).unwrap())
+            .create_async()
+            .await;
+
+        let client = AnthropicClient::new(
+            server.url(),
+            "test-api-key".to_string(),
+            "test-model".to_string(),
+            8192,
+            Default::default(),
+            None,
+            false,
+        );
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "Hello".to_string(),
+            }],
+        }];
+
+        let result = client.send_messages(None, &messages, None).await;
+        assert!(result.is_ok());
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_thinking_config_included_in_request() {
+        let mut server = mockito::Server::new_async().await;
+        let response_json = make_success_response_json();
+
+        let mock = server
+            .mock("POST", "/v1/messages")
+            .match_body(mockito::Matcher::PartialJsonString(
+                r#"{"thinking":{"type":"enabled","budget_tokens":10000}}"#.to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&response_json).unwrap())
+            .create_async()
+            .await;
+
+        let client = AnthropicClient::new(
+            server.url(),
+            "test-api-key".to_string(),
+            "test-model".to_string(),
+            16000,
+            Default::default(),
+            Some(ThinkingConfig::enabled(10000)),
+            false,
+        );
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "Hello".to_string(),
+            }],
+        }];
+
+        let result = client.send_messages(None, &messages, None).await;
+        assert!(result.is_ok());
+
+        mock.assert_async().await;
     }
 }

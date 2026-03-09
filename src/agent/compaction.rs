@@ -1,5 +1,5 @@
 use crate::config::schema::CompactionConfig;
-use crate::llm::types::{ContentBlock, Message, Role};
+use crate::llm::types::{ContentBlock, Message, Role, ToolResultContent};
 
 /// Result of a compaction operation.
 #[derive(Debug, Clone)]
@@ -39,6 +39,19 @@ pub fn build_compaction_request(messages_to_compact: &[Message]) -> Vec<Message>
                         serde_json::to_string(input).unwrap_or_default()
                     ));
                 }
+                ContentBlock::Image { .. } => {
+                    conversation_text.push_str(&format!("[{role_str} sent image]\n\n"));
+                }
+                ContentBlock::Thinking { thinking } => {
+                    conversation_text.push_str(&format!(
+                        "[{role_str} thinking]: {}\n\n",
+                        if thinking.len() > 200 {
+                            format!("{}...", &thinking[..200])
+                        } else {
+                            thinking.clone()
+                        }
+                    ));
+                }
                 ContentBlock::ToolResult {
                     content, is_error, ..
                 } => {
@@ -47,11 +60,24 @@ pub fn build_compaction_request(messages_to_compact: &[Message]) -> Vec<Message>
                     } else {
                         ""
                     };
-                    // Truncate long tool results
-                    let truncated = if content.len() > 500 {
-                        format!("{}... [truncated]", &content[..500])
+                    let content_str = match content {
+                        ToolResultContent::Text(s) => s.clone(),
+                        ToolResultContent::Blocks(blocks) => blocks
+                            .iter()
+                            .filter_map(|b| {
+                                if let ContentBlock::Text { text } = b {
+                                    Some(text.as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    };
+                    let truncated = if content_str.len() > 500 {
+                        format!("{}... [truncated]", &content_str[..500])
                     } else {
-                        content.clone()
+                        content_str
                     };
                     conversation_text
                         .push_str(&format!("[Tool Result{error_marker}]: {truncated}\n\n"));
@@ -206,7 +232,7 @@ mod tests {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: "toolu_01".to_string(),
-                content: "Page loaded successfully".to_string(),
+                content: ToolResultContent::Text("Page loaded successfully".to_string()),
                 is_error: None,
             }],
         }];
@@ -226,7 +252,7 @@ mod tests {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: "toolu_01".to_string(),
-                content: "Connection refused".to_string(),
+                content: ToolResultContent::Text("Connection refused".to_string()),
                 is_error: Some(true),
             }],
         }];
@@ -246,7 +272,7 @@ mod tests {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: "toolu_01".to_string(),
-                content: long_content,
+                content: ToolResultContent::Text(long_content),
                 is_error: None,
             }],
         }];
@@ -302,7 +328,7 @@ mod tests {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
                     tool_use_id: "toolu_01".to_string(),
-                    content: "OK".to_string(),
+                    content: ToolResultContent::Text("OK".to_string()),
                     is_error: None,
                 }],
             },

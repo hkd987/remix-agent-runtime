@@ -166,9 +166,12 @@ impl AgentState {
             AgentStatus::MaxIterations => {
                 AgentResult::max_iterations(self.steps, total_iterations, duration)
             }
-            AgentStatus::BudgetExceeded => {
-                AgentResult::budget_exceeded(self.steps, total_iterations, duration, self.total_cost)
-            }
+            AgentStatus::BudgetExceeded => AgentResult::budget_exceeded(
+                self.steps,
+                total_iterations,
+                duration,
+                self.total_cost,
+            ),
         };
         result.total_input_tokens = input_tokens;
         result.total_output_tokens = output_tokens;
@@ -179,6 +182,7 @@ impl AgentState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::types::ToolResultContent;
     use serde_json::json;
 
     #[test]
@@ -212,7 +216,7 @@ mod tests {
         let mut state = AgentState::new("task");
         state.add_tool_results(vec![ContentBlock::ToolResult {
             tool_use_id: "toolu_01".to_string(),
-            content: "result data".to_string(),
+            content: ToolResultContent::Text("result data".to_string()),
             is_error: None,
         }]);
         assert_eq!(state.messages().len(), 2);
@@ -224,7 +228,7 @@ mod tests {
                 is_error,
             } => {
                 assert_eq!(tool_use_id, "toolu_01");
-                assert_eq!(content, "result data");
+                assert_eq!(*content, ToolResultContent::Text("result data".to_string()));
                 assert!(is_error.is_none());
             }
             _ => panic!("Expected ToolResult content block"),
@@ -325,10 +329,14 @@ mod tests {
         let usage1 = Usage {
             input_tokens: 100,
             output_tokens: 50,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         };
         let usage2 = Usage {
             input_tokens: 200,
             output_tokens: 75,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         };
         state.accumulate_usage(Some(&usage1), "claude-sonnet-4-20250514");
         state.accumulate_usage(Some(&usage2), "claude-sonnet-4-20250514");
@@ -350,10 +358,15 @@ mod tests {
 
         let mut state = AgentState::new("task");
         state.increment_iteration();
-        state.accumulate_usage(Some(&Usage {
-            input_tokens: 150,
-            output_tokens: 80,
-        }), "claude-sonnet-4-20250514");
+        state.accumulate_usage(
+            Some(&Usage {
+                input_tokens: 150,
+                output_tokens: 80,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }),
+            "claude-sonnet-4-20250514",
+        );
         let result = state.into_result(AgentStatus::Success, Some("done".to_string()));
         assert_eq!(result.total_input_tokens, Some(150));
         assert_eq!(result.total_output_tokens, Some(80));
@@ -377,7 +390,7 @@ mod tests {
         }]);
         state.add_tool_results(vec![ContentBlock::ToolResult {
             tool_use_id: "t1".to_string(),
-            content: "result 1".to_string(),
+            content: ToolResultContent::Text("result 1".to_string()),
             is_error: None,
         }]);
         state.add_assistant_message(vec![ContentBlock::Text {
@@ -385,7 +398,7 @@ mod tests {
         }]);
         state.add_tool_results(vec![ContentBlock::ToolResult {
             tool_use_id: "t2".to_string(),
-            content: "result 2".to_string(),
+            content: ToolResultContent::Text("result 2".to_string()),
             is_error: None,
         }]);
         // Total: 5 messages
@@ -420,10 +433,15 @@ mod tests {
     fn test_total_input_tokens_accessor() {
         let mut state = AgentState::new("task");
         assert_eq!(state.total_input_tokens(), 0);
-        state.accumulate_usage(Some(&crate::llm::types::Usage {
-            input_tokens: 100,
-            output_tokens: 50,
-        }), "claude-sonnet-4-20250514");
+        state.accumulate_usage(
+            Some(&crate::llm::types::Usage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }),
+            "claude-sonnet-4-20250514",
+        );
         assert_eq!(state.total_input_tokens(), 100);
         assert_eq!(state.total_output_tokens(), 50);
     }

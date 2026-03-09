@@ -17,6 +17,7 @@ pub fn convert_mcp_tools(tools: &[McpToolInfo]) -> Vec<ToolDefinition> {
             name: t.name.clone(),
             description: t.description.clone(),
             input_schema: t.input_schema.clone(),
+            cache_control: None,
         })
         .collect()
 }

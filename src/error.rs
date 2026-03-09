@@ -57,6 +57,9 @@ pub enum AgentError {
     #[error("Coordination error: {0}")]
     Coordination(String),
 
+    #[error("Tenant error: {0}")]
+    Tenant(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -68,6 +71,13 @@ pub enum AgentError {
 
     #[error("YAML error: {0}")]
     Yaml(#[from] serde_yaml::Error),
+}
+
+#[cfg(feature = "postgres")]
+impl From<sqlx::Error> for AgentError {
+    fn from(e: sqlx::Error) -> Self {
+        AgentError::Session(e.to_string())
+    }
 }
 
 /// Exit codes matching the PRD specification.

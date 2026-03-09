@@ -47,6 +47,30 @@ pub struct SessionMetadata {
     pub parent_session_id: Option<SessionId>,
 }
 
+impl SessionMetadata {
+    /// Create a new `SessionMetadata` with sensible defaults.
+    pub fn new(id: SessionId, task: &str) -> Self {
+        let now = Utc::now();
+        Self {
+            id,
+            created_at: now,
+            updated_at: now,
+            task: task.to_string(),
+            status: SessionStatus::InProgress,
+            total_input_tokens: None,
+            total_output_tokens: None,
+            parent_session_id: None,
+        }
+    }
+}
+
+/// Compute the current iteration number from a slice of step records.
+///
+/// Returns the maximum `iteration` value found, or `0` if the slice is empty.
+pub fn compute_iteration(steps: &[crate::output::result::StepRecord]) -> u32 {
+    steps.iter().map(|s| s.iteration).max().unwrap_or(0)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     pub metadata: SessionMetadata,

@@ -209,7 +209,7 @@ impl<L: LlmProvider + 'static> SpawnHandler for DefaultSpawnHandler<L> {
 mod tests {
     use super::*;
     use crate::browser::mcp::ToolExecutionResult;
-    use crate::llm::types::{Message, MessagesResponse, ToolDefinition};
+    use crate::llm::types::{Message, MessagesResponse, SystemContent, ToolDefinition};
     use serde_json::json;
     use std::sync::Mutex;
 
@@ -222,7 +222,7 @@ mod tests {
     impl LlmProvider for MockLlm {
         async fn send_messages(
             &self,
-            _system: Option<&str>,
+            _system: Option<&[SystemContent]>,
             _messages: &[Message],
             _tools: Option<&[ToolDefinition]>,
         ) -> Result<MessagesResponse, AgentError> {
@@ -249,6 +249,7 @@ mod tests {
                         name: name.to_string(),
                         description: format!("Tool {name}"),
                         input_schema: json!({"type": "object"}),
+                        cache_control: None,
                     })
                     .collect(),
             }
