@@ -38,6 +38,89 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         &self.tools
     }
 
+    /// Returns `true` for tools that only read state and can safely run concurrently.
+    // TODO: Not currently used for concurrency — all tools run sequentially.
+    // Kept for potential future use when parallel read-only execution is implemented.
+    #[allow(dead_code)]
+    fn is_read_only_tool(name: &str) -> bool {
+        matches!(name, "read_file" | "grep" | "glob" | "list_files" | "screenshot")
+    }
+
+    /// Execute tool_use blocks from an assistant response sequentially.
+    ///
+    /// Returns `(tool_results, step_records)` preserving the original block order.
+    async fn execute_tools(
+        &self,
+        assistant_content: &[ContentBlock],
+        iteration: u32,
+    ) -> (Vec<ContentBlock>, Vec<StepRecord>) {
+        let mut tool_results = Vec::new();
+        let mut step_records = Vec::new();
+
+        for block in assistant_content {
+            if let ContentBlock::ToolUse { id, name, input } = block {
+                debug!(tool = %name, "Executing tool");
+                let step_start = Instant::now();
+                let exec_result = self.tools.execute_tool(name, input.clone()).await;
+                let step_duration = step_start.elapsed().as_millis() as u64;
+                let (content_block, step) =
+                    Self::process_tool_result(id, name, input, exec_result, step_duration, iteration);
+                tool_results.push(content_block);
+                step_records.push(step);
+            }
+        }
+
+        (tool_results, step_records)
+    }
+
+    /// Process a single tool execution result into a ContentBlock and StepRecord.
+    fn process_tool_result(
+        id: &str,
+        name: &str,
+        input: &Value,
+        exec_result: Result<crate::browser::mcp::ToolExecutionResult, AgentError>,
+        step_duration: u64,
+        iteration: u32,
+    ) -> (ContentBlock, StepRecord) {
+        match exec_result {
+            Ok(result) => {
+                let step = StepRecord {
+                    iteration,
+                    tool: name.to_string(),
+                    input: input.clone(),
+                    output: serde_json::from_str(&result.content)
+                        .unwrap_or_else(|_| Value::String(result.content.clone())),
+                    duration_ms: step_duration,
+                    is_error: if result.is_error { Some(true) } else { None },
+                };
+                let block = ContentBlock::ToolResult {
+                    tool_use_id: id.to_string(),
+                    content: result.content,
+                    is_error: if result.is_error { Some(true) } else { None },
+                };
+                (block, step)
+            }
+            Err(e) => {
+                warn!(tool = %name, error = %e, "Tool execution failed");
+                let error_msg = e.to_string();
+                let step = StepRecord {
+                    iteration,
+                    tool: name.to_string(),
+                    input: input.clone(),
+                    output: Value::String(error_msg.clone()),
+                    duration_ms: step_duration,
+                    is_error: Some(true),
+                };
+                let block = ContentBlock::ToolResult {
+                    tool_use_id: id.to_string(),
+                    content: error_msg,
+                    is_error: Some(true),
+                };
+                (block, step)
+            }
+        }
+    }
+
     pub async fn run(
         &self,
         task: &str,
@@ -187,7 +270,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 .send_messages(system_prompt.as_deref(), state.messages(), Some(tool_defs))
                 .await?;
 
-            state.accumulate_usage(response.usage.as_ref());
+            state.accumulate_usage(response.usage.as_ref(), &response.model);
 
             match response.stop_reason {
                 StopReason::ToolUse => {
@@ -219,58 +302,12 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
 
                     state.add_assistant_message(assistant_content.clone());
 
-                    let mut tool_results = Vec::new();
-                    for block in &assistant_content {
-                        if let ContentBlock::ToolUse { id, name, input } = block {
-                            debug!(tool = %name, "Executing tool");
-                            let step_start = Instant::now();
-
-                            let exec_result = self.tools.execute_tool(name, input.clone()).await;
-
-                            let step_duration = step_start.elapsed().as_millis() as u64;
-
-                            match exec_result {
-                                Ok(result) => {
-                                    state.record_step(StepRecord {
-                                        iteration: state.current_iteration(),
-                                        tool: name.clone(),
-                                        input: input.clone(),
-                                        output: serde_json::from_str(&result.content)
-                                            .unwrap_or_else(|_| {
-                                                Value::String(result.content.clone())
-                                            }),
-                                        duration_ms: step_duration,
-                                        is_error: if result.is_error { Some(true) } else { None },
-                                    });
-
-                                    tool_results.push(ContentBlock::ToolResult {
-                                        tool_use_id: id.clone(),
-                                        content: result.content,
-                                        is_error: if result.is_error { Some(true) } else { None },
-                                    });
-                                }
-                                Err(e) => {
-                                    warn!(tool = %name, error = %e, "Tool execution failed");
-                                    let error_msg = e.to_string();
-                                    state.record_step(StepRecord {
-                                        iteration: state.current_iteration(),
-                                        tool: name.clone(),
-                                        input: input.clone(),
-                                        output: Value::String(error_msg.clone()),
-                                        duration_ms: step_duration,
-                                        is_error: Some(true),
-                                    });
-
-                                    tool_results.push(ContentBlock::ToolResult {
-                                        tool_use_id: id.clone(),
-                                        content: error_msg,
-                                        is_error: Some(true),
-                                    });
-                                }
-                            }
-                        }
+                    let (tool_results, step_records) = self
+                        .execute_tools(&assistant_content, state.current_iteration())
+                        .await;
+                    for step in step_records {
+                        state.record_step(step);
                     }
-
                     state.add_tool_results(tool_results);
 
                     // Persist to session after each tool use iteration
@@ -391,6 +428,10 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             // Check compaction
             if let Some(compact_config) = compaction_config {
                 if compaction::should_compact(compact_config, state.total_input_tokens()) {
+                    info!(
+                        input_tokens = state.total_input_tokens(),
+                        "Triggering context compaction"
+                    );
                     let (compact_end, _) = compaction::compute_compaction_split(
                         state.messages().len(),
                         compact_config.preserve_recent_n,
@@ -399,7 +440,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         let messages_to_compact = &state.messages()[..compact_end];
                         let compaction_messages =
                             compaction::build_compaction_request(messages_to_compact);
-                        if let Ok(summary_response) = self
+                        match self
                             .llm
                             .send_messages(
                                 Some(COMPACTION_SYSTEM_PROMPT),
@@ -408,16 +449,22 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                             )
                             .await
                         {
-                            let summary_text = summary_response
-                                .content
-                                .iter()
-                                .filter_map(|b| match b {
-                                    ContentBlock::Text { text } => Some(text.clone()),
-                                    _ => None,
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            state.compact(&summary_text, compact_config.preserve_recent_n);
+                            Ok(summary_response) => {
+                                let summary_text = summary_response
+                                    .content
+                                    .iter()
+                                    .filter_map(|b| match b {
+                                        ContentBlock::Text { text } => Some(text.clone()),
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                state.compact(&summary_text, compact_config.preserve_recent_n);
+                                info!("Context compacted successfully");
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Context compaction failed, continuing without");
+                            }
                         }
                     }
                 }
@@ -429,7 +476,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 .send_messages(system_prompt.as_deref(), state.messages(), Some(tool_defs))
                 .await?;
 
-            state.accumulate_usage(response.usage.as_ref());
+            state.accumulate_usage(response.usage.as_ref(), &response.model);
 
             match response.stop_reason {
                 StopReason::ToolUse => {
@@ -457,49 +504,11 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     }
 
                     state.add_assistant_message(assistant_content.clone());
-                    let mut tool_results = Vec::new();
-                    for block in &assistant_content {
-                        if let ContentBlock::ToolUse { id, name, input } = block {
-                            let step_start = Instant::now();
-                            let exec_result = self.tools.execute_tool(name, input.clone()).await;
-                            let step_duration = step_start.elapsed().as_millis() as u64;
-                            match exec_result {
-                                Ok(result) => {
-                                    state.record_step(StepRecord {
-                                        iteration: state.current_iteration(),
-                                        tool: name.clone(),
-                                        input: input.clone(),
-                                        output: serde_json::from_str(&result.content)
-                                            .unwrap_or_else(|_| {
-                                                Value::String(result.content.clone())
-                                            }),
-                                        duration_ms: step_duration,
-                                        is_error: if result.is_error { Some(true) } else { None },
-                                    });
-                                    tool_results.push(ContentBlock::ToolResult {
-                                        tool_use_id: id.clone(),
-                                        content: result.content,
-                                        is_error: if result.is_error { Some(true) } else { None },
-                                    });
-                                }
-                                Err(e) => {
-                                    let error_msg = e.to_string();
-                                    state.record_step(StepRecord {
-                                        iteration: state.current_iteration(),
-                                        tool: name.clone(),
-                                        input: input.clone(),
-                                        output: Value::String(error_msg.clone()),
-                                        duration_ms: step_duration,
-                                        is_error: Some(true),
-                                    });
-                                    tool_results.push(ContentBlock::ToolResult {
-                                        tool_use_id: id.clone(),
-                                        content: error_msg,
-                                        is_error: Some(true),
-                                    });
-                                }
-                            }
-                        }
+                    let (tool_results, step_records) = self
+                        .execute_tools(&assistant_content, state.current_iteration())
+                        .await;
+                    for step in step_records {
+                        state.record_step(step);
                     }
                     state.add_tool_results(tool_results);
                     self.persist_session_iteration(Some(session_store), &session_metadata, &state);
@@ -677,6 +686,8 @@ mod tests {
             system_prompt: None,
             timeout_secs: 300,
             coordination_config: None,
+            tool_result_max_bytes: 32768,
+            max_budget_usd: None,
         }
     }
 
@@ -763,6 +774,8 @@ mod tests {
             system_prompt: None,
             timeout_secs: 300,
             coordination_config: None,
+            tool_result_max_bytes: 32768,
+            max_budget_usd: None,
         };
 
         // LLM always returns tool_use, so we hit max_iterations
@@ -898,6 +911,8 @@ mod tests {
             system_prompt: Some("You are a browser agent.".to_string()),
             timeout_secs: 300,
             coordination_config: None,
+            tool_result_max_bytes: 32768,
+            max_budget_usd: None,
         };
 
         let llm_responses = Arc::new(Mutex::new(vec![make_end_turn_response("Done")]));
@@ -1213,5 +1228,171 @@ mod tests {
         assert!(system.contains("test-skill"));
         assert!(system.contains("A test skill"));
         assert!(system.contains("load_skill"));
+    }
+
+    #[test]
+    fn test_is_read_only_tool() {
+        // Read-only tools
+        assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool("read_file"));
+        assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool("grep"));
+        assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool("glob"));
+        assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool("list_files"));
+        assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool("screenshot"));
+
+        // Write / side-effecting tools
+        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool("write_file"));
+        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool("edit_file"));
+        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool("bash"));
+        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool("navigate"));
+        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool("click"));
+        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool("unknown_tool"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_tools_empty_content() {
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![])),
+        };
+        let llm = MockLlm {
+            responses: Arc::new(Mutex::new(vec![])),
+        };
+        let runner = AgentRunner::new(llm, tools, default_config());
+
+        let content = vec![ContentBlock::Text {
+            text: "No tools here".to_string(),
+        }];
+        let (tool_results, step_records) = runner.execute_tools(&content, 1).await;
+        assert!(tool_results.is_empty());
+        assert!(step_records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_execute_tools_single_tool() {
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![Ok(ToolExecutionResult {
+                content: "navigated".to_string(),
+                is_error: false,
+            })])),
+        };
+        let llm = MockLlm {
+            responses: Arc::new(Mutex::new(vec![])),
+        };
+        let runner = AgentRunner::new(llm, tools, default_config());
+
+        let content = vec![ContentBlock::ToolUse {
+            id: "toolu_01".to_string(),
+            name: "navigate".to_string(),
+            input: json!({"url": "https://example.com"}),
+        }];
+        let (tool_results, step_records) = runner.execute_tools(&content, 1).await;
+        assert_eq!(tool_results.len(), 1);
+        assert_eq!(step_records.len(), 1);
+        assert!(matches!(
+            &tool_results[0],
+            ContentBlock::ToolResult { content, is_error, .. }
+            if content == "navigated" && is_error.is_none()
+        ));
+        assert_eq!(step_records[0].tool, "navigate");
+    }
+
+    /// A mock executor that returns a result based on the tool name.
+    struct NameAwareMockTools;
+
+    #[async_trait]
+    impl ToolExecutor for NameAwareMockTools {
+        fn tool_definitions(&self) -> &[ToolDefinition] {
+            &[]
+        }
+
+        async fn execute_tool(
+            &self,
+            name: &str,
+            _args: Value,
+        ) -> Result<ToolExecutionResult, AgentError> {
+            Ok(ToolExecutionResult {
+                content: format!("{name}_result"),
+                is_error: false,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_tools_preserves_order_mixed() {
+        // read_file (read-only), write_file (write), grep (read-only)
+        let llm = MockLlm {
+            responses: Arc::new(Mutex::new(vec![])),
+        };
+        let runner = AgentRunner::new(llm, NameAwareMockTools, default_config());
+
+        let content = vec![
+            ContentBlock::ToolUse {
+                id: "t1".to_string(),
+                name: "read_file".to_string(),
+                input: json!({"path": "a.txt"}),
+            },
+            ContentBlock::ToolUse {
+                id: "t2".to_string(),
+                name: "write_file".to_string(),
+                input: json!({"path": "b.txt", "content": "hello"}),
+            },
+            ContentBlock::ToolUse {
+                id: "t3".to_string(),
+                name: "grep".to_string(),
+                input: json!({"pattern": "foo"}),
+            },
+        ];
+        let (tool_results, step_records) = runner.execute_tools(&content, 1).await;
+        assert_eq!(tool_results.len(), 3);
+
+        // Results should be in original order regardless of execution order
+        assert!(matches!(
+            &tool_results[0],
+            ContentBlock::ToolResult { tool_use_id, content, .. }
+            if tool_use_id == "t1" && content == "read_file_result"
+        ));
+        assert!(matches!(
+            &tool_results[1],
+            ContentBlock::ToolResult { tool_use_id, content, .. }
+            if tool_use_id == "t2" && content == "write_file_result"
+        ));
+        assert!(matches!(
+            &tool_results[2],
+            ContentBlock::ToolResult { tool_use_id, content, .. }
+            if tool_use_id == "t3" && content == "grep_result"
+        ));
+
+        // Step records also in order
+        assert_eq!(step_records[0].tool, "read_file");
+        assert_eq!(step_records[1].tool, "write_file");
+        assert_eq!(step_records[2].tool, "grep");
+    }
+
+    #[tokio::test]
+    async fn test_execute_tools_handles_errors() {
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![Err(AgentError::ToolExecution(
+                "fail".to_string(),
+            ))])),
+        };
+        let llm = MockLlm {
+            responses: Arc::new(Mutex::new(vec![])),
+        };
+        let runner = AgentRunner::new(llm, tools, default_config());
+
+        let content = vec![ContentBlock::ToolUse {
+            id: "t1".to_string(),
+            name: "bash".to_string(),
+            input: json!({"command": "false"}),
+        }];
+        let (tool_results, step_records) = runner.execute_tools(&content, 1).await;
+        assert_eq!(tool_results.len(), 1);
+        assert!(matches!(
+            &tool_results[0],
+            ContentBlock::ToolResult { is_error: Some(true), .. }
+        ));
+        assert_eq!(step_records[0].is_error, Some(true));
     }
 }

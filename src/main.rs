@@ -6,9 +6,10 @@ use remix_agent_runtime::agent::AgentRunner;
 use remix_agent_runtime::browser::manager::BrowserManager;
 use remix_agent_runtime::browser::mcp::McpBrowserClient;
 use remix_agent_runtime::browser::mcp::ToolExecutor;
-use remix_agent_runtime::cli::{Cli, Commands};
+use remix_agent_runtime::cli::{Cli, Commands, SessionsCommand};
 use remix_agent_runtime::config::credentials;
 use remix_agent_runtime::config::load_config;
+use remix_agent_runtime::config::schema::default_session_dir;
 use remix_agent_runtime::coordination::{
     CoordinationContext, CoordinationExecutor, DefaultSpawnHandler,
 };
@@ -298,6 +299,9 @@ async fn main() -> ExitCode {
                 remix_agent_runtime::config::schema::PermissionModeConfig::Plan => {
                     PermissionMode::Plan
                 }
+                remix_agent_runtime::config::schema::PermissionModeConfig::DontAsk => {
+                    PermissionMode::DontAsk
+                }
             };
             let permission_policy = PermissionPolicy {
                 mode: permission_mode,
@@ -466,6 +470,54 @@ async fn main() -> ExitCode {
                     webhook.send_error(&error_result).await;
 
                     e.exit_status().into()
+                }
+            }
+        }
+        Commands::Sessions(sessions_args) => {
+            let default_session_dir = default_session_dir;
+
+            match sessions_args.command {
+                SessionsCommand::List { session_dir } => {
+                    let dir = session_dir.unwrap_or_else(default_session_dir);
+                    let store = SessionStore::new(dir, usize::MAX);
+                    match store.list() {
+                        Ok(sessions) => {
+                            if sessions.is_empty() {
+                                println!("No sessions found.");
+                            } else {
+                                for meta in &sessions {
+                                    println!(
+                                        "{}\t{:?}\t{}\t{}",
+                                        meta.id,
+                                        meta.status,
+                                        meta.created_at.format("%Y-%m-%d %H:%M:%S"),
+                                        meta.task
+                                    );
+                                }
+                            }
+                            ExitStatus::Success.into()
+                        }
+                        Err(e) => {
+                            eprintln!("Error listing sessions: {e}");
+                            ExitStatus::AgentError.into()
+                        }
+                    }
+                }
+                SessionsCommand::Show { id, session_dir } => {
+                    let dir = session_dir.unwrap_or_else(default_session_dir);
+                    let store = SessionStore::new(dir, usize::MAX);
+                    let session_id = remix_agent_runtime::session::SessionId(id);
+                    match store.load(&session_id) {
+                        Ok(snapshot) => {
+                            let json = serde_json::to_string_pretty(&snapshot).unwrap();
+                            println!("{json}");
+                            ExitStatus::Success.into()
+                        }
+                        Err(e) => {
+                            eprintln!("Error loading session: {e}");
+                            ExitStatus::AgentError.into()
+                        }
+                    }
                 }
             }
         }

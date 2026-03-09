@@ -16,6 +16,8 @@ pub struct AgentResult {
     pub total_input_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<f64>,
 }
 
 /// Status of the agent run.
@@ -26,6 +28,7 @@ pub enum AgentStatus {
     Error,
     Timeout,
     MaxIterations,
+    BudgetExceeded,
 }
 
 /// A single step executed during the agent run.
@@ -52,6 +55,7 @@ impl AgentResult {
             error: None,
             total_input_tokens: None,
             total_output_tokens: None,
+            total_cost_usd: None,
         }
     }
 
@@ -66,6 +70,7 @@ impl AgentResult {
             error: Some(error),
             total_input_tokens: None,
             total_output_tokens: None,
+            total_cost_usd: None,
         }
     }
 
@@ -80,6 +85,7 @@ impl AgentResult {
             error: Some("Agent timed out".to_string()),
             total_input_tokens: None,
             total_output_tokens: None,
+            total_cost_usd: None,
         }
     }
 
@@ -94,6 +100,30 @@ impl AgentResult {
             error: Some(format!("Max iterations ({iterations}) reached")),
             total_input_tokens: None,
             total_output_tokens: None,
+            total_cost_usd: None,
+        }
+    }
+
+    /// Create a budget-exceeded result.
+    pub fn budget_exceeded(
+        steps: Vec<StepRecord>,
+        iterations: u32,
+        duration_ms: u64,
+        cost_usd: f64,
+    ) -> Self {
+        Self {
+            status: AgentStatus::BudgetExceeded,
+            result: None,
+            steps,
+            total_iterations: iterations,
+            total_duration_ms: duration_ms,
+            error: Some(format!(
+                "Budget exceeded (${:.4} spent)",
+                cost_usd
+            )),
+            total_input_tokens: None,
+            total_output_tokens: None,
+            total_cost_usd: Some(cost_usd),
         }
     }
 }
@@ -136,6 +166,7 @@ mod tests {
             error: None,
             total_input_tokens: None,
             total_output_tokens: None,
+            total_cost_usd: None,
         };
 
         let json = serde_json::to_value(&result).unwrap();
@@ -173,6 +204,10 @@ mod tests {
             serde_json::to_value(AgentStatus::MaxIterations).unwrap(),
             json!("max_iterations")
         );
+        assert_eq!(
+            serde_json::to_value(AgentStatus::BudgetExceeded).unwrap(),
+            json!("budget_exceeded")
+        );
     }
 
     #[test]
@@ -192,6 +227,10 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<AgentStatus>("\"max_iterations\"").unwrap(),
             AgentStatus::MaxIterations
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentStatus>("\"budget_exceeded\"").unwrap(),
+            AgentStatus::BudgetExceeded
         );
     }
 
@@ -258,6 +297,7 @@ mod tests {
             error: None,
             total_input_tokens: None,
             total_output_tokens: None,
+            total_cost_usd: None,
         };
 
         let json_str = serde_json::to_string(&original).unwrap();
@@ -277,6 +317,7 @@ mod tests {
             error: Some("fail".to_string()),
             total_input_tokens: None,
             total_output_tokens: None,
+            total_cost_usd: None,
         };
 
         let json = serde_json::to_value(&result).unwrap();
@@ -331,6 +372,49 @@ mod tests {
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["total_input_tokens"], 500);
         assert_eq!(json["total_output_tokens"], 200);
+    }
+
+    #[test]
+    fn test_budget_exceeded_serde_roundtrip() {
+        let json_str = "\"budget_exceeded\"";
+        let status: AgentStatus = serde_json::from_str(json_str).unwrap();
+        assert_eq!(status, AgentStatus::BudgetExceeded);
+        let serialized = serde_json::to_string(&status).unwrap();
+        assert_eq!(serialized, json_str);
+    }
+
+    #[test]
+    fn test_budget_exceeded_constructor() {
+        let steps = vec![sample_step()];
+        let result = AgentResult::budget_exceeded(steps.clone(), 10, 5000, 1.2345);
+
+        assert_eq!(result.status, AgentStatus::BudgetExceeded);
+        assert!(result.result.is_none());
+        assert_eq!(result.steps, steps);
+        assert_eq!(result.total_iterations, 10);
+        assert_eq!(result.total_duration_ms, 5000);
+        assert_eq!(
+            result.error,
+            Some("Budget exceeded ($1.2345 spent)".to_string())
+        );
+        assert_eq!(result.total_cost_usd, Some(1.2345));
+    }
+
+    #[test]
+    fn test_total_cost_usd_omitted_when_none() {
+        let result = AgentResult::success("ok".to_string(), vec![], 100);
+        let json = serde_json::to_value(&result).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(!obj.contains_key("total_cost_usd"));
+    }
+
+    #[test]
+    fn test_total_cost_usd_present_when_some() {
+        let mut result = AgentResult::success("ok".to_string(), vec![], 100);
+        result.total_cost_usd = Some(0.0523);
+        let json = serde_json::to_value(&result).unwrap();
+        let cost = json["total_cost_usd"].as_f64().unwrap();
+        assert!((cost - 0.0523).abs() < f64::EPSILON);
     }
 
     #[test]

@@ -161,6 +161,10 @@ impl Default for BrowserConfig {
     }
 }
 
+fn default_tool_result_max_bytes() -> usize {
+    32768
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     #[serde(default = "default_max_iterations")]
@@ -170,6 +174,10 @@ pub struct AgentConfig {
     pub timeout_secs: u64,
     #[serde(default = "default_coordination_config")]
     pub coordination_config: Option<CoordinationConfig>,
+    #[serde(default = "default_tool_result_max_bytes")]
+    pub tool_result_max_bytes: usize,
+    #[serde(default)]
+    pub max_budget_usd: Option<f64>,
 }
 
 fn default_coordination_config() -> Option<CoordinationConfig> {
@@ -183,6 +191,8 @@ impl Default for AgentConfig {
             system_prompt: None,
             timeout_secs: default_timeout(),
             coordination_config: Some(CoordinationConfig::default()),
+            tool_result_max_bytes: default_tool_result_max_bytes(),
+            max_budget_usd: None,
         }
     }
 }
@@ -340,7 +350,7 @@ impl Default for PluginComponentsConfig {
     }
 }
 
-fn default_session_dir() -> PathBuf {
+pub fn default_session_dir() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
         PathBuf::from(home).join(".remix").join("sessions")
     } else {
@@ -445,6 +455,7 @@ pub enum PermissionModeConfig {
     AcceptEdits,
     BypassPermissions,
     Plan,
+    DontAsk,
 }
 
 impl Default for PermissionsConfig {
@@ -1180,5 +1191,62 @@ coordination:
         assert_eq!(config.coordination.max_workers, 5);
         assert_eq!(config.coordination.max_worker_iterations, 10);
         assert_eq!(config.coordination.worker_timeout_secs, 120);
+    }
+
+    #[test]
+    fn test_agent_config_tool_result_max_bytes_default() {
+        let config = AgentConfig::default();
+        assert_eq!(config.tool_result_max_bytes, 32768);
+    }
+
+    #[test]
+    fn test_agent_config_max_budget_usd_default() {
+        let config = AgentConfig::default();
+        assert!(config.max_budget_usd.is_none());
+    }
+
+    #[test]
+    fn test_agent_config_yaml_with_new_fields() {
+        let yaml = r#"
+max_iterations: 30
+timeout_secs: 120
+tool_result_max_bytes: 65536
+max_budget_usd: 5.0
+"#;
+        let config: AgentConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.max_iterations, 30);
+        assert_eq!(config.timeout_secs, 120);
+        assert_eq!(config.tool_result_max_bytes, 65536);
+        assert_eq!(config.max_budget_usd, Some(5.0));
+    }
+
+    #[test]
+    fn test_agent_config_yaml_defaults_for_new_fields() {
+        let yaml = r#"
+max_iterations: 20
+"#;
+        let config: AgentConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.tool_result_max_bytes, 32768);
+        assert!(config.max_budget_usd.is_none());
+    }
+
+    #[test]
+    fn test_permission_mode_dont_ask_variant() {
+        let yaml = r#"
+mode: dont_ask
+allowed_tools: []
+denied_tools: []
+"#;
+        let config: PermissionsConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.mode, PermissionModeConfig::DontAsk);
+    }
+
+    #[test]
+    fn test_permission_mode_dont_ask_serde_roundtrip() {
+        let mode = PermissionModeConfig::DontAsk;
+        let json = serde_json::to_value(&mode).unwrap();
+        assert_eq!(json, serde_json::json!("dont_ask"));
+        let deserialized: PermissionModeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized, PermissionModeConfig::DontAsk);
     }
 }

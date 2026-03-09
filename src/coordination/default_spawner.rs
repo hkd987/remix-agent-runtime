@@ -183,6 +183,8 @@ impl<L: LlmProvider + 'static> SpawnHandler for DefaultSpawnHandler<L> {
             system_prompt: definition.system_prompt.clone(),
             timeout_secs: definition.timeout_secs,
             coordination_config: Some(self.coordination_config.clone()),
+            tool_result_max_bytes: 32_768,
+            max_budget_usd: None,
         };
 
         // 4. Create AgentRunner and tokio::spawn
