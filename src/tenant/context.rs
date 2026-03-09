@@ -142,7 +142,10 @@ mod tests {
         assert_eq!(deserialized.max_iterations, ctx.max_iterations);
         assert_eq!(deserialized.timeout_secs, ctx.timeout_secs);
         assert_eq!(deserialized.max_budget_usd, ctx.max_budget_usd);
-        assert_eq!(deserialized.max_concurrent_agents, ctx.max_concurrent_agents);
+        assert_eq!(
+            deserialized.max_concurrent_agents,
+            ctx.max_concurrent_agents
+        );
         assert_eq!(deserialized.custom_headers, ctx.custom_headers);
     }
 

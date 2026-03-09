@@ -6,23 +6,16 @@ use crate::error::AgentError;
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
     /// `message_start` - contains the initial Message object
-    MessageStart {
-        message: MessageStartData,
-    },
+    MessageStart { message: MessageStartData },
     /// `content_block_start` - a new content block is beginning
     ContentBlockStart {
         index: u32,
         content_block: ContentBlockStartData,
     },
     /// `content_block_delta` - incremental update to a content block
-    ContentBlockDelta {
-        index: u32,
-        delta: Delta,
-    },
+    ContentBlockDelta { index: u32, delta: Delta },
     /// `content_block_stop` - a content block is complete
-    ContentBlockStop {
-        index: u32,
-    },
+    ContentBlockStop { index: u32 },
     /// `message_delta` - update to the top-level message (e.g. stop_reason)
     MessageDelta {
         delta: MessageDeltaData,
@@ -33,9 +26,7 @@ pub enum StreamEvent {
     /// `ping` - keep-alive event
     Ping,
     /// `error` - an error occurred during streaming
-    Error {
-        error: StreamErrorData,
-    },
+    Error { error: StreamErrorData },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -161,9 +152,8 @@ impl SseParser {
                 struct Wrapper {
                     message: MessageStartData,
                 }
-                let wrapper: Wrapper = serde_json::from_str(data).map_err(|e| {
-                    AgentError::Llm(format!("Failed to parse message_start: {e}"))
-                })?;
+                let wrapper: Wrapper = serde_json::from_str(data)
+                    .map_err(|e| AgentError::Llm(format!("Failed to parse message_start: {e}")))?;
                 Ok(StreamEvent::MessageStart {
                     message: wrapper.message,
                 })
@@ -214,9 +204,8 @@ impl SseParser {
                     delta: MessageDeltaData,
                     usage: Option<DeltaUsage>,
                 }
-                let wrapper: Wrapper = serde_json::from_str(data).map_err(|e| {
-                    AgentError::Llm(format!("Failed to parse message_delta: {e}"))
-                })?;
+                let wrapper: Wrapper = serde_json::from_str(data)
+                    .map_err(|e| AgentError::Llm(format!("Failed to parse message_delta: {e}")))?;
                 Ok(StreamEvent::MessageDelta {
                     delta: wrapper.delta,
                     usage: wrapper.usage,
@@ -229,9 +218,8 @@ impl SseParser {
                 struct Wrapper {
                     error: StreamErrorData,
                 }
-                let wrapper: Wrapper = serde_json::from_str(data).map_err(|e| {
-                    AgentError::Llm(format!("Failed to parse error event: {e}"))
-                })?;
+                let wrapper: Wrapper = serde_json::from_str(data)
+                    .map_err(|e| AgentError::Llm(format!("Failed to parse error event: {e}")))?;
                 Ok(StreamEvent::Error {
                     error: wrapper.error,
                 })
@@ -325,7 +313,8 @@ mod tests {
 
     #[test]
     fn test_parse_content_block_start_text() {
-        let data = r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#;
+        let data =
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#;
         let event = SseParser::parse_event("content_block_start", data).unwrap();
         match event {
             StreamEvent::ContentBlockStart {
@@ -333,7 +322,9 @@ mod tests {
                 content_block,
             } => {
                 assert_eq!(index, 0);
-                assert!(matches!(content_block, ContentBlockStartData::Text { text } if text.is_empty()));
+                assert!(
+                    matches!(content_block, ContentBlockStartData::Text { text } if text.is_empty())
+                );
             }
             other => panic!("Expected ContentBlockStart, got {:?}", other),
         }
@@ -349,7 +340,9 @@ mod tests {
                 content_block,
             } => {
                 assert_eq!(index, 1);
-                assert!(matches!(content_block, ContentBlockStartData::ToolUse { id, name } if id == "toolu_abc" && name == "navigate"));
+                assert!(
+                    matches!(content_block, ContentBlockStartData::ToolUse { id, name } if id == "toolu_abc" && name == "navigate")
+                );
             }
             other => panic!("Expected ContentBlockStart, got {:?}", other),
         }
@@ -357,8 +350,7 @@ mod tests {
 
     #[test]
     fn test_parse_content_block_delta_text() {
-        let data =
-            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#;
+        let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#;
         let event = SseParser::parse_event("content_block_delta", data).unwrap();
         match event {
             StreamEvent::ContentBlockDelta { index, delta } => {

@@ -243,13 +243,17 @@ impl<T: ToolExecutor> HookAwareExecutor<T> {
                         let trimmed = stdout_str.trim();
                         if !trimmed.is_empty() {
                             if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
-                                if let Some(decision) = parsed.get("permissionDecision").and_then(|v| v.as_str()) {
+                                if let Some(decision) =
+                                    parsed.get("permissionDecision").and_then(|v| v.as_str())
+                                {
                                     result.permission_decision = Some(decision.to_string());
                                 }
                                 if let Some(input) = parsed.get("updatedInput") {
                                     result.updated_input = Some(input.clone());
                                 }
-                                if let Some(msg) = parsed.get("systemMessage").and_then(|v| v.as_str()) {
+                                if let Some(msg) =
+                                    parsed.get("systemMessage").and_then(|v| v.as_str())
+                                {
                                     result.system_message = Some(msg.to_string());
                                 }
                             }
@@ -890,8 +894,7 @@ mod tests {
             "hook.sh",
             r#"printf '{"permissionDecision": "allow"}'"#,
         );
-        let registry =
-            registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, &cmd);
+        let registry = registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, &cmd);
         let inner = mock_inner();
         let executor = HookAwareExecutor::new(inner, registry, 30);
 
@@ -911,8 +914,7 @@ mod tests {
             "hook.sh",
             r#"printf '{"updatedInput": {"url": "https://changed.com"}}'"#,
         );
-        let registry =
-            registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, &cmd);
+        let registry = registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, &cmd);
         let inner = mock_inner();
         let executor = HookAwareExecutor::new(inner, registry, 30);
 
@@ -933,18 +935,14 @@ mod tests {
             "hook.sh",
             r#"printf '{"systemMessage": "Please be careful"}'"#,
         );
-        let registry =
-            registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, &cmd);
+        let registry = registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, &cmd);
         let inner = mock_inner();
         let executor = HookAwareExecutor::new(inner, registry, 30);
 
         let result = executor
             .run_hooks("navigate", &json!({}), None, &HookTiming::PreToolUse)
             .await;
-        assert_eq!(
-            result.system_message,
-            Some("Please be careful".to_string())
-        );
+        assert_eq!(result.system_message, Some("Please be careful".to_string()));
     }
 
     #[tokio::test]
@@ -955,8 +953,7 @@ mod tests {
             "hook.sh",
             r#"printf '{"permissionDecision":"deny","updatedInput":{"x":1},"systemMessage":"blocked"}'"#,
         );
-        let registry =
-            registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, &cmd);
+        let registry = registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, &cmd);
         let inner = mock_inner();
         let executor = HookAwareExecutor::new(inner, registry, 30);
 
@@ -972,8 +969,7 @@ mod tests {
     async fn test_run_hooks_ignores_invalid_json() {
         let dir = TempDir::new().unwrap();
         let cmd = script_command(dir.path(), "hook.sh", "echo this is not json");
-        let registry =
-            registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, &cmd);
+        let registry = registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, &cmd);
         let inner = mock_inner();
         let executor = HookAwareExecutor::new(inner, registry, 30);
 
@@ -988,8 +984,7 @@ mod tests {
     async fn test_run_hooks_ignores_empty_stdout() {
         let dir = TempDir::new().unwrap();
         let command = "true"; // produces no output
-        let registry =
-            registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, command);
+        let registry = registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, command);
         let inner = mock_inner();
         let executor = HookAwareExecutor::new(inner, registry, 30);
 
@@ -1091,8 +1086,7 @@ mod tests {
             "hook.sh",
             r#"printf '{"permissionDecision": "allow", "systemMessage": "ok"}'"#,
         );
-        let registry =
-            registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, &cmd);
+        let registry = registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, &cmd);
         let inner = mock_inner();
         let executor = HookAwareExecutor::new(inner, registry, 30);
 

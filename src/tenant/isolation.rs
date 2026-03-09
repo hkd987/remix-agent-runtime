@@ -1,11 +1,11 @@
-use crate::config::schema::{AgentConfig, PermissionsConfig, PermissionModeConfig};
-use crate::llm::client::AnthropicClient;
 use super::context::TenantContext;
+use crate::config::schema::{AgentConfig, PermissionModeConfig, PermissionsConfig};
+use crate::llm::client::AnthropicClient;
 
 /// Create an AnthropicClient configured for a specific tenant.
 pub fn create_tenant_llm(context: &TenantContext) -> AnthropicClient {
     AnthropicClient::new(
-        "https://api.anthropic.com".to_string(),
+        crate::config::schema::default_base_url(),
         context.api_key.clone(),
         context.model.clone(),
         context.max_tokens,

@@ -73,6 +73,13 @@ pub enum AgentError {
     Yaml(#[from] serde_yaml::Error),
 }
 
+#[cfg(feature = "postgres")]
+impl From<sqlx::Error> for AgentError {
+    fn from(e: sqlx::Error) -> Self {
+        AgentError::Session(e.to_string())
+    }
+}
+
 /// Exit codes matching the PRD specification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitStatus {

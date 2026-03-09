@@ -74,9 +74,10 @@ async fn main() -> ExitCode {
             tracing::info!("Starting agent with config: {}", config.llm);
 
             // Create LLM client (wrapped in Arc for sharing with child agents)
-            let thinking_config = config.llm.thinking_budget_tokens.map(
-                remix_agent_runtime::llm::types::ThinkingConfig::enabled,
-            );
+            let thinking_config = config
+                .llm
+                .thinking_budget_tokens
+                .map(remix_agent_runtime::llm::types::ThinkingConfig::enabled);
             let llm_client = std::sync::Arc::new(AnthropicClient::new(
                 config.llm.base_url.clone(),
                 config.llm.api_key.clone(),
@@ -408,7 +409,9 @@ async fn main() -> ExitCode {
                         &credential_set,
                         &skill_set,
                         &agents_md,
-                        session_store.as_ref().map(|s| s as &dyn remix_agent_runtime::session::SessionStorage),
+                        session_store
+                            .as_ref()
+                            .map(|s| s as &dyn remix_agent_runtime::session::SessionStorage),
                         compaction_config.as_ref(),
                     )
                     .await

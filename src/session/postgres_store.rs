@@ -7,7 +7,7 @@ use crate::llm::types::Message;
 use crate::output::result::StepRecord;
 
 use super::traits::SessionStorage;
-use super::types::{SessionId, SessionMetadata, SessionSnapshot, SessionStatus};
+use super::types::{compute_iteration, SessionId, SessionMetadata, SessionSnapshot, SessionStatus};
 
 /// PostgreSQL-backed session storage.
 ///
@@ -42,8 +42,7 @@ impl PostgresSessionStore {
             "#,
         )
         .execute(&self.pool)
-        .await
-        .map_err(|e| AgentError::Session(e.to_string()))?;
+        .await?;
 
         sqlx::query(
             r#"
@@ -56,8 +55,7 @@ impl PostgresSessionStore {
             "#,
         )
         .execute(&self.pool)
-        .await
-        .map_err(|e| AgentError::Session(e.to_string()))?;
+        .await?;
 
         sqlx::query(
             r#"
@@ -68,8 +66,7 @@ impl PostgresSessionStore {
             "#,
         )
         .execute(&self.pool)
-        .await
-        .map_err(|e| AgentError::Session(e.to_string()))?;
+        .await?;
 
         sqlx::query(
             r#"
@@ -78,64 +75,46 @@ impl PostgresSessionStore {
             "#,
         )
         .execute(&self.pool)
-        .await
-        .map_err(|e| AgentError::Session(e.to_string()))?;
+        .await?;
 
         Ok(())
     }
 
     /// Serialize a `SessionStatus` to the snake_case string stored in the DB.
-    fn status_to_str(status: &SessionStatus) -> &'static str {
-        match status {
-            SessionStatus::InProgress => "in_progress",
-            SessionStatus::Completed => "completed",
-            SessionStatus::Error => "error",
-            SessionStatus::Paused => "paused",
+    ///
+    /// Uses serde_json as the single source of truth so that the mapping stays
+    /// in sync with the `#[serde(rename_all = "snake_case")]` on `SessionStatus`.
+    fn status_to_str(status: &SessionStatus) -> Result<String, AgentError> {
+        match serde_json::to_value(status) {
+            Ok(serde_json::Value::String(s)) => Ok(s),
+            Ok(other) => Err(AgentError::Session(format!(
+                "Expected string for SessionStatus, got: {other}"
+            ))),
+            Err(e) => Err(AgentError::Session(e.to_string())),
         }
     }
 
     /// Deserialize a status string from the DB back to `SessionStatus`.
+    ///
+    /// Uses serde_json as the single source of truth so that the mapping stays
+    /// in sync with the `#[serde(rename_all = "snake_case")]` on `SessionStatus`.
     fn str_to_status(s: &str) -> Result<SessionStatus, AgentError> {
-        match s {
-            "in_progress" => Ok(SessionStatus::InProgress),
-            "completed" => Ok(SessionStatus::Completed),
-            "error" => Ok(SessionStatus::Error),
-            "paused" => Ok(SessionStatus::Paused),
-            other => Err(AgentError::Session(format!(
-                "Unknown session status: {}",
-                other
-            ))),
-        }
+        serde_json::from_value(serde_json::Value::String(s.to_string()))
+            .map_err(|e| AgentError::Session(format!("Unknown session status '{s}': {e}")))
     }
 
     /// Build a `SessionMetadata` from a raw database row.
     fn row_to_metadata(row: &sqlx::postgres::PgRow) -> Result<SessionMetadata, AgentError> {
         use sqlx::Row;
 
-        let id: String = row
-            .try_get("id")
-            .map_err(|e| AgentError::Session(e.to_string()))?;
-        let created_at = row
-            .try_get("created_at")
-            .map_err(|e| AgentError::Session(e.to_string()))?;
-        let updated_at = row
-            .try_get("updated_at")
-            .map_err(|e| AgentError::Session(e.to_string()))?;
-        let task: String = row
-            .try_get("task")
-            .map_err(|e| AgentError::Session(e.to_string()))?;
-        let status_str: String = row
-            .try_get("status")
-            .map_err(|e| AgentError::Session(e.to_string()))?;
-        let total_input_tokens: Option<i32> = row
-            .try_get("total_input_tokens")
-            .map_err(|e| AgentError::Session(e.to_string()))?;
-        let total_output_tokens: Option<i32> = row
-            .try_get("total_output_tokens")
-            .map_err(|e| AgentError::Session(e.to_string()))?;
-        let parent_session_id: Option<String> = row
-            .try_get("parent_session_id")
-            .map_err(|e| AgentError::Session(e.to_string()))?;
+        let id: String = row.try_get("id")?;
+        let created_at = row.try_get("created_at")?;
+        let updated_at = row.try_get("updated_at")?;
+        let task: String = row.try_get("task")?;
+        let status_str: String = row.try_get("status")?;
+        let total_input_tokens: Option<i32> = row.try_get("total_input_tokens")?;
+        let total_output_tokens: Option<i32> = row.try_get("total_output_tokens")?;
+        let parent_session_id: Option<String> = row.try_get("parent_session_id")?;
 
         Ok(SessionMetadata {
             id: SessionId(id),
@@ -153,11 +132,12 @@ impl PostgresSessionStore {
 #[async_trait]
 impl SessionStorage for PostgresSessionStore {
     async fn create(&self, task: &str) -> Result<SessionMetadata, AgentError> {
+        let mut tx = self.pool.begin().await?;
+
         // Check session count
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| AgentError::Session(e.to_string()))?;
+            .fetch_one(&mut *tx)
+            .await?;
 
         if count as usize >= self.max_sessions {
             return Err(AgentError::Session(format!(
@@ -168,7 +148,7 @@ impl SessionStorage for PostgresSessionStore {
 
         let id = SessionId::new();
         let now = Utc::now();
-        let status_str = Self::status_to_str(&SessionStatus::InProgress);
+        let status_str = Self::status_to_str(&SessionStatus::InProgress)?;
 
         sqlx::query(
             r#"
@@ -180,10 +160,9 @@ impl SessionStorage for PostgresSessionStore {
         .bind(now)
         .bind(now)
         .bind(task)
-        .bind(status_str)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| AgentError::Session(e.to_string()))?;
+        .bind(&status_str)
+        .execute(&mut *tx)
+        .await?;
 
         // Initialize empty steps row
         sqlx::query(
@@ -193,24 +172,16 @@ impl SessionStorage for PostgresSessionStore {
             "#,
         )
         .bind(&id.0)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| AgentError::Session(e.to_string()))?;
+        .execute(&mut *tx)
+        .await?;
 
-        Ok(SessionMetadata {
-            id,
-            created_at: now,
-            updated_at: now,
-            task: task.to_string(),
-            status: SessionStatus::InProgress,
-            total_input_tokens: None,
-            total_output_tokens: None,
-            parent_session_id: None,
-        })
+        tx.commit().await?;
+
+        Ok(SessionMetadata::new(id, task))
     }
 
     async fn save_metadata(&self, metadata: &SessionMetadata) -> Result<(), AgentError> {
-        let status_str = Self::status_to_str(&metadata.status);
+        let status_str = Self::status_to_str(&metadata.status)?;
 
         let result = sqlx::query(
             r#"
@@ -226,14 +197,13 @@ impl SessionStorage for PostgresSessionStore {
         )
         .bind(metadata.updated_at)
         .bind(&metadata.task)
-        .bind(status_str)
+        .bind(&status_str)
         .bind(metadata.total_input_tokens.map(|v| v as i32))
         .bind(metadata.total_output_tokens.map(|v| v as i32))
         .bind(metadata.parent_session_id.as_ref().map(|id| &id.0))
         .bind(&metadata.id.0)
         .execute(&self.pool)
-        .await
-        .map_err(|e| AgentError::Session(e.to_string()))?;
+        .await?;
 
         if result.rows_affected() == 0 {
             return Err(AgentError::Session(format!(
@@ -263,8 +233,7 @@ impl SessionStorage for PostgresSessionStore {
             .bind(&session_id.0)
             .bind(json_value)
             .execute(&self.pool)
-            .await
-            .map_err(|e| AgentError::Session(e.to_string()))?;
+            .await?;
         }
 
         Ok(())
@@ -289,8 +258,7 @@ impl SessionStorage for PostgresSessionStore {
         .bind(&session_id.0)
         .bind(json_value)
         .execute(&self.pool)
-        .await
-        .map_err(|e| AgentError::Session(e.to_string()))?;
+        .await?;
 
         Ok(())
     }
@@ -304,22 +272,19 @@ impl SessionStorage for PostgresSessionStore {
             sqlx::query("SELECT steps FROM session_steps WHERE session_id = $1")
                 .bind(&session_id.0)
                 .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| AgentError::Session(e.to_string()))?;
+                .await?;
 
         let steps: Vec<StepRecord> = match steps_row {
             Some(row) => {
                 use sqlx::Row;
-                let json_value: serde_json::Value = row
-                    .try_get("steps")
-                    .map_err(|e| AgentError::Session(e.to_string()))?;
+                let json_value: serde_json::Value = row.try_get("steps")?;
                 serde_json::from_value(json_value)
                     .map_err(|e| AgentError::Session(e.to_string()))?
             }
             None => Vec::new(),
         };
 
-        let iteration = steps.iter().map(|s| s.iteration).max().unwrap_or(0);
+        let iteration = compute_iteration(&steps);
 
         Ok(SessionSnapshot {
             metadata,
@@ -334,28 +299,23 @@ impl SessionStorage for PostgresSessionStore {
         let row: sqlx::postgres::PgRow = sqlx::query("SELECT * FROM sessions WHERE id = $1")
             .bind(&session_id.0)
             .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| AgentError::Session(e.to_string()))?
+            .await?
             .ok_or_else(|| AgentError::Session(format!("Session not found: {}", session_id)))?;
 
         Self::row_to_metadata(&row)
     }
 
     async fn load_messages(&self, session_id: &SessionId) -> Result<Vec<Message>, AgentError> {
-        let rows: Vec<sqlx::postgres::PgRow> = sqlx::query(
-            "SELECT message FROM session_messages WHERE session_id = $1 ORDER BY id",
-        )
-        .bind(&session_id.0)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| AgentError::Session(e.to_string()))?;
+        let rows: Vec<sqlx::postgres::PgRow> =
+            sqlx::query("SELECT message FROM session_messages WHERE session_id = $1 ORDER BY id")
+                .bind(&session_id.0)
+                .fetch_all(&self.pool)
+                .await?;
 
         let mut messages = Vec::with_capacity(rows.len());
         for row in &rows {
             use sqlx::Row;
-            let json_value: serde_json::Value = row
-                .try_get("message")
-                .map_err(|e| AgentError::Session(e.to_string()))?;
+            let json_value: serde_json::Value = row.try_get("message")?;
             let msg: Message = serde_json::from_value(json_value)
                 .map_err(|e| AgentError::Session(e.to_string()))?;
             messages.push(msg);
@@ -369,8 +329,7 @@ impl SessionStorage for PostgresSessionStore {
             sqlx::query("SELECT * FROM sessions ORDER BY created_at DESC LIMIT $1")
                 .bind(self.max_sessions as i64)
                 .fetch_all(&self.pool)
-                .await
-                .map_err(|e| AgentError::Session(e.to_string()))?;
+                .await?;
 
         let mut sessions = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -381,14 +340,15 @@ impl SessionStorage for PostgresSessionStore {
     }
 
     async fn fork(&self, source_id: &SessionId) -> Result<SessionMetadata, AgentError> {
-        // Load source metadata
+        // Load source metadata before starting the transaction
         let source = self.load_metadata(source_id).await?;
+
+        let mut tx = self.pool.begin().await?;
 
         // Check session limit
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| AgentError::Session(e.to_string()))?;
+            .fetch_one(&mut *tx)
+            .await?;
 
         if count as usize >= self.max_sessions {
             return Err(AgentError::Session(format!(
@@ -399,7 +359,7 @@ impl SessionStorage for PostgresSessionStore {
 
         let new_id = SessionId::new();
         let now = Utc::now();
-        let status_str = Self::status_to_str(&SessionStatus::InProgress);
+        let status_str = Self::status_to_str(&SessionStatus::InProgress)?;
 
         // Insert new session row
         sqlx::query(
@@ -413,13 +373,12 @@ impl SessionStorage for PostgresSessionStore {
         .bind(now)
         .bind(now)
         .bind(&source.task)
-        .bind(status_str)
+        .bind(&status_str)
         .bind(source.total_input_tokens.map(|v| v as i32))
         .bind(source.total_output_tokens.map(|v| v as i32))
         .bind(&source_id.0)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| AgentError::Session(e.to_string()))?;
+        .execute(&mut *tx)
+        .await?;
 
         // Copy messages
         sqlx::query(
@@ -433,9 +392,8 @@ impl SessionStorage for PostgresSessionStore {
         )
         .bind(&new_id.0)
         .bind(&source_id.0)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| AgentError::Session(e.to_string()))?;
+        .execute(&mut *tx)
+        .await?;
 
         // Copy steps
         sqlx::query(
@@ -449,9 +407,10 @@ impl SessionStorage for PostgresSessionStore {
         )
         .bind(&new_id.0)
         .bind(&source_id.0)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| AgentError::Session(e.to_string()))?;
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
 
         Ok(SessionMetadata {
             id: new_id,
@@ -766,19 +725,19 @@ mod tests {
     #[test]
     fn test_status_to_str() {
         assert_eq!(
-            PostgresSessionStore::status_to_str(&SessionStatus::InProgress),
+            PostgresSessionStore::status_to_str(&SessionStatus::InProgress).unwrap(),
             "in_progress"
         );
         assert_eq!(
-            PostgresSessionStore::status_to_str(&SessionStatus::Completed),
+            PostgresSessionStore::status_to_str(&SessionStatus::Completed).unwrap(),
             "completed"
         );
         assert_eq!(
-            PostgresSessionStore::status_to_str(&SessionStatus::Error),
+            PostgresSessionStore::status_to_str(&SessionStatus::Error).unwrap(),
             "error"
         );
         assert_eq!(
-            PostgresSessionStore::status_to_str(&SessionStatus::Paused),
+            PostgresSessionStore::status_to_str(&SessionStatus::Paused).unwrap(),
             "paused"
         );
     }

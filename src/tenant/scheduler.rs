@@ -1,13 +1,13 @@
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
 
+use super::context::{TenantContext, TenantId};
 use crate::error::AgentError;
-use super::context::{TenantId, TenantContext};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RunId(pub String);
@@ -102,14 +102,29 @@ impl TenantScheduler {
         let mut semaphores = self.semaphores.write().await;
         semaphores.remove(tenant_id);
 
+        // Cancel and remove all active runs for this tenant
+        let mut active_runs = self.active_runs.write().await;
+        let run_ids_to_remove: Vec<RunId> = active_runs
+            .iter()
+            .filter(|(_, run)| &run.status.tenant_id == tenant_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for run_id in run_ids_to_remove {
+            if let Some(run) = active_runs.remove(&run_id) {
+                run.cancel_token.cancel();
+            }
+        }
+
         Ok(())
     }
 
     pub async fn get_tenant(&self, tenant_id: &TenantId) -> Result<TenantContext, AgentError> {
         let tenants = self.tenants.read().await;
-        tenants.get(tenant_id).cloned().ok_or_else(|| {
-            AgentError::Tenant(format!("Tenant not found: {}", tenant_id))
-        })
+        tenants
+            .get(tenant_id)
+            .cloned()
+            .ok_or_else(|| AgentError::Tenant(format!("Tenant not found: {}", tenant_id)))
     }
 
     /// Schedule a run for a tenant. The provided closure receives the TenantContext and CancellationToken.
@@ -158,7 +173,15 @@ impl TenantScheduler {
         let active_runs = self.active_runs.clone();
         let rid = run_id.clone();
 
+        // Use a oneshot channel to prevent the spawned task from starting work
+        // before the run is registered in active_runs, avoiding a race condition
+        // where cleanup could be a no-op if the task completes before insertion.
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+
         let join_handle = tokio::spawn(async move {
+            // Wait until the run has been registered in active_runs
+            let _ = ready_rx.await;
+
             // Acquire both semaphore permits
             let _global_permit = global_sem
                 .acquire()
@@ -191,6 +214,10 @@ impl TenantScheduler {
 
         let mut runs = self.active_runs.write().await;
         runs.insert(run_id, active_run);
+        drop(runs);
+
+        // Signal the spawned task that registration is complete
+        let _ = ready_tx.send(());
 
         Ok(handle)
     }
@@ -250,7 +277,9 @@ mod tests {
         scheduler.register_tenant(ctx1).await.unwrap();
         let result = scheduler.register_tenant(ctx2).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), AgentError::Tenant(msg) if msg.contains("already registered")));
+        assert!(
+            matches!(result.unwrap_err(), AgentError::Tenant(msg) if msg.contains("already registered"))
+        );
     }
 
     #[tokio::test]
@@ -267,7 +296,9 @@ mod tests {
         let scheduler = TenantScheduler::new(10);
         let result = scheduler.remove_tenant(&TenantId::new("nonexistent")).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), AgentError::Tenant(msg) if msg.contains("not found")));
+        assert!(
+            matches!(result.unwrap_err(), AgentError::Tenant(msg) if msg.contains("not found"))
+        );
     }
 
     #[tokio::test]
@@ -346,7 +377,9 @@ mod tests {
         let scheduler = TenantScheduler::new(10);
         let result = scheduler.cancel_run(&RunId::new()).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), AgentError::Tenant(msg) if msg.contains("Run not found")));
+        assert!(
+            matches!(result.unwrap_err(), AgentError::Tenant(msg) if msg.contains("Run not found"))
+        );
     }
 
     #[tokio::test]
@@ -408,17 +441,21 @@ mod tests {
             let b = barrier.clone();
 
             scheduler
-                .schedule_run(&tid, "concurrent task".to_string(), move |_ctx, _cancel| async move {
-                    let current = cc.fetch_add(1, Ordering::SeqCst) + 1;
-                    // Update max if current is higher
-                    mc.fetch_max(current, Ordering::SeqCst);
+                .schedule_run(
+                    &tid,
+                    "concurrent task".to_string(),
+                    move |_ctx, _cancel| async move {
+                        let current = cc.fetch_add(1, Ordering::SeqCst) + 1;
+                        // Update max if current is higher
+                        mc.fetch_max(current, Ordering::SeqCst);
 
-                    // Hold the slot for a bit
-                    b.notified().await;
+                        // Hold the slot for a bit
+                        b.notified().await;
 
-                    cc.fetch_sub(1, Ordering::SeqCst);
-                    Ok(())
-                })
+                        cc.fetch_sub(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
                 .await
                 .unwrap();
         }

@@ -43,7 +43,10 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
     // Kept for potential future use when parallel read-only execution is implemented.
     #[allow(dead_code)]
     fn is_read_only_tool(name: &str) -> bool {
-        matches!(name, "read_file" | "grep" | "glob" | "list_files" | "screenshot")
+        matches!(
+            name,
+            "read_file" | "grep" | "glob" | "list_files" | "screenshot"
+        )
     }
 
     /// Execute tool_use blocks from an assistant response sequentially.
@@ -65,13 +68,21 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     let exec_result = self.tools.execute_tool(name, input.clone()).await;
                     let step_duration = step_start.elapsed().as_millis() as u64;
                     let (content_block, step) = Self::process_tool_result(
-                        id, name, input, exec_result, step_duration, iteration,
+                        id,
+                        name,
+                        input,
+                        exec_result,
+                        step_duration,
+                        iteration,
                     );
                     tool_results.push(content_block);
                     step_records.push(step);
                 }
                 ContentBlock::Thinking { thinking } => {
-                    debug!(thinking_length = thinking.len(), "Model produced thinking block");
+                    debug!(
+                        thinking_length = thinking.len(),
+                        "Model produced thinking block"
+                    );
                 }
                 _ => {}
             }
@@ -252,11 +263,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         let compaction_system = [SystemContent::text(COMPACTION_SYSTEM_PROMPT)];
                         match self
                             .llm
-                            .send_messages(
-                                Some(&compaction_system),
-                                &compaction_messages,
-                                None,
-                            )
+                            .send_messages(Some(&compaction_system), &compaction_messages, None)
                             .await
                         {
                             Ok(summary_response) => {
@@ -310,12 +317,12 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                             .join("\n");
                         state.add_assistant_message(assistant_content);
                         self.finalize_session(
-                    session_store,
-                    &session_metadata,
-                    &state,
-                    SessionStatus::Completed,
-                )
-                .await;
+                            session_store,
+                            &session_metadata,
+                            &state,
+                            SessionStatus::Completed,
+                        )
+                        .await;
                         return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                     }
 
@@ -330,7 +337,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     state.add_tool_results(tool_results);
 
                     // Persist to session after each tool use iteration
-                    self.persist_session_iteration(session_store, &session_metadata, &state).await;
+                    self.persist_session_iteration(session_store, &session_metadata, &state)
+                        .await;
 
                     // Check for inter-agent messages
                     if let Some(messages) = self.tools.check_inbox().await {
@@ -357,12 +365,12 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     state.add_assistant_message(response.content);
 
                     self.finalize_session(
-                    session_store,
-                    &session_metadata,
-                    &state,
-                    SessionStatus::Completed,
-                )
-                .await;
+                        session_store,
+                        &session_metadata,
+                        &state,
+                        SessionStatus::Completed,
+                    )
+                    .await;
                     return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                 }
             }
@@ -473,11 +481,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         let compaction_system = [SystemContent::text(COMPACTION_SYSTEM_PROMPT)];
                         match self
                             .llm
-                            .send_messages(
-                                Some(&compaction_system),
-                                &compaction_messages,
-                                None,
-                            )
+                            .send_messages(Some(&compaction_system), &compaction_messages, None)
                             .await
                         {
                             Ok(summary_response) => {
@@ -526,12 +530,12 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                             .join("\n");
                         state.add_assistant_message(assistant_content);
                         self.finalize_session(
-                    Some(session_store),
-                    &session_metadata,
-                    &state,
-                    SessionStatus::Completed,
-                )
-                .await;
+                            Some(session_store),
+                            &session_metadata,
+                            &state,
+                            SessionStatus::Completed,
+                        )
+                        .await;
                         return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                     }
 
@@ -543,7 +547,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         state.record_step(step);
                     }
                     state.add_tool_results(tool_results);
-                    self.persist_session_iteration(Some(session_store), &session_metadata, &state).await;
+                    self.persist_session_iteration(Some(session_store), &session_metadata, &state)
+                        .await;
 
                     // Check for inter-agent messages
                     if let Some(messages) = self.tools.check_inbox().await {
@@ -568,12 +573,12 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         .join("\n");
                     state.add_assistant_message(response.content);
                     self.finalize_session(
-                    Some(session_store),
-                    &session_metadata,
-                    &state,
-                    SessionStatus::Completed,
-                )
-                .await;
+                        Some(session_store),
+                        &session_metadata,
+                        &state,
+                        SessionStatus::Completed,
+                    )
+                    .await;
                     return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                 }
             }
@@ -588,10 +593,14 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         state: &AgentState,
     ) {
         if let (Some(store), Some(metadata)) = (session_store, session_metadata) {
-            if let Err(e) = store.append_messages(&metadata.id, state.messages()).await {
+            let (r1, r2) = tokio::join!(
+                store.append_messages(&metadata.id, state.messages()),
+                store.save_steps(&metadata.id, state.steps())
+            );
+            if let Err(e) = r1 {
                 warn!(error = %e, "Failed to persist session messages");
             }
-            if let Err(e) = store.save_steps(&metadata.id, state.steps()).await {
+            if let Err(e) = r2 {
                 warn!(error = %e, "Failed to persist session steps");
             }
         }
@@ -619,10 +628,14 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             } else {
                 None
             };
-            if let Err(e) = store.save_metadata(&updated).await {
+            let (r1, r2) = tokio::join!(
+                store.save_metadata(&updated),
+                store.save_steps(&metadata.id, state.steps())
+            );
+            if let Err(e) = r1 {
                 warn!(error = %e, "Failed to finalize session");
             }
-            if let Err(e) = store.save_steps(&metadata.id, state.steps()).await {
+            if let Err(e) = r2 {
                 warn!(error = %e, "Failed to save final steps");
             }
         }
@@ -1278,19 +1291,37 @@ mod tests {
     #[test]
     fn test_is_read_only_tool() {
         // Read-only tools
-        assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool("read_file"));
+        assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
+            "read_file"
+        ));
         assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool("grep"));
         assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool("glob"));
-        assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool("list_files"));
-        assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool("screenshot"));
+        assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
+            "list_files"
+        ));
+        assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
+            "screenshot"
+        ));
 
         // Write / side-effecting tools
-        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool("write_file"));
-        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool("edit_file"));
-        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool("bash"));
-        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool("navigate"));
-        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool("click"));
-        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool("unknown_tool"));
+        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
+            "write_file"
+        ));
+        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
+            "edit_file"
+        ));
+        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
+            "bash"
+        ));
+        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
+            "navigate"
+        ));
+        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
+            "click"
+        ));
+        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
+            "unknown_tool"
+        ));
     }
 
     #[tokio::test]
@@ -1436,7 +1467,10 @@ mod tests {
         assert_eq!(tool_results.len(), 1);
         assert!(matches!(
             &tool_results[0],
-            ContentBlock::ToolResult { is_error: Some(true), .. }
+            ContentBlock::ToolResult {
+                is_error: Some(true),
+                ..
+            }
         ));
         assert_eq!(step_records[0].is_error, Some(true));
     }

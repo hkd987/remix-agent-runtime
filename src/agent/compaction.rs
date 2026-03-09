@@ -62,19 +62,17 @@ pub fn build_compaction_request(messages_to_compact: &[Message]) -> Vec<Message>
                     };
                     let content_str = match content {
                         ToolResultContent::Text(s) => s.clone(),
-                        ToolResultContent::Blocks(blocks) => {
-                            blocks
-                                .iter()
-                                .filter_map(|b| {
-                                    if let ContentBlock::Text { text } = b {
-                                        Some(text.as_str())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        }
+                        ToolResultContent::Blocks(blocks) => blocks
+                            .iter()
+                            .filter_map(|b| {
+                                if let ContentBlock::Text { text } = b {
+                                    Some(text.as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
                     };
                     let truncated = if content_str.len() > 500 {
                         format!("{}... [truncated]", &content_str[..500])

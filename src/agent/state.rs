@@ -166,9 +166,12 @@ impl AgentState {
             AgentStatus::MaxIterations => {
                 AgentResult::max_iterations(self.steps, total_iterations, duration)
             }
-            AgentStatus::BudgetExceeded => {
-                AgentResult::budget_exceeded(self.steps, total_iterations, duration, self.total_cost)
-            }
+            AgentStatus::BudgetExceeded => AgentResult::budget_exceeded(
+                self.steps,
+                total_iterations,
+                duration,
+                self.total_cost,
+            ),
         };
         result.total_input_tokens = input_tokens;
         result.total_output_tokens = output_tokens;
@@ -355,12 +358,15 @@ mod tests {
 
         let mut state = AgentState::new("task");
         state.increment_iteration();
-        state.accumulate_usage(Some(&Usage {
-            input_tokens: 150,
-            output_tokens: 80,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
-        }), "claude-sonnet-4-20250514");
+        state.accumulate_usage(
+            Some(&Usage {
+                input_tokens: 150,
+                output_tokens: 80,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }),
+            "claude-sonnet-4-20250514",
+        );
         let result = state.into_result(AgentStatus::Success, Some("done".to_string()));
         assert_eq!(result.total_input_tokens, Some(150));
         assert_eq!(result.total_output_tokens, Some(80));
@@ -427,12 +433,15 @@ mod tests {
     fn test_total_input_tokens_accessor() {
         let mut state = AgentState::new("task");
         assert_eq!(state.total_input_tokens(), 0);
-        state.accumulate_usage(Some(&crate::llm::types::Usage {
-            input_tokens: 100,
-            output_tokens: 50,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
-        }), "claude-sonnet-4-20250514");
+        state.accumulate_usage(
+            Some(&crate::llm::types::Usage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }),
+            "claude-sonnet-4-20250514",
+        );
         assert_eq!(state.total_input_tokens(), 100);
         assert_eq!(state.total_output_tokens(), 50);
     }

@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 
-use crate::error::AgentError;
 use super::context::TenantId;
+use crate::error::AgentError;
 
 /// Per-tenant token bucket rate limiter.
 pub struct TenantRateLimiter {
@@ -59,7 +59,8 @@ impl TenantRateLimiter {
 
     pub async fn check_rate(&self, tenant_id: &TenantId, tokens: u32) -> Result<(), AgentError> {
         let mut buckets = self.buckets.write().await;
-        let bucket = buckets.entry(tenant_id.clone())
+        let bucket = buckets
+            .entry(tenant_id.clone())
             .or_insert_with(|| TokenBucket::new(self.default_capacity, self.default_refill_rate));
 
         if bucket.try_consume(tokens) {

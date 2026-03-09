@@ -1,10 +1,10 @@
 use async_trait::async_trait;
+use futures_core::Stream;
 use std::collections::HashMap;
 use std::pin::Pin;
-use futures_core::Stream;
 use tracing::{debug, error, warn};
 
-use super::stream::{StreamEvent, SseParser};
+use super::stream::{SseParser, StreamEvent};
 use super::types::*;
 use crate::error::AgentError;
 
@@ -381,7 +381,11 @@ mod tests {
         }];
 
         let result = client
-            .send_messages(Some(&[SystemContent::text("system prompt")]), &messages, None)
+            .send_messages(
+                Some(&[SystemContent::text("system prompt")]),
+                &messages,
+                None,
+            )
             .await;
 
         assert!(result.is_ok());
@@ -788,7 +792,11 @@ mod tests {
         }];
 
         let result = client
-            .send_messages(Some(&[SystemContent::text("You are a helper")]), &messages, Some(&tools))
+            .send_messages(
+                Some(&[SystemContent::text("You are a helper")]),
+                &messages,
+                Some(&tools),
+            )
             .await;
 
         assert!(result.is_ok());

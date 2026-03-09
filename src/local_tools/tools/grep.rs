@@ -419,11 +419,7 @@ mod tests {
     async fn test_grep_context_no_separator_adjacent_groups() {
         let tmp = TempDir::new().unwrap();
         // Matches close enough that context overlaps — no separator
-        fs::write(
-            tmp.path().join("nosep.txt"),
-            "a\nMATCH1\nc\nMATCH2\ne",
-        )
-        .unwrap();
+        fs::write(tmp.path().join("nosep.txt"), "a\nMATCH1\nc\nMATCH2\ne").unwrap();
         let validator = make_validator(&tmp);
 
         let result = execute_grep(json!({"pattern": "MATCH", "context_lines": 1}), &validator)

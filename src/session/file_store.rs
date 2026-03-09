@@ -1,6 +1,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -10,7 +10,37 @@ use crate::llm::types::Message;
 use crate::output::result::StepRecord;
 
 use super::traits::SessionStorage;
-use super::types::{SessionId, SessionMetadata, SessionSnapshot, SessionStatus};
+use super::types::{compute_iteration, SessionId, SessionMetadata, SessionSnapshot, SessionStatus};
+
+/// Run a blocking closure on the Tokio blocking thread pool and flatten the join error.
+async fn blocking<F, T>(f: F) -> Result<T, AgentError>
+where
+    F: FnOnce() -> Result<T, AgentError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| AgentError::Session(format!("Task join error: {e}")))?
+}
+
+/// Read JSONL messages from the given path. Returns an empty vec if the file does not exist.
+fn load_messages_sync(path: &Path) -> Result<Vec<Message>, AgentError> {
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut messages = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let msg: Message = serde_json::from_str(&line)?;
+        messages.push(msg);
+    }
+    Ok(messages)
+}
 
 pub struct FileSessionStore {
     root_dir: PathBuf,
@@ -58,7 +88,7 @@ impl SessionStorage for FileSessionStore {
         let max_sessions = self.max_sessions;
         let task = task.to_string();
 
-        tokio::task::spawn_blocking(move || {
+        blocking(move || {
             let count = FileSessionStore::count_sessions_sync(&root_dir)?;
             if count >= max_sessions {
                 return Err(AgentError::Config(format!(
@@ -71,17 +101,7 @@ impl SessionStorage for FileSessionStore {
             let dir = root_dir.join(&id.0);
             fs::create_dir_all(&dir)?;
 
-            let now = Utc::now();
-            let metadata = SessionMetadata {
-                id,
-                created_at: now,
-                updated_at: now,
-                task,
-                status: SessionStatus::InProgress,
-                total_input_tokens: None,
-                total_output_tokens: None,
-                parent_session_id: None,
-            };
+            let metadata = SessionMetadata::new(id, &task);
 
             // Save metadata
             let path = dir.join("metadata.json");
@@ -99,14 +119,13 @@ impl SessionStorage for FileSessionStore {
             Ok(metadata)
         })
         .await
-        .map_err(|e| AgentError::Session(format!("Task join error: {e}")))?
     }
 
     async fn save_metadata(&self, metadata: &SessionMetadata) -> Result<(), AgentError> {
         let dir = self.session_dir(&metadata.id);
         let metadata = metadata.clone();
 
-        tokio::task::spawn_blocking(move || {
+        blocking(move || {
             if !dir.exists() {
                 return Err(AgentError::Config(format!(
                     "Session directory not found: {}",
@@ -119,7 +138,6 @@ impl SessionStorage for FileSessionStore {
             Ok(())
         })
         .await
-        .map_err(|e| AgentError::Session(format!("Task join error: {e}")))?
     }
 
     async fn append_messages(
@@ -130,7 +148,7 @@ impl SessionStorage for FileSessionStore {
         let dir = self.session_dir(session_id);
         let messages = messages.to_vec();
 
-        tokio::task::spawn_blocking(move || {
+        blocking(move || {
             if !dir.exists() {
                 return Err(AgentError::Config(format!(
                     "Session directory not found: {}",
@@ -138,7 +156,11 @@ impl SessionStorage for FileSessionStore {
                 )));
             }
             let path = dir.join("messages.jsonl");
-            let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(path)?;
             for msg in &messages {
                 let line = serde_json::to_string(msg)?;
                 writeln!(file, "{}", line)?;
@@ -146,7 +168,6 @@ impl SessionStorage for FileSessionStore {
             Ok(())
         })
         .await
-        .map_err(|e| AgentError::Session(format!("Task join error: {e}")))?
     }
 
     async fn save_steps(
@@ -157,7 +178,7 @@ impl SessionStorage for FileSessionStore {
         let dir = self.session_dir(session_id);
         let steps = steps.to_vec();
 
-        tokio::task::spawn_blocking(move || {
+        blocking(move || {
             if !dir.exists() {
                 return Err(AgentError::Config(format!(
                     "Session directory not found: {}",
@@ -170,14 +191,13 @@ impl SessionStorage for FileSessionStore {
             Ok(())
         })
         .await
-        .map_err(|e| AgentError::Session(format!("Task join error: {e}")))?
     }
 
     async fn load(&self, session_id: &SessionId) -> Result<SessionSnapshot, AgentError> {
         let root_dir = self.root_dir.clone();
         let session_id = session_id.clone();
 
-        tokio::task::spawn_blocking(move || {
+        blocking(move || {
             let dir = root_dir.join(&session_id.0);
             if !dir.exists() {
                 return Err(AgentError::Config(format!(
@@ -199,27 +219,12 @@ impl SessionStorage for FileSessionStore {
 
             // Load messages
             let messages_path = dir.join("messages.jsonl");
-            let messages = if messages_path.exists() {
-                let file = fs::File::open(messages_path)?;
-                let reader = BufReader::new(file);
-                let mut msgs = Vec::new();
-                for line in reader.lines() {
-                    let line = line?;
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    let msg: Message = serde_json::from_str(&line)?;
-                    msgs.push(msg);
-                }
-                msgs
-            } else {
-                vec![]
-            };
+            let messages = load_messages_sync(&messages_path)?;
 
             // Load steps
             let steps = FileSessionStore::load_steps_sync(&dir)?;
 
-            let iteration = steps.iter().map(|s| s.iteration).max().unwrap_or(0);
+            let iteration = compute_iteration(&steps);
 
             Ok(SessionSnapshot {
                 metadata,
@@ -230,13 +235,12 @@ impl SessionStorage for FileSessionStore {
             })
         })
         .await
-        .map_err(|e| AgentError::Session(format!("Task join error: {e}")))?
     }
 
     async fn load_metadata(&self, session_id: &SessionId) -> Result<SessionMetadata, AgentError> {
         let path = self.session_dir(session_id).join("metadata.json");
 
-        tokio::task::spawn_blocking(move || {
+        blocking(move || {
             if !path.exists() {
                 return Err(AgentError::Config(format!(
                     "Session metadata not found: {}",
@@ -248,37 +252,18 @@ impl SessionStorage for FileSessionStore {
             Ok(metadata)
         })
         .await
-        .map_err(|e| AgentError::Session(format!("Task join error: {e}")))?
     }
 
     async fn load_messages(&self, session_id: &SessionId) -> Result<Vec<Message>, AgentError> {
         let path = self.session_dir(session_id).join("messages.jsonl");
 
-        tokio::task::spawn_blocking(move || {
-            if !path.exists() {
-                return Ok(vec![]);
-            }
-            let file = fs::File::open(path)?;
-            let reader = BufReader::new(file);
-            let mut messages = Vec::new();
-            for line in reader.lines() {
-                let line = line?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let msg: Message = serde_json::from_str(&line)?;
-                messages.push(msg);
-            }
-            Ok(messages)
-        })
-        .await
-        .map_err(|e| AgentError::Session(format!("Task join error: {e}")))?
+        blocking(move || load_messages_sync(&path)).await
     }
 
     async fn list(&self) -> Result<Vec<SessionMetadata>, AgentError> {
         let root_dir = self.root_dir.clone();
 
-        tokio::task::spawn_blocking(move || {
+        blocking(move || {
             if !root_dir.exists() {
                 return Ok(vec![]);
             }
@@ -302,7 +287,6 @@ impl SessionStorage for FileSessionStore {
             Ok(sessions)
         })
         .await
-        .map_err(|e| AgentError::Session(format!("Task join error: {e}")))?
     }
 
     async fn fork(&self, source_id: &SessionId) -> Result<SessionMetadata, AgentError> {
@@ -310,7 +294,7 @@ impl SessionStorage for FileSessionStore {
         let max_sessions = self.max_sessions;
         let source_id = source_id.clone();
 
-        tokio::task::spawn_blocking(move || {
+        blocking(move || {
             let source_dir = root_dir.join(&source_id.0);
             if !source_dir.exists() {
                 return Err(AgentError::Config(format!(
@@ -375,7 +359,6 @@ impl SessionStorage for FileSessionStore {
             Ok(new_metadata)
         })
         .await
-        .map_err(|e| AgentError::Session(format!("Task join error: {e}")))?
     }
 }
 
@@ -473,7 +456,10 @@ mod tests {
         let metadata = store.create("Test task").await.unwrap();
 
         let messages = vec![sample_message("Hello"), sample_message("How are you?")];
-        store.append_messages(&metadata.id, &messages).await.unwrap();
+        store
+            .append_messages(&metadata.id, &messages)
+            .await
+            .unwrap();
 
         // Verify file contents
         let path = tmp.path().join(&metadata.id.0).join("messages.jsonl");
@@ -490,7 +476,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_messages_appends_to_existing() {
+    async fn test_append_messages_truncates_on_full_write() {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp);
         let metadata = store.create("Test task").await.unwrap();
@@ -499,6 +485,7 @@ mod tests {
             .append_messages(&metadata.id, &[sample_message("First")])
             .await
             .unwrap();
+        // Second call with only one message should truncate the file, not append
         store
             .append_messages(&metadata.id, &[sample_message("Second")])
             .await
@@ -507,7 +494,14 @@ mod tests {
         let path = tmp.path().join(&metadata.id.0).join("messages.jsonl");
         let content = fs::read_to_string(path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 2);
+        // Truncate mode means only the last write's messages remain
+        assert_eq!(lines.len(), 1);
+
+        let msg: Message = serde_json::from_str(lines[0]).unwrap();
+        assert!(matches!(
+            &msg.content[0],
+            ContentBlock::Text { text } if text == "Second"
+        ));
     }
 
     #[tokio::test]
@@ -727,7 +721,10 @@ mod tests {
         let metadata = store.create("Test task").await.unwrap();
 
         let messages = vec![sample_message("Hello"), sample_message("World")];
-        store.append_messages(&metadata.id, &messages).await.unwrap();
+        store
+            .append_messages(&metadata.id, &messages)
+            .await
+            .unwrap();
 
         let loaded = store.load_messages(&metadata.id).await.unwrap();
         assert_eq!(loaded.len(), 2);

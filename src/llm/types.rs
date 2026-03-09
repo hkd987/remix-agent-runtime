@@ -308,7 +308,9 @@ mod tests {
         let request = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 8192,
-            system: Some(vec![SystemContent::text("You are a browser automation agent.")]),
+            system: Some(vec![SystemContent::text(
+                "You are a browser automation agent.",
+            )]),
             messages: vec![Message {
                 role: Role::User,
                 content: vec![ContentBlock::Text {
@@ -324,7 +326,10 @@ mod tests {
         assert_eq!(json["model"], "claude-sonnet-4-5-20250929");
         assert_eq!(json["max_tokens"], 8192);
         assert_eq!(json["system"][0]["type"], "text");
-        assert_eq!(json["system"][0]["text"], "You are a browser automation agent.");
+        assert_eq!(
+            json["system"][0]["text"],
+            "You are a browser automation agent."
+        );
         assert_eq!(json["messages"][0]["role"], "user");
         assert_eq!(
             json["messages"][0]["content"][0]["text"],
@@ -731,7 +736,9 @@ mod tests {
         match content {
             ToolResultContent::Blocks(blocks) => {
                 assert_eq!(blocks.len(), 1);
-                assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "block content"));
+                assert!(
+                    matches!(&blocks[0], ContentBlock::Text { text } if text == "block content")
+                );
             }
             _ => panic!("Expected Blocks variant"),
         }
@@ -786,7 +793,10 @@ mod tests {
     fn test_system_content_text_constructor() {
         let content = SystemContent::text("hello");
         match &content {
-            SystemContent::Text { text, cache_control } => {
+            SystemContent::Text {
+                text,
+                cache_control,
+            } => {
                 assert_eq!(text, "hello");
                 assert!(cache_control.is_none());
             }
@@ -797,7 +807,10 @@ mod tests {
     fn test_system_content_text_cached_constructor() {
         let content = SystemContent::text_cached("cached");
         match &content {
-            SystemContent::Text { text, cache_control } => {
+            SystemContent::Text {
+                text,
+                cache_control,
+            } => {
                 assert_eq!(text, "cached");
                 assert!(cache_control.is_some());
                 assert_eq!(cache_control.as_ref().unwrap().cache_type, "ephemeral");
@@ -884,7 +897,8 @@ mod tests {
         let json = serde_json::to_value(&tool).unwrap();
         assert_eq!(json["cache_control"]["type"], "ephemeral");
 
-        let deserialized: ToolDefinition = serde_json::from_str(&serde_json::to_string(&tool).unwrap()).unwrap();
+        let deserialized: ToolDefinition =
+            serde_json::from_str(&serde_json::to_string(&tool).unwrap()).unwrap();
         assert_eq!(deserialized.name, "navigate");
         assert!(deserialized.cache_control.is_some());
     }

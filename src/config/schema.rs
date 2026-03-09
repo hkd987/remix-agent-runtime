@@ -36,7 +36,7 @@ pub struct AppConfig {
     pub coordination: CoordinationConfig,
 }
 
-fn default_base_url() -> String {
+pub fn default_base_url() -> String {
     "https://api.anthropic.com".to_string()
 }
 

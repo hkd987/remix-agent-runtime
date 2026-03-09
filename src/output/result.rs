@@ -117,10 +117,7 @@ impl AgentResult {
             steps,
             total_iterations: iterations,
             total_duration_ms: duration_ms,
-            error: Some(format!(
-                "Budget exceeded (${:.4} spent)",
-                cost_usd
-            )),
+            error: Some(format!("Budget exceeded (${:.4} spent)", cost_usd)),
             total_input_tokens: None,
             total_output_tokens: None,
             total_cost_usd: Some(cost_usd),
