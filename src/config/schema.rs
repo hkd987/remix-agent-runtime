@@ -350,7 +350,7 @@ impl Default for PluginComponentsConfig {
     }
 }
 
-fn default_session_dir() -> PathBuf {
+pub fn default_session_dir() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
         PathBuf::from(home).join(".remix").join("sessions")
     } else {

@@ -9,6 +9,7 @@ use remix_agent_runtime::browser::mcp::ToolExecutor;
 use remix_agent_runtime::cli::{Cli, Commands, SessionsCommand};
 use remix_agent_runtime::config::credentials;
 use remix_agent_runtime::config::load_config;
+use remix_agent_runtime::config::schema::default_session_dir;
 use remix_agent_runtime::coordination::{
     CoordinationContext, CoordinationExecutor, DefaultSpawnHandler,
 };
@@ -473,15 +474,7 @@ async fn main() -> ExitCode {
             }
         }
         Commands::Sessions(sessions_args) => {
-            let default_session_dir = || {
-                std::path::PathBuf::from(
-                    std::env::var("HOME").unwrap_or_else(|_| ".".to_string()),
-                )
-                .join(".local")
-                .join("share")
-                .join("remix-agent")
-                .join("sessions")
-            };
+            let default_session_dir = default_session_dir;
 
             match sessions_args.command {
                 SessionsCommand::List { session_dir } => {

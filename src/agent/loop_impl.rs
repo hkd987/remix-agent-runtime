@@ -39,12 +39,14 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
     }
 
     /// Returns `true` for tools that only read state and can safely run concurrently.
+    // TODO: Not currently used for concurrency — all tools run sequentially.
+    // Kept for potential future use when parallel read-only execution is implemented.
+    #[allow(dead_code)]
     fn is_read_only_tool(name: &str) -> bool {
         matches!(name, "read_file" | "grep" | "glob" | "list_files" | "screenshot")
     }
 
-    /// Execute tool_use blocks from an assistant response, running read-only tools
-    /// concurrently and write/side-effecting tools sequentially.
+    /// Execute tool_use blocks from an assistant response sequentially.
     ///
     /// Returns `(tool_results, step_records)` preserving the original block order.
     async fn execute_tools(
@@ -52,73 +54,20 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         assistant_content: &[ContentBlock],
         iteration: u32,
     ) -> (Vec<ContentBlock>, Vec<StepRecord>) {
-        // Collect tool_use blocks with their original indices
-        let tool_uses: Vec<(usize, &str, &str, &Value)> = assistant_content
-            .iter()
-            .enumerate()
-            .filter_map(|(i, block)| {
-                if let ContentBlock::ToolUse { id, name, input } = block {
-                    Some((i, id.as_str(), name.as_str(), input))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let mut tool_results = Vec::new();
+        let mut step_records = Vec::new();
 
-        if tool_uses.is_empty() {
-            return (Vec::new(), Vec::new());
-        }
-
-        // Partition into read-only (can run concurrently) and write (must run sequentially)
-        let mut read_only_indices: Vec<usize> = Vec::new();
-        let mut write_indices: Vec<usize> = Vec::new();
-        for (idx, (_, _, name, _)) in tool_uses.iter().enumerate() {
-            if Self::is_read_only_tool(name) {
-                read_only_indices.push(idx);
-            } else {
-                write_indices.push(idx);
+        for block in assistant_content {
+            if let ContentBlock::ToolUse { id, name, input } = block {
+                debug!(tool = %name, "Executing tool");
+                let step_start = Instant::now();
+                let exec_result = self.tools.execute_tool(name, input.clone()).await;
+                let step_duration = step_start.elapsed().as_millis() as u64;
+                let (content_block, step) =
+                    Self::process_tool_result(id, name, input, exec_result, step_duration, iteration);
+                tool_results.push(content_block);
+                step_records.push(step);
             }
-        }
-
-        // Pre-allocate result slots keyed by tool_uses index
-        let total = tool_uses.len();
-        let mut results: Vec<Option<(ContentBlock, StepRecord)>> = (0..total).map(|_| None).collect();
-
-        // Execute read-only tools concurrently.
-        // We batch read-only tools before write tools so reads complete first.
-        // True parallel execution within reads requires Arc<T> wrapping; the
-        // classification still ensures writes never block pending reads.
-        for &idx in &read_only_indices {
-            let (_, id, name, input) = tool_uses[idx];
-            debug!(tool = %name, "Executing read-only tool");
-            let step_start = Instant::now();
-            let exec_result = self.tools.execute_tool(name, input.clone()).await;
-            let step_duration = step_start.elapsed().as_millis() as u64;
-            let (content_block, step) = Self::process_tool_result(
-                id, name, input, exec_result, step_duration, iteration,
-            );
-            results[idx] = Some((content_block, step));
-        }
-
-        // Execute write tools sequentially
-        for &idx in &write_indices {
-            let (_, id, name, input) = tool_uses[idx];
-            debug!(tool = %name, "Executing tool");
-            let step_start = Instant::now();
-            let exec_result = self.tools.execute_tool(name, input.clone()).await;
-            let step_duration = step_start.elapsed().as_millis() as u64;
-            let (content_block, step) = Self::process_tool_result(
-                id, name, input, exec_result, step_duration, iteration,
-            );
-            results[idx] = Some((content_block, step));
-        }
-
-        // Flatten in original order
-        let mut tool_results = Vec::with_capacity(total);
-        let mut step_records = Vec::with_capacity(total);
-        for (block, step) in results.into_iter().flatten() {
-            tool_results.push(block);
-            step_records.push(step);
         }
 
         (tool_results, step_records)
@@ -321,7 +270,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 .send_messages(system_prompt.as_deref(), state.messages(), Some(tool_defs))
                 .await?;
 
-            state.accumulate_usage(response.usage.as_ref());
+            state.accumulate_usage(response.usage.as_ref(), &response.model);
 
             match response.stop_reason {
                 StopReason::ToolUse => {
@@ -527,7 +476,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 .send_messages(system_prompt.as_deref(), state.messages(), Some(tool_defs))
                 .await?;
 
-            state.accumulate_usage(response.usage.as_ref());
+            state.accumulate_usage(response.usage.as_ref(), &response.model);
 
             match response.stop_reason {
                 StopReason::ToolUse => {

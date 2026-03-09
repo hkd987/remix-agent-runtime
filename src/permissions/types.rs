@@ -51,6 +51,25 @@ const PLAN_MODE_ALLOWED: &[&str] = &[
 const ACCEPT_EDITS_AUTO_ALLOW: &[&str] = &["write_file", "edit_file", "bash", "multi_edit"];
 
 impl PermissionPolicy {
+    /// Returns the first denied pattern that matches `tool_name`, if any.
+    fn matches_denied(&self, tool_name: &str) -> Option<&str> {
+        self.denied_tools.iter().find_map(|pattern| {
+            regex::Regex::new(pattern)
+                .ok()
+                .filter(|re| re.is_match(tool_name))
+                .map(|_| pattern.as_str())
+        })
+    }
+
+    /// Returns `true` if `tool_name` matches any pattern in `allowed_tools`.
+    fn matches_allowed(&self, tool_name: &str) -> bool {
+        self.allowed_tools.iter().any(|pattern| {
+            regex::Regex::new(pattern)
+                .map(|re| re.is_match(tool_name))
+                .unwrap_or(false)
+        })
+    }
+
     /// Check whether a tool is allowed, denied, or requires user confirmation.
     ///
     /// Evaluation order:
@@ -75,17 +94,12 @@ impl PermissionPolicy {
                 }
             }
             PermissionMode::AcceptEdits => {
-                // Denied patterns take precedence
-                for pattern in &self.denied_tools {
-                    if let Ok(re) = regex::Regex::new(pattern) {
-                        if re.is_match(tool_name) {
-                            return PermissionDecision::Deny {
-                                reason: format!(
-                                    "Tool '{tool_name}' matches denied pattern '{pattern}'"
-                                ),
-                            };
-                        }
-                    }
+                if let Some(pattern) = self.matches_denied(tool_name) {
+                    return PermissionDecision::Deny {
+                        reason: format!(
+                            "Tool '{tool_name}' matches denied pattern '{pattern}'"
+                        ),
+                    };
                 }
 
                 // Auto-allow write/edit tools
@@ -93,39 +107,24 @@ impl PermissionPolicy {
                     return PermissionDecision::Allow;
                 }
 
-                // Allowed patterns
-                for pattern in &self.allowed_tools {
-                    if let Ok(re) = regex::Regex::new(pattern) {
-                        if re.is_match(tool_name) {
-                            return PermissionDecision::Allow;
-                        }
-                    }
+                if self.matches_allowed(tool_name) {
+                    return PermissionDecision::Allow;
                 }
 
                 // Nothing matched — caller decides
                 PermissionDecision::Ask
             }
             PermissionMode::Default | PermissionMode::DontAsk => {
-                // Denied patterns take precedence
-                for pattern in &self.denied_tools {
-                    if let Ok(re) = regex::Regex::new(pattern) {
-                        if re.is_match(tool_name) {
-                            return PermissionDecision::Deny {
-                                reason: format!(
-                                    "Tool '{tool_name}' matches denied pattern '{pattern}'"
-                                ),
-                            };
-                        }
-                    }
+                if let Some(pattern) = self.matches_denied(tool_name) {
+                    return PermissionDecision::Deny {
+                        reason: format!(
+                            "Tool '{tool_name}' matches denied pattern '{pattern}'"
+                        ),
+                    };
                 }
 
-                // Allowed patterns
-                for pattern in &self.allowed_tools {
-                    if let Ok(re) = regex::Regex::new(pattern) {
-                        if re.is_match(tool_name) {
-                            return PermissionDecision::Allow;
-                        }
-                    }
+                if self.matches_allowed(tool_name) {
+                    return PermissionDecision::Allow;
                 }
 
                 // DontAsk denies instead of asking

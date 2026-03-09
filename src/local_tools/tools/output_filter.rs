@@ -1,10 +1,14 @@
 use regex::Regex;
+use std::sync::LazyLock;
+
+static ANSI_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").expect("valid ANSI regex")
+});
 
 /// Remove ANSI escape codes, carriage returns, and other terminal control sequences.
 /// Achieves 85-95% reduction on typical CI output.
 pub fn strip_ansi(input: &str) -> String {
-    let ansi_re = Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").expect("valid regex");
-    let stripped = ansi_re.replace_all(input, "");
+    let stripped = ANSI_RE.replace_all(input, "");
     stripped.replace('\r', "")
 }
 

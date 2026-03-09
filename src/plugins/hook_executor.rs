@@ -7,6 +7,10 @@ use crate::error::AgentError;
 use crate::llm::types::ToolDefinition;
 use crate::plugins::components::hooks::{HookRegistry, HookTiming};
 
+/// Maximum bytes of stdout to buffer from a hook process.
+/// Output beyond this limit is truncated to prevent OOM from misbehaving hooks.
+const MAX_HOOK_STDOUT_BYTES: usize = 65536;
+
 /// Structured output parsed from hook stdout.
 ///
 /// Hooks may optionally emit a JSON object to stdout containing any of these
@@ -228,8 +232,14 @@ impl<T: ToolExecutor> HookAwareExecutor<T> {
                         );
                     }
 
-                    // Attempt to parse stdout as JSON for structured output
-                    if let Ok(stdout_str) = String::from_utf8(output.stdout) {
+                    // Attempt to parse stdout as JSON for structured output.
+                    // Truncate to MAX_HOOK_STDOUT_BYTES to prevent OOM from misbehaving hooks.
+                    let raw_stdout = if output.stdout.len() > MAX_HOOK_STDOUT_BYTES {
+                        output.stdout[..MAX_HOOK_STDOUT_BYTES].to_vec()
+                    } else {
+                        output.stdout
+                    };
+                    if let Ok(stdout_str) = String::from_utf8(raw_stdout) {
                         let trimmed = stdout_str.trim();
                         if !trimmed.is_empty() {
                             if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {

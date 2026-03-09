@@ -79,11 +79,11 @@ pub struct MessagesResponse {
 /// Per-token pricing (input, output) in USD. Returns (input_cost_per_token, output_cost_per_token).
 pub fn model_pricing(model: &str) -> (f64, f64) {
     // Claude pricing per million tokens
-    let (input_per_m, output_per_m) = if model.contains("opus") {
+    let (input_per_m, output_per_m) = if model.starts_with("claude-opus") {
         (15.0, 75.0)
-    } else if model.contains("sonnet") {
+    } else if model.starts_with("claude-sonnet") {
         (3.0, 15.0)
-    } else if model.contains("haiku") {
+    } else if model.starts_with("claude-haiku") {
         (0.25, 1.25)
     } else {
         // Default to Sonnet pricing for unknown models

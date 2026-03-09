@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use crate::llm::types::{ContentBlock, Message, Role};
+use crate::llm::types::{compute_cost, ContentBlock, Message, Role};
 use crate::output::result::{AgentResult, AgentStatus, StepRecord};
 use crate::session::types::SessionSnapshot;
 
@@ -11,6 +11,7 @@ pub struct AgentState {
     start_time: Instant,
     total_input_tokens: u32,
     total_output_tokens: u32,
+    total_cost: f64,
 }
 
 impl AgentState {
@@ -27,6 +28,7 @@ impl AgentState {
             start_time: Instant::now(),
             total_input_tokens: 0,
             total_output_tokens: 0,
+            total_cost: 0.0,
         }
     }
 
@@ -39,6 +41,7 @@ impl AgentState {
             start_time: Instant::now(),
             total_input_tokens: snapshot.metadata.total_input_tokens.unwrap_or(0),
             total_output_tokens: snapshot.metadata.total_output_tokens.unwrap_or(0),
+            total_cost: 0.0,
         }
     }
 
@@ -76,11 +79,16 @@ impl AgentState {
         self.start_time.elapsed().as_millis() as u64
     }
 
-    pub fn accumulate_usage(&mut self, usage: Option<&crate::llm::types::Usage>) {
+    pub fn accumulate_usage(&mut self, usage: Option<&crate::llm::types::Usage>, model: &str) {
         if let Some(u) = usage {
             self.total_input_tokens += u.input_tokens;
             self.total_output_tokens += u.output_tokens;
+            self.total_cost += compute_cost(model, u.input_tokens, u.output_tokens);
         }
+    }
+
+    pub fn total_cost(&self) -> f64 {
+        self.total_cost
     }
 
     pub fn total_input_tokens(&self) -> u32 {
@@ -159,7 +167,7 @@ impl AgentState {
                 AgentResult::max_iterations(self.steps, total_iterations, duration)
             }
             AgentStatus::BudgetExceeded => {
-                AgentResult::budget_exceeded(self.steps, total_iterations, duration, 0.0)
+                AgentResult::budget_exceeded(self.steps, total_iterations, duration, self.total_cost)
             }
         };
         result.total_input_tokens = input_tokens;
@@ -322,8 +330,8 @@ mod tests {
             input_tokens: 200,
             output_tokens: 75,
         };
-        state.accumulate_usage(Some(&usage1));
-        state.accumulate_usage(Some(&usage2));
+        state.accumulate_usage(Some(&usage1), "claude-sonnet-4-20250514");
+        state.accumulate_usage(Some(&usage2), "claude-sonnet-4-20250514");
         assert_eq!(state.total_input_tokens, 300);
         assert_eq!(state.total_output_tokens, 125);
     }
@@ -331,7 +339,7 @@ mod tests {
     #[test]
     fn test_accumulate_usage_with_none() {
         let mut state = AgentState::new("task");
-        state.accumulate_usage(None);
+        state.accumulate_usage(None, "claude-sonnet-4-20250514");
         assert_eq!(state.total_input_tokens, 0);
         assert_eq!(state.total_output_tokens, 0);
     }
@@ -345,7 +353,7 @@ mod tests {
         state.accumulate_usage(Some(&Usage {
             input_tokens: 150,
             output_tokens: 80,
-        }));
+        }), "claude-sonnet-4-20250514");
         let result = state.into_result(AgentStatus::Success, Some("done".to_string()));
         assert_eq!(result.total_input_tokens, Some(150));
         assert_eq!(result.total_output_tokens, Some(80));
@@ -415,7 +423,7 @@ mod tests {
         state.accumulate_usage(Some(&crate::llm::types::Usage {
             input_tokens: 100,
             output_tokens: 50,
-        }));
+        }), "claude-sonnet-4-20250514");
         assert_eq!(state.total_input_tokens(), 100);
         assert_eq!(state.total_output_tokens(), 50);
     }

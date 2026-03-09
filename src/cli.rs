@@ -44,6 +44,14 @@ pub enum SessionsCommand {
     },
 }
 
+#[derive(Debug, Clone, clap::ValueEnum)]
+pub enum EffortLevel {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
 #[derive(clap::Args, Debug)]
 pub struct RunArgs {
     /// Task to execute (natural language)
@@ -171,7 +179,7 @@ pub struct RunArgs {
 
     /// Effort level (low, medium, high, max)
     #[arg(long)]
-    pub effort: Option<String>,
+    pub effort: Option<EffortLevel>,
 }
 
 #[cfg(test)]
@@ -505,19 +513,19 @@ mod tests {
     #[test]
     fn test_parse_run_with_effort() {
         let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--effort", "high"]));
-        assert_eq!(args.effort, Some("high".to_string()));
+        assert!(matches!(args.effort, Some(EffortLevel::High)));
     }
 
     #[test]
     fn test_parse_run_with_effort_low() {
         let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--effort", "low"]));
-        assert_eq!(args.effort, Some("low".to_string()));
+        assert!(matches!(args.effort, Some(EffortLevel::Low)));
     }
 
     #[test]
     fn test_parse_run_with_effort_max() {
         let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--effort", "max"]));
-        assert_eq!(args.effort, Some("max".to_string()));
+        assert!(matches!(args.effort, Some(EffortLevel::Max)));
     }
 
     #[test]
