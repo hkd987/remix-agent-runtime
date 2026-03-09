@@ -408,6 +408,8 @@ pub struct SessionConfig {
     pub storage_dir: PathBuf,
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
+    #[serde(default)]
+    pub database_url: Option<String>,
 }
 
 impl Default for SessionConfig {
@@ -416,6 +418,7 @@ impl Default for SessionConfig {
             enabled: true,
             storage_dir: default_session_dir(),
             max_sessions: 100,
+            database_url: None,
         }
     }
 }

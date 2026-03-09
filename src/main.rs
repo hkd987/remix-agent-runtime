@@ -25,7 +25,7 @@ use remix_agent_runtime::plugins::components::mcp::{build_mcp_command, parse_mcp
 use remix_agent_runtime::plugins::components::skills::merge_plugin_skills;
 use remix_agent_runtime::plugins::discovery::discover_all_plugins;
 use remix_agent_runtime::plugins::{CompositeToolExecutor, HookAwareExecutor};
-use remix_agent_runtime::session::SessionStore;
+use remix_agent_runtime::session::{SessionStorage, SessionStore};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -378,7 +378,7 @@ async fn main() -> ExitCode {
                     std::process::exit(2);
                 });
                 let source_id = remix_agent_runtime::session::SessionId(fork_id.clone());
-                match store.fork(&source_id) {
+                match store.fork(&source_id).await {
                     Ok(forked_metadata) => {
                         tracing::info!(
                             forked_session = %forked_metadata.id,
@@ -408,7 +408,7 @@ async fn main() -> ExitCode {
                         &credential_set,
                         &skill_set,
                         &agents_md,
-                        session_store.as_ref(),
+                        session_store.as_ref().map(|s| s as &dyn remix_agent_runtime::session::SessionStorage),
                         compaction_config.as_ref(),
                     )
                     .await
@@ -485,7 +485,7 @@ async fn main() -> ExitCode {
                 SessionsCommand::List { session_dir } => {
                     let dir = session_dir.unwrap_or_else(default_session_dir);
                     let store = SessionStore::new(dir, usize::MAX);
-                    match store.list() {
+                    match store.list().await {
                         Ok(sessions) => {
                             if sessions.is_empty() {
                                 println!("No sessions found.");
@@ -512,7 +512,7 @@ async fn main() -> ExitCode {
                     let dir = session_dir.unwrap_or_else(default_session_dir);
                     let store = SessionStore::new(dir, usize::MAX);
                     let session_id = remix_agent_runtime::session::SessionId(id);
-                    match store.load(&session_id) {
+                    match store.load(&session_id).await {
                         Ok(snapshot) => {
                             let json = serde_json::to_string_pretty(&snapshot).unwrap();
                             println!("{json}");

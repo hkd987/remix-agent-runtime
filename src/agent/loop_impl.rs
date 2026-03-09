@@ -10,7 +10,7 @@ use crate::llm::client::LlmProvider;
 use crate::llm::types::{CacheControl, ContentBlock, StopReason, SystemContent, ToolResultContent};
 use crate::output::result::{AgentResult, AgentStatus, StepRecord};
 use crate::session::types::{SessionId, SessionStatus};
-use crate::session::SessionStore;
+use crate::session::SessionStorage;
 use crate::skills::{inject_skills_into_system_prompt, SkillSet};
 
 use super::compaction;
@@ -146,14 +146,14 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         credentials: &CredentialSet,
         skill_set: &SkillSet,
         agents_md: &Option<crate::agents_md::AgentsMdContent>,
-        session_store: Option<&SessionStore>,
+        session_store: Option<&dyn SessionStorage>,
         compaction_config: Option<&CompactionConfig>,
     ) -> Result<AgentResult, AgentError> {
         let mut state = AgentState::new(task);
 
         // Create session if store is provided
         let session_metadata = if let Some(store) = session_store {
-            match store.create(task) {
+            match store.create(task).await {
                 Ok(metadata) => {
                     info!(session_id = %metadata.id, "Created new session");
                     Some(metadata)
@@ -217,7 +217,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     &session_metadata,
                     &state,
                     SessionStatus::Completed,
-                );
+                )
+                .await;
                 return Ok(state.into_result(AgentStatus::MaxIterations, None));
             }
 
@@ -228,7 +229,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     &session_metadata,
                     &state,
                     SessionStatus::Completed,
-                );
+                )
+                .await;
                 return Ok(state.into_result(AgentStatus::Timeout, None));
             }
 
@@ -308,11 +310,12 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                             .join("\n");
                         state.add_assistant_message(assistant_content);
                         self.finalize_session(
-                            session_store,
-                            &session_metadata,
-                            &state,
-                            SessionStatus::Completed,
-                        );
+                    session_store,
+                    &session_metadata,
+                    &state,
+                    SessionStatus::Completed,
+                )
+                .await;
                         return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                     }
 
@@ -327,7 +330,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     state.add_tool_results(tool_results);
 
                     // Persist to session after each tool use iteration
-                    self.persist_session_iteration(session_store, &session_metadata, &state);
+                    self.persist_session_iteration(session_store, &session_metadata, &state).await;
 
                     // Check for inter-agent messages
                     if let Some(messages) = self.tools.check_inbox().await {
@@ -354,11 +357,12 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     state.add_assistant_message(response.content);
 
                     self.finalize_session(
-                        session_store,
-                        &session_metadata,
-                        &state,
-                        SessionStatus::Completed,
-                    );
+                    session_store,
+                    &session_metadata,
+                    &state,
+                    SessionStatus::Completed,
+                )
+                .await;
                     return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                 }
             }
@@ -368,14 +372,14 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
     /// Resume an existing session and continue the agent loop.
     pub async fn resume(
         &self,
-        session_store: &SessionStore,
+        session_store: &dyn SessionStorage,
         session_id: &SessionId,
         credentials: &CredentialSet,
         skill_set: &SkillSet,
         agents_md: &Option<crate::agents_md::AgentsMdContent>,
         compaction_config: Option<&CompactionConfig>,
     ) -> Result<AgentResult, AgentError> {
-        let snapshot = session_store.load(session_id)?;
+        let snapshot = session_store.load(session_id).await?;
         info!(
             session_id = %session_id,
             iteration = snapshot.iteration,
@@ -426,7 +430,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
 
         let tool_defs = self.tools.tool_definitions();
         let timeout_ms = self.config.timeout_secs * 1000;
-        let session_metadata = session_store.load_metadata(session_id).ok();
+        let session_metadata = session_store.load_metadata(session_id).await.ok();
 
         loop {
             if state.current_iteration() >= self.config.max_iterations {
@@ -435,7 +439,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     &session_metadata,
                     &state,
                     SessionStatus::Completed,
-                );
+                )
+                .await;
                 return Ok(state.into_result(AgentStatus::MaxIterations, None));
             }
 
@@ -445,7 +450,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     &session_metadata,
                     &state,
                     SessionStatus::Completed,
-                );
+                )
+                .await;
                 return Ok(state.into_result(AgentStatus::Timeout, None));
             }
 
@@ -520,11 +526,12 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                             .join("\n");
                         state.add_assistant_message(assistant_content);
                         self.finalize_session(
-                            Some(session_store),
-                            &session_metadata,
-                            &state,
-                            SessionStatus::Completed,
-                        );
+                    Some(session_store),
+                    &session_metadata,
+                    &state,
+                    SessionStatus::Completed,
+                )
+                .await;
                         return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                     }
 
@@ -536,7 +543,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         state.record_step(step);
                     }
                     state.add_tool_results(tool_results);
-                    self.persist_session_iteration(Some(session_store), &session_metadata, &state);
+                    self.persist_session_iteration(Some(session_store), &session_metadata, &state).await;
 
                     // Check for inter-agent messages
                     if let Some(messages) = self.tools.check_inbox().await {
@@ -561,11 +568,12 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         .join("\n");
                     state.add_assistant_message(response.content);
                     self.finalize_session(
-                        Some(session_store),
-                        &session_metadata,
-                        &state,
-                        SessionStatus::Completed,
-                    );
+                    Some(session_store),
+                    &session_metadata,
+                    &state,
+                    SessionStatus::Completed,
+                )
+                .await;
                     return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                 }
             }
@@ -573,26 +581,26 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
     }
 
     /// Persist session state after each iteration (best-effort, failures logged and ignored).
-    fn persist_session_iteration(
+    async fn persist_session_iteration(
         &self,
-        session_store: Option<&SessionStore>,
+        session_store: Option<&dyn SessionStorage>,
         session_metadata: &Option<crate::session::types::SessionMetadata>,
         state: &AgentState,
     ) {
         if let (Some(store), Some(metadata)) = (session_store, session_metadata) {
-            if let Err(e) = store.append_messages(&metadata.id, state.messages()) {
+            if let Err(e) = store.append_messages(&metadata.id, state.messages()).await {
                 warn!(error = %e, "Failed to persist session messages");
             }
-            if let Err(e) = store.save_steps(&metadata.id, state.steps()) {
+            if let Err(e) = store.save_steps(&metadata.id, state.steps()).await {
                 warn!(error = %e, "Failed to persist session steps");
             }
         }
     }
 
     /// Finalize session with final status (best-effort).
-    fn finalize_session(
+    async fn finalize_session(
         &self,
-        session_store: Option<&SessionStore>,
+        session_store: Option<&dyn SessionStorage>,
         session_metadata: &Option<crate::session::types::SessionMetadata>,
         state: &AgentState,
         status: SessionStatus,
@@ -611,10 +619,10 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             } else {
                 None
             };
-            if let Err(e) = store.save_metadata(&updated) {
+            if let Err(e) = store.save_metadata(&updated).await {
                 warn!(error = %e, "Failed to finalize session");
             }
-            if let Err(e) = store.save_steps(&metadata.id, state.steps()) {
+            if let Err(e) = store.save_steps(&metadata.id, state.steps()).await {
                 warn!(error = %e, "Failed to save final steps");
             }
         }

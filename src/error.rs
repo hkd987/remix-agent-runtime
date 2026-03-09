@@ -57,6 +57,9 @@ pub enum AgentError {
     #[error("Coordination error: {0}")]
     Coordination(String),
 
+    #[error("Tenant error: {0}")]
+    Tenant(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
