@@ -9,6 +9,7 @@ pub enum PermissionMode {
     AcceptEdits,
     BypassPermissions,
     Plan,
+    DontAsk,
 }
 
 /// Policy that determines which tools may be executed.
@@ -46,15 +47,19 @@ const PLAN_MODE_ALLOWED: &[&str] = &[
     "read_skill_resource",
 ];
 
+/// Write/edit tools that are auto-allowed in AcceptEdits mode.
+const ACCEPT_EDITS_AUTO_ALLOW: &[&str] = &["write_file", "edit_file", "bash", "multi_edit"];
+
 impl PermissionPolicy {
     /// Check whether a tool is allowed, denied, or requires user confirmation.
     ///
     /// Evaluation order:
     /// 1. `BypassPermissions` mode always allows.
     /// 2. `Plan` mode allows only read-only tools, denies everything else.
-    /// 3. `denied_tools` patterns are checked first (deny wins over allow).
-    /// 4. `allowed_tools` patterns are checked next.
-    /// 5. If nothing matches, `Ask` is returned (caller decides).
+    /// 3. `AcceptEdits` mode: denied patterns first, then auto-allows write tools
+    ///    (`write_file`, `edit_file`, `bash`, `multi_edit`), then allowed patterns, then `Ask`.
+    /// 4. `Default` / `DontAsk` mode: denied patterns first, then allowed patterns.
+    ///    `Default` falls through to `Ask`; `DontAsk` falls through to `Deny`.
     pub fn check(&self, tool_name: &str) -> PermissionDecision {
         match self.mode {
             PermissionMode::BypassPermissions => PermissionDecision::Allow,
@@ -69,7 +74,38 @@ impl PermissionPolicy {
                     }
                 }
             }
-            PermissionMode::Default | PermissionMode::AcceptEdits => {
+            PermissionMode::AcceptEdits => {
+                // Denied patterns take precedence
+                for pattern in &self.denied_tools {
+                    if let Ok(re) = regex::Regex::new(pattern) {
+                        if re.is_match(tool_name) {
+                            return PermissionDecision::Deny {
+                                reason: format!(
+                                    "Tool '{tool_name}' matches denied pattern '{pattern}'"
+                                ),
+                            };
+                        }
+                    }
+                }
+
+                // Auto-allow write/edit tools
+                if ACCEPT_EDITS_AUTO_ALLOW.contains(&tool_name) {
+                    return PermissionDecision::Allow;
+                }
+
+                // Allowed patterns
+                for pattern in &self.allowed_tools {
+                    if let Ok(re) = regex::Regex::new(pattern) {
+                        if re.is_match(tool_name) {
+                            return PermissionDecision::Allow;
+                        }
+                    }
+                }
+
+                // Nothing matched — caller decides
+                PermissionDecision::Ask
+            }
+            PermissionMode::Default | PermissionMode::DontAsk => {
                 // Denied patterns take precedence
                 for pattern in &self.denied_tools {
                     if let Ok(re) = regex::Regex::new(pattern) {
@@ -90,6 +126,15 @@ impl PermissionPolicy {
                             return PermissionDecision::Allow;
                         }
                     }
+                }
+
+                // DontAsk denies instead of asking
+                if self.mode == PermissionMode::DontAsk {
+                    return PermissionDecision::Deny {
+                        reason: format!(
+                            "Tool '{tool_name}' is not in the allowed list (DontAsk mode)"
+                        ),
+                    };
                 }
 
                 // Nothing matched — caller decides
@@ -281,12 +326,54 @@ mod tests {
         assert_eq!(policy.check("read_file"), PermissionDecision::Allow);
     }
 
-    // --- Default/AcceptEdits returns Ask ---
+    // --- Default returns Ask ---
 
     #[test]
     fn test_default_mode_returns_ask_for_unknown() {
         let policy = PermissionPolicy::default();
         assert_eq!(policy.check("some_random_tool"), PermissionDecision::Ask);
+    }
+
+    // --- AcceptEdits auto-allows write tools ---
+
+    #[test]
+    fn test_accept_edits_auto_allows_write_file() {
+        let policy = PermissionPolicy {
+            mode: PermissionMode::AcceptEdits,
+            allowed_tools: vec![],
+            denied_tools: vec![],
+        };
+        assert_eq!(policy.check("write_file"), PermissionDecision::Allow);
+    }
+
+    #[test]
+    fn test_accept_edits_auto_allows_edit_file() {
+        let policy = PermissionPolicy {
+            mode: PermissionMode::AcceptEdits,
+            allowed_tools: vec![],
+            denied_tools: vec![],
+        };
+        assert_eq!(policy.check("edit_file"), PermissionDecision::Allow);
+    }
+
+    #[test]
+    fn test_accept_edits_auto_allows_bash() {
+        let policy = PermissionPolicy {
+            mode: PermissionMode::AcceptEdits,
+            allowed_tools: vec![],
+            denied_tools: vec![],
+        };
+        assert_eq!(policy.check("bash"), PermissionDecision::Allow);
+    }
+
+    #[test]
+    fn test_accept_edits_auto_allows_multi_edit() {
+        let policy = PermissionPolicy {
+            mode: PermissionMode::AcceptEdits,
+            allowed_tools: vec![],
+            denied_tools: vec![],
+        };
+        assert_eq!(policy.check("multi_edit"), PermissionDecision::Allow);
     }
 
     #[test]
@@ -297,6 +384,90 @@ mod tests {
             denied_tools: vec![],
         };
         assert_eq!(policy.check("navigate"), PermissionDecision::Ask);
+    }
+
+    #[test]
+    fn test_accept_edits_denied_overrides_auto_allow() {
+        let policy = PermissionPolicy {
+            mode: PermissionMode::AcceptEdits,
+            allowed_tools: vec![],
+            denied_tools: vec!["bash".to_string()],
+        };
+        assert!(matches!(
+            policy.check("bash"),
+            PermissionDecision::Deny { .. }
+        ));
+        // Other write tools still auto-allowed
+        assert_eq!(policy.check("write_file"), PermissionDecision::Allow);
+    }
+
+    #[test]
+    fn test_accept_edits_allowed_patterns_still_work() {
+        let policy = PermissionPolicy {
+            mode: PermissionMode::AcceptEdits,
+            allowed_tools: vec!["navigate".to_string()],
+            denied_tools: vec![],
+        };
+        assert_eq!(policy.check("navigate"), PermissionDecision::Allow);
+    }
+
+    // --- DontAsk mode ---
+
+    #[test]
+    fn test_dont_ask_mode_serde() {
+        let mode = PermissionMode::DontAsk;
+        let json = serde_json::to_string(&mode).unwrap();
+        assert_eq!(json, "\"dont_ask\"");
+        let back: PermissionMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, PermissionMode::DontAsk);
+    }
+
+    #[test]
+    fn test_dont_ask_denies_unknown_tools() {
+        let policy = PermissionPolicy {
+            mode: PermissionMode::DontAsk,
+            allowed_tools: vec![],
+            denied_tools: vec![],
+        };
+        let decision = policy.check("bash");
+        assert!(matches!(decision, PermissionDecision::Deny { .. }));
+    }
+
+    #[test]
+    fn test_dont_ask_allows_explicitly_allowed() {
+        let policy = PermissionPolicy {
+            mode: PermissionMode::DontAsk,
+            allowed_tools: vec!["bash".to_string()],
+            denied_tools: vec![],
+        };
+        assert_eq!(policy.check("bash"), PermissionDecision::Allow);
+    }
+
+    #[test]
+    fn test_dont_ask_denied_takes_precedence() {
+        let policy = PermissionPolicy {
+            mode: PermissionMode::DontAsk,
+            allowed_tools: vec!["bash".to_string()],
+            denied_tools: vec!["bash".to_string()],
+        };
+        assert!(matches!(
+            policy.check("bash"),
+            PermissionDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn test_dont_ask_allows_regex_pattern() {
+        let policy = PermissionPolicy {
+            mode: PermissionMode::DontAsk,
+            allowed_tools: vec!["read_.*".to_string()],
+            denied_tools: vec![],
+        };
+        assert_eq!(policy.check("read_file"), PermissionDecision::Allow);
+        assert!(matches!(
+            policy.check("write_file"),
+            PermissionDecision::Deny { .. }
+        ));
     }
 
     // --- PermissionDecision equality ---

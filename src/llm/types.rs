@@ -76,6 +76,28 @@ pub struct MessagesResponse {
     pub usage: Option<Usage>,
 }
 
+/// Per-token pricing (input, output) in USD. Returns (input_cost_per_token, output_cost_per_token).
+pub fn model_pricing(model: &str) -> (f64, f64) {
+    // Claude pricing per million tokens
+    let (input_per_m, output_per_m) = if model.contains("opus") {
+        (15.0, 75.0)
+    } else if model.contains("sonnet") {
+        (3.0, 15.0)
+    } else if model.contains("haiku") {
+        (0.25, 1.25)
+    } else {
+        // Default to Sonnet pricing for unknown models
+        (3.0, 15.0)
+    };
+    (input_per_m / 1_000_000.0, output_per_m / 1_000_000.0)
+}
+
+/// Compute total cost from token counts and model.
+pub fn compute_cost(model: &str, input_tokens: u32, output_tokens: u32) -> f64 {
+    let (input_rate, output_rate) = model_pricing(model);
+    (input_tokens as f64 * input_rate) + (output_tokens as f64 * output_rate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,5 +479,64 @@ mod tests {
             deserialized.description,
             "Take a screenshot of the current page"
         );
+    }
+
+    #[test]
+    fn test_model_pricing_opus() {
+        let (input, output) = model_pricing("claude-opus-4-20250514");
+        assert!((input - 15.0 / 1_000_000.0).abs() < f64::EPSILON);
+        assert!((output - 75.0 / 1_000_000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_model_pricing_sonnet() {
+        let (input, output) = model_pricing("claude-sonnet-4-20250514");
+        assert!((input - 3.0 / 1_000_000.0).abs() < f64::EPSILON);
+        assert!((output - 15.0 / 1_000_000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_model_pricing_haiku() {
+        let (input, output) = model_pricing("claude-haiku-3-20240307");
+        assert!((input - 0.25 / 1_000_000.0).abs() < f64::EPSILON);
+        assert!((output - 1.25 / 1_000_000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_model_pricing_unknown_defaults_to_sonnet() {
+        let (input, output) = model_pricing("some-unknown-model");
+        let (sonnet_input, sonnet_output) = model_pricing("claude-sonnet-4-20250514");
+        assert!((input - sonnet_input).abs() < f64::EPSILON);
+        assert!((output - sonnet_output).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_compute_cost_sonnet() {
+        // 1000 input tokens at $3/M = $0.003, 500 output tokens at $15/M = $0.0075
+        let cost = compute_cost("claude-sonnet-4-20250514", 1000, 500);
+        let expected = 0.003 + 0.0075;
+        assert!((cost - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_compute_cost_opus() {
+        // 1_000_000 input tokens at $15/M = $15, 1_000_000 output at $75/M = $75
+        let cost = compute_cost("claude-opus-4-20250514", 1_000_000, 1_000_000);
+        let expected = 15.0 + 75.0;
+        assert!((cost - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_compute_cost_zero_tokens() {
+        let cost = compute_cost("claude-sonnet-4-20250514", 0, 0);
+        assert!((cost - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_compute_cost_haiku() {
+        // 10000 input at $0.25/M = $0.0025, 5000 output at $1.25/M = $0.00625
+        let cost = compute_cost("claude-haiku-3-20240307", 10000, 5000);
+        let expected = 0.0025 + 0.00625;
+        assert!((cost - expected).abs() < 1e-10);
     }
 }

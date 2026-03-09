@@ -7,6 +7,20 @@ use crate::error::AgentError;
 use crate::llm::types::ToolDefinition;
 use crate::plugins::components::hooks::{HookRegistry, HookTiming};
 
+/// Structured output parsed from hook stdout.
+///
+/// Hooks may optionally emit a JSON object to stdout containing any of these
+/// keys. If multiple hooks return decisions, the last one wins.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HookResult {
+    /// Permission decision: "allow", "deny", or "ask"
+    pub permission_decision: Option<String>,
+    /// Replacement input for the tool call
+    pub updated_input: Option<Value>,
+    /// System message to inject into the conversation
+    pub system_message: Option<String>,
+}
+
 /// Decorator that wraps a ToolExecutor and fires hooks before/after tool calls.
 ///
 /// Hook failures are logged and ignored (never block the agent loop).
@@ -134,16 +148,19 @@ impl<T: ToolExecutor> HookAwareExecutor<T> {
     /// { "tool_name": "...", "tool_input": {...}, "tool_output": "..." }
     /// ```
     /// `tool_output` is only present for PostToolUse hooks.
+    ///
+    /// Returns a [`HookResult`] parsed from hook stdout. If multiple hooks
+    /// produce structured output, the last one's values win.
     async fn run_hooks(
         &self,
         tool_name: &str,
         tool_input: &Value,
         tool_output: Option<&str>,
         timing: &HookTiming,
-    ) {
+    ) -> HookResult {
         let hooks = self.hook_registry.matching_hooks(tool_name, timing);
         if hooks.is_empty() {
-            return;
+            return HookResult::default();
         }
 
         let mut context = json!({
@@ -157,11 +174,12 @@ impl<T: ToolExecutor> HookAwareExecutor<T> {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to serialize hook context");
-                return;
+                return HookResult::default();
             }
         };
 
         let timeout = Duration::from_secs(self.timeout_secs);
+        let mut result = HookResult::default();
 
         for hook in hooks {
             let mut cmd = tokio::process::Command::new("sh");
@@ -200,14 +218,33 @@ impl<T: ToolExecutor> HookAwareExecutor<T> {
                 drop(stdin);
             }
 
-            match tokio::time::timeout(timeout, child.wait()).await {
-                Ok(Ok(status)) => {
-                    if !status.success() {
+            match tokio::time::timeout(timeout, child.wait_with_output()).await {
+                Ok(Ok(output)) => {
+                    if !output.status.success() {
                         tracing::warn!(
                             command = %hook.command,
-                            exit_code = status.code().unwrap_or(-1),
+                            exit_code = output.status.code().unwrap_or(-1),
                             "Hook exited with non-zero status"
                         );
+                    }
+
+                    // Attempt to parse stdout as JSON for structured output
+                    if let Ok(stdout_str) = String::from_utf8(output.stdout) {
+                        let trimmed = stdout_str.trim();
+                        if !trimmed.is_empty() {
+                            if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                                if let Some(decision) = parsed.get("permissionDecision").and_then(|v| v.as_str()) {
+                                    result.permission_decision = Some(decision.to_string());
+                                }
+                                if let Some(input) = parsed.get("updatedInput") {
+                                    result.updated_input = Some(input.clone());
+                                }
+                                if let Some(msg) = parsed.get("systemMessage").and_then(|v| v.as_str()) {
+                                    result.system_message = Some(msg.to_string());
+                                }
+                            }
+                            // If JSON parsing fails, silently ignore (backwards compatible)
+                        }
                     }
                 }
                 Ok(Err(e)) => {
@@ -227,6 +264,8 @@ impl<T: ToolExecutor> HookAwareExecutor<T> {
                 }
             }
         }
+
+        result
     }
 }
 
@@ -796,5 +835,261 @@ mod tests {
             !failure_marker.exists(),
             "PostToolUseFailure hook should NOT fire on success"
         );
+    }
+
+    // --- HookResult structured output tests ---
+
+    #[test]
+    fn test_hook_result_default() {
+        let result = HookResult::default();
+        assert_eq!(result.permission_decision, None);
+        assert_eq!(result.updated_input, None);
+        assert_eq!(result.system_message, None);
+    }
+
+    #[tokio::test]
+    async fn test_run_hooks_returns_default_when_no_hooks() {
+        let inner = mock_inner();
+        let executor = HookAwareExecutor::new(inner, empty_registry(), 30);
+
+        let result = executor
+            .run_hooks("navigate", &json!({}), None, &HookTiming::PreToolUse)
+            .await;
+        assert_eq!(result, HookResult::default());
+    }
+
+    /// Helper: write a shell script that outputs the given content to stdout,
+    /// and return the command string to execute it. This avoids quote-escaping
+    /// issues when embedding JSON in the hooks.json command field.
+    fn script_command(dir: &std::path::Path, name: &str, content: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let script_path = dir.join(name);
+        let script_body = format!("#!/bin/sh\n{content}\n");
+        std::fs::write(&script_path, &script_body).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script_path.display().to_string()
+    }
+
+    #[tokio::test]
+    async fn test_run_hooks_parses_permission_decision() {
+        let dir = TempDir::new().unwrap();
+        let cmd = script_command(
+            dir.path(),
+            "hook.sh",
+            r#"printf '{"permissionDecision": "allow"}'"#,
+        );
+        let registry =
+            registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, &cmd);
+        let inner = mock_inner();
+        let executor = HookAwareExecutor::new(inner, registry, 30);
+
+        let result = executor
+            .run_hooks("navigate", &json!({}), None, &HookTiming::PreToolUse)
+            .await;
+        assert_eq!(result.permission_decision, Some("allow".to_string()));
+        assert_eq!(result.updated_input, None);
+        assert_eq!(result.system_message, None);
+    }
+
+    #[tokio::test]
+    async fn test_run_hooks_parses_updated_input() {
+        let dir = TempDir::new().unwrap();
+        let cmd = script_command(
+            dir.path(),
+            "hook.sh",
+            r#"printf '{"updatedInput": {"url": "https://changed.com"}}'"#,
+        );
+        let registry =
+            registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, &cmd);
+        let inner = mock_inner();
+        let executor = HookAwareExecutor::new(inner, registry, 30);
+
+        let result = executor
+            .run_hooks("navigate", &json!({}), None, &HookTiming::PreToolUse)
+            .await;
+        assert_eq!(
+            result.updated_input,
+            Some(json!({"url": "https://changed.com"}))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_hooks_parses_system_message() {
+        let dir = TempDir::new().unwrap();
+        let cmd = script_command(
+            dir.path(),
+            "hook.sh",
+            r#"printf '{"systemMessage": "Please be careful"}'"#,
+        );
+        let registry =
+            registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, &cmd);
+        let inner = mock_inner();
+        let executor = HookAwareExecutor::new(inner, registry, 30);
+
+        let result = executor
+            .run_hooks("navigate", &json!({}), None, &HookTiming::PreToolUse)
+            .await;
+        assert_eq!(
+            result.system_message,
+            Some("Please be careful".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_hooks_parses_all_fields() {
+        let dir = TempDir::new().unwrap();
+        let cmd = script_command(
+            dir.path(),
+            "hook.sh",
+            r#"printf '{"permissionDecision":"deny","updatedInput":{"x":1},"systemMessage":"blocked"}'"#,
+        );
+        let registry =
+            registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, &cmd);
+        let inner = mock_inner();
+        let executor = HookAwareExecutor::new(inner, registry, 30);
+
+        let result = executor
+            .run_hooks("navigate", &json!({}), None, &HookTiming::PreToolUse)
+            .await;
+        assert_eq!(result.permission_decision, Some("deny".to_string()));
+        assert_eq!(result.updated_input, Some(json!({"x": 1})));
+        assert_eq!(result.system_message, Some("blocked".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_run_hooks_ignores_invalid_json() {
+        let dir = TempDir::new().unwrap();
+        let cmd = script_command(dir.path(), "hook.sh", "echo this is not json");
+        let registry =
+            registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, &cmd);
+        let inner = mock_inner();
+        let executor = HookAwareExecutor::new(inner, registry, 30);
+
+        let result = executor
+            .run_hooks("navigate", &json!({}), None, &HookTiming::PreToolUse)
+            .await;
+        // Should silently ignore and return default
+        assert_eq!(result, HookResult::default());
+    }
+
+    #[tokio::test]
+    async fn test_run_hooks_ignores_empty_stdout() {
+        let dir = TempDir::new().unwrap();
+        let command = "true"; // produces no output
+        let registry =
+            registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, command);
+        let inner = mock_inner();
+        let executor = HookAwareExecutor::new(inner, registry, 30);
+
+        let result = executor
+            .run_hooks("navigate", &json!({}), None, &HookTiming::PreToolUse)
+            .await;
+        assert_eq!(result, HookResult::default());
+    }
+
+    #[tokio::test]
+    async fn test_run_hooks_last_hook_wins() {
+        let dir = TempDir::new().unwrap();
+        let cmd1 = script_command(
+            dir.path(),
+            "hook1.sh",
+            r#"printf '{"permissionDecision": "allow"}'"#,
+        );
+        let cmd2 = script_command(
+            dir.path(),
+            "hook2.sh",
+            r#"printf '{"permissionDecision": "deny"}'"#,
+        );
+        let hooks_json = format!(
+            r#"{{
+                "hooks": {{
+                    "PreToolUse": [{{
+                        "matcher": "navigate",
+                        "hooks": [
+                            {{ "type": "command", "command": "{cmd1}" }},
+                            {{ "type": "command", "command": "{cmd2}" }}
+                        ]
+                    }}]
+                }}
+            }}"#,
+        );
+        let path = dir.path().join("hooks.json");
+        std::fs::write(&path, hooks_json).unwrap();
+        let mut registry = HookRegistry::new();
+        registry.load_from_file(&path, dir.path()).unwrap();
+
+        let inner = mock_inner();
+        let executor = HookAwareExecutor::new(inner, registry, 30);
+
+        let result = executor
+            .run_hooks("navigate", &json!({}), None, &HookTiming::PreToolUse)
+            .await;
+        // Last hook should win
+        assert_eq!(result.permission_decision, Some("deny".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_run_hooks_partial_fields_merge() {
+        let dir = TempDir::new().unwrap();
+        let cmd1 = script_command(
+            dir.path(),
+            "hook1.sh",
+            r#"printf '{"permissionDecision": "allow"}'"#,
+        );
+        let cmd2 = script_command(
+            dir.path(),
+            "hook2.sh",
+            r#"printf '{"systemMessage": "hello"}'"#,
+        );
+        let hooks_json = format!(
+            r#"{{
+                "hooks": {{
+                    "PreToolUse": [{{
+                        "matcher": "navigate",
+                        "hooks": [
+                            {{ "type": "command", "command": "{cmd1}" }},
+                            {{ "type": "command", "command": "{cmd2}" }}
+                        ]
+                    }}]
+                }}
+            }}"#,
+        );
+        let path = dir.path().join("hooks.json");
+        std::fs::write(&path, hooks_json).unwrap();
+        let mut registry = HookRegistry::new();
+        registry.load_from_file(&path, dir.path()).unwrap();
+
+        let inner = mock_inner();
+        let executor = HookAwareExecutor::new(inner, registry, 30);
+
+        let result = executor
+            .run_hooks("navigate", &json!({}), None, &HookTiming::PreToolUse)
+            .await;
+        // First hook's permissionDecision should persist, second adds systemMessage
+        assert_eq!(result.permission_decision, Some("allow".to_string()));
+        assert_eq!(result.system_message, Some("hello".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_execute_tool_backwards_compatible_with_structured_hooks() {
+        // Hooks that return structured output should not break execute_tool
+        let dir = TempDir::new().unwrap();
+        let cmd = script_command(
+            dir.path(),
+            "hook.sh",
+            r#"printf '{"permissionDecision": "allow", "systemMessage": "ok"}'"#,
+        );
+        let registry =
+            registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, &cmd);
+        let inner = mock_inner();
+        let executor = HookAwareExecutor::new(inner, registry, 30);
+
+        let result = executor
+            .execute_tool("navigate", json!({"url": "test"}))
+            .await
+            .unwrap();
+        // Tool should still return normal result
+        assert_eq!(result.content, "Page loaded");
+        assert!(!result.is_error);
     }
 }

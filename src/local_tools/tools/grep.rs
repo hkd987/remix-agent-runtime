@@ -129,12 +129,31 @@ fn search_file(file: &Path, ctx: &mut SearchContext<'_>) -> Result<(), AgentErro
     let relative = file.strip_prefix(ctx.root).unwrap_or(file);
     let lines: Vec<&str> = content.lines().collect();
 
+    // Track the last printed line index to avoid duplicating context lines
+    // when matches are adjacent or overlapping.
+    let mut last_printed_line: Option<usize> = None;
+
     for (i, line) in lines.iter().enumerate() {
         if ctx.regex.is_match(line) {
             let start = i.saturating_sub(ctx.context_lines);
             let end = (i + ctx.context_lines + 1).min(lines.len());
 
+            // Insert a separator if there's a gap between this group and the last printed line
+            if let Some(last) = last_printed_line {
+                if start > last + 1 {
+                    ctx.results.push("--".to_string());
+                    ctx.total_bytes += 3; // "--\n"
+                }
+            }
+
             for (j, ctx_line) in lines.iter().enumerate().take(end).skip(start) {
+                // Skip lines already printed by a previous match's context
+                if let Some(last) = last_printed_line {
+                    if j <= last {
+                        continue;
+                    }
+                }
+
                 let prefix = if j == i { ">" } else { " " };
                 let entry = format!("{}{}:{}: {}", prefix, relative.display(), j + 1, ctx_line);
                 ctx.total_bytes += entry.len();
@@ -144,6 +163,8 @@ fn search_file(file: &Path, ctx: &mut SearchContext<'_>) -> Result<(), AgentErro
                     return Ok(());
                 }
             }
+
+            last_printed_line = Some(end - 1);
         }
     }
 
@@ -302,6 +323,117 @@ mod tests {
         assert!(result.content.contains("needle top"));
         assert!(result.content.contains("needle mid"));
         assert!(result.content.contains("needle bottom"));
+    }
+
+    #[tokio::test]
+    async fn test_grep_context_no_duplicate_lines_adjacent_matches() {
+        let tmp = TempDir::new().unwrap();
+        // Lines 1-5, matches on lines 2 and 4 with context_lines=1
+        // Without dedup: line1,>line2,line3,line3,>line4,line5
+        // With dedup:    line1,>line2,line3,>line4,line5
+        fs::write(
+            tmp.path().join("adj.txt"),
+            "line1\nMATCH_A\nline3\nMATCH_B\nline5",
+        )
+        .unwrap();
+        let validator = make_validator(&tmp);
+
+        let result = execute_grep(json!({"pattern": "MATCH", "context_lines": 1}), &validator)
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+
+        // Count occurrences of each line — none should appear more than once
+        let lines: Vec<&str> = result.content.lines().collect();
+        for line in &lines {
+            if line.starts_with("--") {
+                continue;
+            }
+            let count = lines.iter().filter(|l| *l == line).count();
+            assert_eq!(
+                count, 1,
+                "Line '{}' appears {} times, expected 1",
+                line, count
+            );
+        }
+
+        // Verify all expected lines are present
+        assert!(result.content.contains("line1"));
+        assert!(result.content.contains("MATCH_A"));
+        assert!(result.content.contains("line3"));
+        assert!(result.content.contains("MATCH_B"));
+        assert!(result.content.contains("line5"));
+    }
+
+    #[tokio::test]
+    async fn test_grep_context_no_duplicate_lines_overlapping_context() {
+        let tmp = TempDir::new().unwrap();
+        // Two matches right next to each other with context_lines=2
+        fs::write(
+            tmp.path().join("overlap.txt"),
+            "a\nb\nMATCH1\nd\nMATCH2\nf\ng",
+        )
+        .unwrap();
+        let validator = make_validator(&tmp);
+
+        let result = execute_grep(json!({"pattern": "MATCH", "context_lines": 2}), &validator)
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+
+        let lines: Vec<&str> = result.content.lines().collect();
+        // Filter out separators for duplicate check
+        let content_lines: Vec<&&str> = lines.iter().filter(|l| !l.starts_with("--")).collect();
+        for line in &content_lines {
+            let count = content_lines.iter().filter(|l| *l == line).count();
+            assert_eq!(
+                count, 1,
+                "Line '{}' appears {} times, expected 1",
+                line, count
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_grep_context_separator_between_groups() {
+        let tmp = TempDir::new().unwrap();
+        // Two matches far apart — should have "--" separator between groups
+        fs::write(
+            tmp.path().join("sep.txt"),
+            "a\nMATCH1\nc\nd\ne\nf\ng\nMATCH2\ni",
+        )
+        .unwrap();
+        let validator = make_validator(&tmp);
+
+        let result = execute_grep(json!({"pattern": "MATCH", "context_lines": 1}), &validator)
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(
+            result.content.contains("--"),
+            "Should have separator between non-adjacent match groups"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_grep_context_no_separator_adjacent_groups() {
+        let tmp = TempDir::new().unwrap();
+        // Matches close enough that context overlaps — no separator
+        fs::write(
+            tmp.path().join("nosep.txt"),
+            "a\nMATCH1\nc\nMATCH2\ne",
+        )
+        .unwrap();
+        let validator = make_validator(&tmp);
+
+        let result = execute_grep(json!({"pattern": "MATCH", "context_lines": 1}), &validator)
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(
+            !result.content.contains("--"),
+            "Should NOT have separator when context groups are adjacent/overlapping"
+        );
     }
 
     #[tokio::test]

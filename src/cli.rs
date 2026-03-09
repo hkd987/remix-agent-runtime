@@ -15,7 +15,33 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Run an agent task
-    Run(RunArgs),
+    Run(Box<RunArgs>),
+    /// Manage sessions
+    Sessions(SessionsArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct SessionsArgs {
+    #[command(subcommand)]
+    pub command: SessionsCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SessionsCommand {
+    /// List all sessions
+    List {
+        /// Override session storage directory
+        #[arg(long, env = "REMIX_SESSION_DIR")]
+        session_dir: Option<std::path::PathBuf>,
+    },
+    /// Show details of a specific session
+    Show {
+        /// Session ID
+        id: String,
+        /// Override session storage directory
+        #[arg(long, env = "REMIX_SESSION_DIR")]
+        session_dir: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -138,6 +164,14 @@ pub struct RunArgs {
     /// Override coordination storage directory
     #[arg(long, env = "REMIX_COORDINATION_DIR")]
     pub coordination_dir: Option<PathBuf>,
+
+    /// Resume the most recent session automatically
+    #[arg(long = "continue", alias = "resume", alias = "continue-session")]
+    pub continue_session: bool,
+
+    /// Effort level (low, medium, high, max)
+    #[arg(long)]
+    pub effort: Option<String>,
 }
 
 #[cfg(test)]
@@ -145,50 +179,46 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    /// Helper to extract RunArgs from a parsed CLI, panicking if it's not a Run command.
+    fn extract_run_args(cli: Cli) -> RunArgs {
+        match cli.command {
+            Commands::Run(args) => *args,
+            other => panic!("Expected Commands::Run, got {:?}", other),
+        }
+    }
+
     #[test]
     fn test_parse_run_with_task() {
-        let cli = Cli::parse_from(["remix-agent", "run", "navigate to google.com"]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert_eq!(args.task, Some("navigate to google.com".to_string()));
-                assert!(args.config.is_none());
-                assert!(args.base_url.is_none());
-                assert!(args.api_key.is_none());
-                assert!(args.model.is_none());
-                assert!(args.max_tokens.is_none());
-                assert!(args.timeout.is_none());
-                assert!(args.max_iterations.is_none());
-                assert!(!args.headed);
-                assert!(!args.verbose);
-                assert!(args.output.is_none());
-                assert!(args.browser_path.is_none());
-            }
-        }
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "navigate to google.com"]));
+        assert_eq!(args.task, Some("navigate to google.com".to_string()));
+        assert!(args.config.is_none());
+        assert!(args.base_url.is_none());
+        assert!(args.api_key.is_none());
+        assert!(args.model.is_none());
+        assert!(args.max_tokens.is_none());
+        assert!(args.timeout.is_none());
+        assert!(args.max_iterations.is_none());
+        assert!(!args.headed);
+        assert!(!args.verbose);
+        assert!(args.output.is_none());
+        assert!(args.browser_path.is_none());
     }
 
     #[test]
     fn test_parse_run_without_task() {
-        let cli = Cli::parse_from(["remix-agent", "run"]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert!(args.task.is_none());
-            }
-        }
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
+        assert!(args.task.is_none());
     }
 
     #[test]
     fn test_parse_run_with_config() {
-        let cli = Cli::parse_from(["remix-agent", "run", "--config", "task.yaml"]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert_eq!(args.config, Some(PathBuf::from("task.yaml")));
-            }
-        }
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--config", "task.yaml"]));
+        assert_eq!(args.config, Some(PathBuf::from("task.yaml")));
     }
 
     #[test]
     fn test_parse_run_with_all_flags() {
-        let cli = Cli::parse_from([
+        let args = extract_run_args(Cli::parse_from([
             "remix-agent",
             "run",
             "--config",
@@ -244,52 +274,48 @@ mod tests {
             "--coordination-dir",
             "/tmp/coordination",
             "do something",
-        ]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert_eq!(args.task, Some("do something".to_string()));
-                assert_eq!(args.config, Some(PathBuf::from("task.yaml")));
-                assert_eq!(args.base_url, Some("https://api.example.com".to_string()));
-                assert_eq!(args.api_key, Some("sk-test".to_string()));
-                assert_eq!(args.model, Some("gpt-4".to_string()));
-                assert_eq!(args.max_tokens, Some(4096));
-                assert_eq!(args.timeout, Some(600));
-                assert_eq!(args.max_iterations, Some(100));
-                assert!(args.headed);
-                assert!(args.verbose);
-                assert_eq!(args.output, Some(PathBuf::from("result.json")));
-                assert_eq!(
-                    args.browser_path,
-                    Some("/usr/local/bin/remix-browser".to_string())
-                );
-                assert_eq!(args.skills_dir, Some(PathBuf::from("/tmp/skills")));
-                assert!(args.no_skills);
-                assert_eq!(args.agents_md_dir, Some(PathBuf::from("/tmp/agents")));
-                assert!(args.no_agents_md);
-                assert!(args.no_local_tools);
-                assert_eq!(args.sandbox_dir, Some(PathBuf::from("/tmp/sandbox")));
-                assert!(args.no_plugins);
-                assert_eq!(args.plugins_dir, Some(PathBuf::from("/tmp/plugins")));
-                assert!(args.no_claude_plugins);
-                assert_eq!(args.session_id, Some("abc-123".to_string()));
-                assert_eq!(args.fork_session, Some("def-456".to_string()));
-                assert_eq!(args.session_dir, Some(PathBuf::from("/tmp/sessions")));
-                assert_eq!(args.permission_mode, Some("plan".to_string()));
-                assert_eq!(args.allow_tool, vec!["navigate", "click"]);
-                assert_eq!(args.deny_tool, vec!["bash"]);
-                assert!(args.no_coordination);
-                assert_eq!(args.max_workers, Some(10));
-                assert_eq!(
-                    args.coordination_dir,
-                    Some(PathBuf::from("/tmp/coordination"))
-                );
-            }
-        }
+        ]));
+        assert_eq!(args.task, Some("do something".to_string()));
+        assert_eq!(args.config, Some(PathBuf::from("task.yaml")));
+        assert_eq!(args.base_url, Some("https://api.example.com".to_string()));
+        assert_eq!(args.api_key, Some("sk-test".to_string()));
+        assert_eq!(args.model, Some("gpt-4".to_string()));
+        assert_eq!(args.max_tokens, Some(4096));
+        assert_eq!(args.timeout, Some(600));
+        assert_eq!(args.max_iterations, Some(100));
+        assert!(args.headed);
+        assert!(args.verbose);
+        assert_eq!(args.output, Some(PathBuf::from("result.json")));
+        assert_eq!(
+            args.browser_path,
+            Some("/usr/local/bin/remix-browser".to_string())
+        );
+        assert_eq!(args.skills_dir, Some(PathBuf::from("/tmp/skills")));
+        assert!(args.no_skills);
+        assert_eq!(args.agents_md_dir, Some(PathBuf::from("/tmp/agents")));
+        assert!(args.no_agents_md);
+        assert!(args.no_local_tools);
+        assert_eq!(args.sandbox_dir, Some(PathBuf::from("/tmp/sandbox")));
+        assert!(args.no_plugins);
+        assert_eq!(args.plugins_dir, Some(PathBuf::from("/tmp/plugins")));
+        assert!(args.no_claude_plugins);
+        assert_eq!(args.session_id, Some("abc-123".to_string()));
+        assert_eq!(args.fork_session, Some("def-456".to_string()));
+        assert_eq!(args.session_dir, Some(PathBuf::from("/tmp/sessions")));
+        assert_eq!(args.permission_mode, Some("plan".to_string()));
+        assert_eq!(args.allow_tool, vec!["navigate", "click"]);
+        assert_eq!(args.deny_tool, vec!["bash"]);
+        assert!(args.no_coordination);
+        assert_eq!(args.max_workers, Some(10));
+        assert_eq!(
+            args.coordination_dir,
+            Some(PathBuf::from("/tmp/coordination"))
+        );
     }
 
     #[test]
     fn test_parse_run_short_flags() {
-        let cli = Cli::parse_from([
+        let args = extract_run_args(Cli::parse_from([
             "remix-agent",
             "run",
             "-c",
@@ -297,70 +323,46 @@ mod tests {
             "-v",
             "-o",
             "out.json",
-        ]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert_eq!(args.config, Some(PathBuf::from("task.yaml")));
-                assert!(args.verbose);
-                assert_eq!(args.output, Some(PathBuf::from("out.json")));
-            }
-        }
+        ]));
+        assert_eq!(args.config, Some(PathBuf::from("task.yaml")));
+        assert!(args.verbose);
+        assert_eq!(args.output, Some(PathBuf::from("out.json")));
     }
 
     #[test]
     fn test_parse_run_with_skills_dir() {
-        let cli = Cli::parse_from(["remix-agent", "run", "--skills-dir", "/path/to/skills"]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert_eq!(args.skills_dir, Some(PathBuf::from("/path/to/skills")));
-                assert!(!args.no_skills);
-            }
-        }
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--skills-dir", "/path/to/skills"]));
+        assert_eq!(args.skills_dir, Some(PathBuf::from("/path/to/skills")));
+        assert!(!args.no_skills);
     }
 
     #[test]
     fn test_parse_run_with_no_skills() {
-        let cli = Cli::parse_from(["remix-agent", "run", "--no-skills"]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert!(args.no_skills);
-                assert!(args.skills_dir.is_none());
-            }
-        }
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--no-skills"]));
+        assert!(args.no_skills);
+        assert!(args.skills_dir.is_none());
     }
 
     #[test]
     fn test_parse_run_with_no_plugins() {
-        let cli = Cli::parse_from(["remix-agent", "run", "--no-plugins"]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert!(args.no_plugins);
-                assert!(args.plugins_dir.is_none());
-                assert!(!args.no_claude_plugins);
-            }
-        }
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--no-plugins"]));
+        assert!(args.no_plugins);
+        assert!(args.plugins_dir.is_none());
+        assert!(!args.no_claude_plugins);
     }
 
     #[test]
     fn test_parse_run_with_plugins_dir() {
-        let cli = Cli::parse_from(["remix-agent", "run", "--plugins-dir", "/path/to/plugins"]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert_eq!(args.plugins_dir, Some(PathBuf::from("/path/to/plugins")));
-                assert!(!args.no_plugins);
-            }
-        }
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--plugins-dir", "/path/to/plugins"]));
+        assert_eq!(args.plugins_dir, Some(PathBuf::from("/path/to/plugins")));
+        assert!(!args.no_plugins);
     }
 
     #[test]
     fn test_parse_run_with_no_claude_plugins() {
-        let cli = Cli::parse_from(["remix-agent", "run", "--no-claude-plugins"]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert!(args.no_claude_plugins);
-                assert!(!args.no_plugins);
-            }
-        }
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--no-claude-plugins"]));
+        assert!(args.no_claude_plugins);
+        assert!(!args.no_plugins);
     }
 
     #[test]
@@ -377,134 +379,90 @@ mod tests {
 
     #[test]
     fn test_parse_run_with_agents_md_dir() {
-        let cli = Cli::parse_from(["remix-agent", "run", "--agents-md-dir", "/path/to/project"]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert_eq!(args.agents_md_dir, Some(PathBuf::from("/path/to/project")));
-                assert!(!args.no_agents_md);
-            }
-        }
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--agents-md-dir", "/path/to/project"]));
+        assert_eq!(args.agents_md_dir, Some(PathBuf::from("/path/to/project")));
+        assert!(!args.no_agents_md);
     }
 
     #[test]
     fn test_parse_run_with_no_agents_md() {
-        let cli = Cli::parse_from(["remix-agent", "run", "--no-agents-md"]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert!(args.no_agents_md);
-                assert!(args.agents_md_dir.is_none());
-            }
-        }
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--no-agents-md"]));
+        assert!(args.no_agents_md);
+        assert!(args.agents_md_dir.is_none());
     }
 
     #[test]
     fn test_parse_run_with_no_local_tools() {
-        let cli = Cli::parse_from(["remix-agent", "run", "--no-local-tools"]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert!(args.no_local_tools);
-                assert!(args.sandbox_dir.is_none());
-            }
-        }
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--no-local-tools"]));
+        assert!(args.no_local_tools);
+        assert!(args.sandbox_dir.is_none());
     }
 
     #[test]
     fn test_parse_run_with_sandbox_dir() {
-        let cli = Cli::parse_from(["remix-agent", "run", "--sandbox-dir", "/tmp/sandbox"]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert_eq!(args.sandbox_dir, Some(PathBuf::from("/tmp/sandbox")));
-                assert!(!args.no_local_tools);
-            }
-        }
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--sandbox-dir", "/tmp/sandbox"]));
+        assert_eq!(args.sandbox_dir, Some(PathBuf::from("/tmp/sandbox")));
+        assert!(!args.no_local_tools);
     }
 
     #[test]
     fn test_parse_run_with_session_id() {
-        let cli = Cli::parse_from(["remix-agent", "run", "--session-id", "abc-123"]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert_eq!(args.session_id, Some("abc-123".to_string()));
-                assert!(args.fork_session.is_none());
-            }
-        }
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--session-id", "abc-123"]));
+        assert_eq!(args.session_id, Some("abc-123".to_string()));
+        assert!(args.fork_session.is_none());
     }
 
     #[test]
     fn test_parse_run_with_fork_session() {
-        let cli = Cli::parse_from(["remix-agent", "run", "--fork-session", "def-456"]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert_eq!(args.fork_session, Some("def-456".to_string()));
-                assert!(args.session_id.is_none());
-            }
-        }
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--fork-session", "def-456"]));
+        assert_eq!(args.fork_session, Some("def-456".to_string()));
+        assert!(args.session_id.is_none());
     }
 
     #[test]
     fn test_parse_run_with_session_dir() {
-        let cli = Cli::parse_from(["remix-agent", "run", "--session-dir", "/tmp/sessions"]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert_eq!(args.session_dir, Some(PathBuf::from("/tmp/sessions")));
-            }
-        }
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--session-dir", "/tmp/sessions"]));
+        assert_eq!(args.session_dir, Some(PathBuf::from("/tmp/sessions")));
     }
 
     #[test]
     fn test_parse_run_with_permission_mode() {
-        let cli = Cli::parse_from(["remix-agent", "run", "--permission-mode", "plan"]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert_eq!(args.permission_mode, Some("plan".to_string()));
-            }
-        }
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--permission-mode", "plan"]));
+        assert_eq!(args.permission_mode, Some("plan".to_string()));
     }
 
     #[test]
     fn test_parse_run_with_no_coordination() {
-        let cli = Cli::parse_from(["remix-agent", "run", "--no-coordination"]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert!(args.no_coordination);
-                assert!(args.max_workers.is_none());
-                assert!(args.coordination_dir.is_none());
-            }
-        }
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--no-coordination"]));
+        assert!(args.no_coordination);
+        assert!(args.max_workers.is_none());
+        assert!(args.coordination_dir.is_none());
     }
 
     #[test]
     fn test_parse_run_with_max_workers() {
-        let cli = Cli::parse_from(["remix-agent", "run", "--max-workers", "8"]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert_eq!(args.max_workers, Some(8));
-                assert!(!args.no_coordination);
-            }
-        }
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--max-workers", "8"]));
+        assert_eq!(args.max_workers, Some(8));
+        assert!(!args.no_coordination);
     }
 
     #[test]
     fn test_parse_run_with_coordination_dir() {
-        let cli = Cli::parse_from([
+        let args = extract_run_args(Cli::parse_from([
             "remix-agent",
             "run",
             "--coordination-dir",
             "/tmp/coordination",
-        ]);
-        match cli.command {
-            Commands::Run(args) => {
-                assert_eq!(
-                    args.coordination_dir,
-                    Some(PathBuf::from("/tmp/coordination"))
-                );
-            }
-        }
+        ]));
+        assert_eq!(
+            args.coordination_dir,
+            Some(PathBuf::from("/tmp/coordination"))
+        );
     }
 
     #[test]
     fn test_parse_run_with_allow_deny_tools() {
-        let cli = Cli::parse_from([
+        let args = extract_run_args(Cli::parse_from([
             "remix-agent",
             "run",
             "--allow-tool",
@@ -513,12 +471,141 @@ mod tests {
             "click",
             "--deny-tool",
             "bash",
+        ]));
+        assert_eq!(args.allow_tool, vec!["navigate", "click"]);
+        assert_eq!(args.deny_tool, vec!["bash"]);
+    }
+
+    // --- New tests for --continue, --effort, and sessions subcommand ---
+
+    #[test]
+    fn test_parse_run_with_continue_flag() {
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--continue"]));
+        assert!(args.continue_session);
+    }
+
+    #[test]
+    fn test_parse_run_with_continue_session_alias() {
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--continue-session"]));
+        assert!(args.continue_session);
+    }
+
+    #[test]
+    fn test_parse_run_with_resume_alias() {
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--resume"]));
+        assert!(args.continue_session);
+    }
+
+    #[test]
+    fn test_parse_run_continue_default_false() {
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
+        assert!(!args.continue_session);
+    }
+
+    #[test]
+    fn test_parse_run_with_effort() {
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--effort", "high"]));
+        assert_eq!(args.effort, Some("high".to_string()));
+    }
+
+    #[test]
+    fn test_parse_run_with_effort_low() {
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--effort", "low"]));
+        assert_eq!(args.effort, Some("low".to_string()));
+    }
+
+    #[test]
+    fn test_parse_run_with_effort_max() {
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--effort", "max"]));
+        assert_eq!(args.effort, Some("max".to_string()));
+    }
+
+    #[test]
+    fn test_parse_run_effort_default_none() {
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
+        assert!(args.effort.is_none());
+    }
+
+    #[test]
+    fn test_parse_sessions_list() {
+        let cli = Cli::parse_from(["remix-agent", "sessions", "list"]);
+        match cli.command {
+            Commands::Sessions(sessions_args) => match sessions_args.command {
+                SessionsCommand::List { session_dir } => {
+                    assert!(session_dir.is_none());
+                }
+                other => panic!("Expected SessionsCommand::List, got {:?}", other),
+            },
+            other => panic!("Expected Commands::Sessions, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_sessions_list_with_session_dir() {
+        let cli = Cli::parse_from([
+            "remix-agent",
+            "sessions",
+            "list",
+            "--session-dir",
+            "/tmp/sessions",
         ]);
         match cli.command {
-            Commands::Run(args) => {
-                assert_eq!(args.allow_tool, vec!["navigate", "click"]);
-                assert_eq!(args.deny_tool, vec!["bash"]);
-            }
+            Commands::Sessions(sessions_args) => match sessions_args.command {
+                SessionsCommand::List { session_dir } => {
+                    assert_eq!(session_dir, Some(PathBuf::from("/tmp/sessions")));
+                }
+                other => panic!("Expected SessionsCommand::List, got {:?}", other),
+            },
+            other => panic!("Expected Commands::Sessions, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_parse_sessions_show() {
+        let cli = Cli::parse_from(["remix-agent", "sessions", "show", "abc-123"]);
+        match cli.command {
+            Commands::Sessions(sessions_args) => match sessions_args.command {
+                SessionsCommand::Show { id, session_dir } => {
+                    assert_eq!(id, "abc-123");
+                    assert!(session_dir.is_none());
+                }
+                other => panic!("Expected SessionsCommand::Show, got {:?}", other),
+            },
+            other => panic!("Expected Commands::Sessions, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_sessions_show_with_session_dir() {
+        let cli = Cli::parse_from([
+            "remix-agent",
+            "sessions",
+            "show",
+            "abc-123",
+            "--session-dir",
+            "/tmp/sessions",
+        ]);
+        match cli.command {
+            Commands::Sessions(sessions_args) => match sessions_args.command {
+                SessionsCommand::Show { id, session_dir } => {
+                    assert_eq!(id, "abc-123");
+                    assert_eq!(session_dir, Some(PathBuf::from("/tmp/sessions")));
+                }
+                other => panic!("Expected SessionsCommand::Show, got {:?}", other),
+            },
+            other => panic!("Expected Commands::Sessions, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_sessions_missing_subcommand_fails() {
+        let result = Cli::try_parse_from(["remix-agent", "sessions"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_sessions_show_missing_id_fails() {
+        let result = Cli::try_parse_from(["remix-agent", "sessions", "show"]);
+        assert!(result.is_err());
     }
 }

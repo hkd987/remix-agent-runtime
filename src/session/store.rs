@@ -248,7 +248,7 @@ impl SessionStore {
         self.root_dir.join(&session_id.0)
     }
 
-    fn load_messages(&self, session_id: &SessionId) -> Result<Vec<Message>, AgentError> {
+    pub fn load_messages(&self, session_id: &SessionId) -> Result<Vec<Message>, AgentError> {
         let path = self.session_dir(session_id).join("messages.jsonl");
         if !path.exists() {
             return Ok(vec![]);

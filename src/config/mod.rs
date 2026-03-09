@@ -208,7 +208,13 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::path::PathBuf;
+    use std::sync::Mutex;
     use tempfile::NamedTempFile;
+
+    /// Mutex to serialize tests that read/write process-wide environment variables.
+    /// `std::env::set_var` / `remove_var` are not thread-safe; concurrent tests that
+    /// modify the same env vars (REMIX_LLM_*) will race without this lock.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn default_run_args() -> RunArgs {
         RunArgs {
@@ -242,6 +248,8 @@ mod tests {
             no_coordination: false,
             max_workers: None,
             coordination_dir: None,
+            continue_session: false,
+            effort: None,
         }
     }
 
@@ -252,12 +260,25 @@ mod tests {
         file
     }
 
+    /// Clear all REMIX_* env vars that could interfere with config tests.
+    /// Must be called while holding `ENV_LOCK`.
+    fn clear_env_vars() {
+        unsafe {
+            std::env::remove_var("REMIX_LLM_BASE_URL");
+            std::env::remove_var("REMIX_LLM_API_KEY");
+            std::env::remove_var("REMIX_LLM_MODEL");
+            std::env::remove_var("REMIX_SKILLS_DIR");
+            std::env::remove_var("REMIX_AGENTS_MD_DIR");
+            std::env::remove_var("REMIX_SANDBOX_DIR");
+            std::env::remove_var("REMIX_PLUGINS_DIR");
+            std::env::remove_var("REMIX_SESSION_DIR");
+        }
+    }
+
     #[test]
     fn test_defaults_only() {
-        // Clear env vars that could interfere
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
         let args = default_run_args();
         let config = load_config(&args).unwrap();
@@ -271,10 +292,8 @@ mod tests {
 
     #[test]
     fn test_yaml_parsing() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
-
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
         let yaml = r#"
 task: "navigate to example.com"
 llm:
@@ -306,6 +325,8 @@ agent:
 
     #[test]
     fn test_env_var_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
         let yaml = r#"
 llm:
   base_url: "https://yaml.api.com"
@@ -314,9 +335,11 @@ llm:
 "#;
         let file = write_yaml_tempfile(yaml);
 
-        std::env::set_var("REMIX_LLM_BASE_URL", "https://env.api.com");
-        std::env::set_var("REMIX_LLM_API_KEY", "env-key");
-        std::env::set_var("REMIX_LLM_MODEL", "env-model");
+        unsafe {
+            std::env::set_var("REMIX_LLM_BASE_URL", "https://env.api.com");
+            std::env::set_var("REMIX_LLM_API_KEY", "env-key");
+            std::env::set_var("REMIX_LLM_MODEL", "env-model");
+        }
 
         let args = RunArgs {
             config: Some(file.path().to_path_buf()),
@@ -328,16 +351,22 @@ llm:
         assert_eq!(config.llm.api_key, "env-key");
         assert_eq!(config.llm.model, "env-model");
 
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
+        unsafe {
+            std::env::remove_var("REMIX_LLM_BASE_URL");
+            std::env::remove_var("REMIX_LLM_API_KEY");
+            std::env::remove_var("REMIX_LLM_MODEL");
+        }
     }
 
     #[test]
     fn test_cli_flag_override() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        unsafe {
+            std::env::remove_var("REMIX_LLM_BASE_URL");
+            std::env::remove_var("REMIX_LLM_API_KEY");
+            std::env::remove_var("REMIX_LLM_MODEL");
+        }
 
         let yaml = r#"
 task: "yaml task"
@@ -383,6 +412,8 @@ agent:
             no_coordination: false,
             max_workers: None,
             coordination_dir: None,
+            continue_session: false,
+            effort: None,
         };
         let config = load_config(&args).unwrap();
 
@@ -400,6 +431,8 @@ agent:
 
     #[test]
     fn test_merge_priority_cli_over_env_over_yaml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
         let yaml = r#"
 llm:
   base_url: "https://yaml.api.com"
@@ -409,9 +442,11 @@ llm:
         let file = write_yaml_tempfile(yaml);
 
         // Set env vars (should override YAML)
-        std::env::set_var("REMIX_LLM_BASE_URL", "https://env.api.com");
-        std::env::set_var("REMIX_LLM_API_KEY", "env-key");
-        std::env::set_var("REMIX_LLM_MODEL", "env-model");
+        unsafe {
+            std::env::set_var("REMIX_LLM_BASE_URL", "https://env.api.com");
+            std::env::set_var("REMIX_LLM_API_KEY", "env-key");
+            std::env::set_var("REMIX_LLM_MODEL", "env-model");
+        }
 
         // Set CLI flags (should override env)
         let args = RunArgs {
@@ -428,16 +463,22 @@ llm:
         assert_eq!(config.llm.api_key, "cli-key");
         assert_eq!(config.llm.model, "cli-model");
 
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
+        unsafe {
+            std::env::remove_var("REMIX_LLM_BASE_URL");
+            std::env::remove_var("REMIX_LLM_API_KEY");
+            std::env::remove_var("REMIX_LLM_MODEL");
+        }
     }
 
     #[test]
     fn test_missing_config_file_error() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        unsafe {
+            std::env::remove_var("REMIX_LLM_BASE_URL");
+            std::env::remove_var("REMIX_LLM_API_KEY");
+            std::env::remove_var("REMIX_LLM_MODEL");
+        }
 
         let args = RunArgs {
             config: Some(PathBuf::from("/nonexistent/path/config.yaml")),
@@ -451,6 +492,9 @@ llm:
 
     #[test]
     fn test_invalid_yaml_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
         let file = write_yaml_tempfile("{{{{invalid yaml content");
         let args = RunArgs {
             config: Some(file.path().to_path_buf()),
@@ -462,11 +506,15 @@ llm:
 
     #[test]
     fn test_yaml_env_var_interpolation() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
+        let _guard = ENV_LOCK.lock().unwrap();
 
-        std::env::set_var("TEST_CONFIG_API_KEY", "interpolated-key");
+        unsafe {
+            std::env::remove_var("REMIX_LLM_BASE_URL");
+            std::env::remove_var("REMIX_LLM_API_KEY");
+            std::env::remove_var("REMIX_LLM_MODEL");
+            std::env::set_var("TEST_CONFIG_API_KEY", "interpolated-key");
+        }
+
         let yaml = r#"
 llm:
   api_key: "${TEST_CONFIG_API_KEY}"
@@ -478,14 +526,15 @@ llm:
         };
         let config = load_config(&args).unwrap();
         assert_eq!(config.llm.api_key, "interpolated-key");
-        std::env::remove_var("TEST_CONFIG_API_KEY");
+        unsafe {
+            std::env::remove_var("TEST_CONFIG_API_KEY");
+        }
     }
 
     #[test]
     fn test_headed_flag_overrides_headless() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
         let args = RunArgs {
             headed: true,
@@ -497,9 +546,8 @@ llm:
 
     #[test]
     fn test_headed_false_preserves_default() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
         let args = RunArgs {
             headed: false,
@@ -511,9 +559,8 @@ llm:
 
     #[test]
     fn test_credentials_normalized_from_yaml() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
         let yaml = r#"
 credentials:
@@ -545,9 +592,8 @@ credentials:
 
     #[test]
     fn test_cli_task_overrides_yaml_task() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
         let yaml = r#"
 task: "yaml task"
@@ -564,9 +610,8 @@ task: "yaml task"
 
     #[test]
     fn test_no_cli_task_preserves_yaml_task() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
         let yaml = r#"
 task: "yaml task"
@@ -582,10 +627,8 @@ task: "yaml task"
 
     #[test]
     fn test_skills_dir_from_cli() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
-        std::env::remove_var("REMIX_SKILLS_DIR");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
         let args = RunArgs {
             skills_dir: Some(PathBuf::from("/custom/skills")),
@@ -601,10 +644,8 @@ task: "yaml task"
 
     #[test]
     fn test_no_skills_flag() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
-        std::env::remove_var("REMIX_SKILLS_DIR");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
         let args = RunArgs {
             no_skills: true,
@@ -616,24 +657,28 @@ task: "yaml task"
 
     #[test]
     fn test_skills_dir_from_env() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
-        std::env::set_var("REMIX_SKILLS_DIR", "/env/skills");
+        unsafe {
+            std::env::set_var("REMIX_SKILLS_DIR", "/env/skills");
+        }
         let args = default_run_args();
         let config = load_config(&args).unwrap();
         assert!(config.skills.dirs.contains(&PathBuf::from("/env/skills")));
-        std::env::remove_var("REMIX_SKILLS_DIR");
+        unsafe {
+            std::env::remove_var("REMIX_SKILLS_DIR");
+        }
     }
 
     #[test]
     fn test_skills_dir_cli_and_env_no_duplicates() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
-        std::env::set_var("REMIX_SKILLS_DIR", "/same/path");
+        unsafe {
+            std::env::set_var("REMIX_SKILLS_DIR", "/same/path");
+        }
         let args = RunArgs {
             skills_dir: Some(PathBuf::from("/same/path")),
             ..default_run_args()
@@ -646,15 +691,15 @@ task: "yaml task"
             .filter(|d| d == &&PathBuf::from("/same/path"))
             .count();
         assert_eq!(count, 1);
-        std::env::remove_var("REMIX_SKILLS_DIR");
+        unsafe {
+            std::env::remove_var("REMIX_SKILLS_DIR");
+        }
     }
 
     #[test]
     fn test_agents_md_dir_from_cli() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
-        std::env::remove_var("REMIX_AGENTS_MD_DIR");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
         let args = RunArgs {
             agents_md_dir: Some(PathBuf::from("/custom/agents")),
@@ -670,10 +715,8 @@ task: "yaml task"
 
     #[test]
     fn test_no_agents_md_flag() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
-        std::env::remove_var("REMIX_AGENTS_MD_DIR");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
         let args = RunArgs {
             no_agents_md: true,
@@ -685,10 +728,8 @@ task: "yaml task"
 
     #[test]
     fn test_sandbox_dir_from_cli() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
-        std::env::remove_var("REMIX_SANDBOX_DIR");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
         let args = RunArgs {
             sandbox_dir: Some(PathBuf::from("/custom/sandbox")),
@@ -704,10 +745,8 @@ task: "yaml task"
 
     #[test]
     fn test_no_local_tools_flag() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
-        std::env::remove_var("REMIX_SANDBOX_DIR");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
         let args = RunArgs {
             no_local_tools: true,
@@ -719,10 +758,8 @@ task: "yaml task"
 
     #[test]
     fn test_skills_config_from_yaml() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
-        std::env::remove_var("REMIX_SKILLS_DIR");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
         let yaml = r#"
 task: "test"
@@ -745,9 +782,8 @@ skills:
 
     #[test]
     fn test_timeout_applies_to_both_browser_and_agent() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
         let args = RunArgs {
             timeout: Some(999),
@@ -760,10 +796,8 @@ skills:
 
     #[test]
     fn test_no_plugins_flag() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
-        std::env::remove_var("REMIX_PLUGINS_DIR");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
         let args = RunArgs {
             no_plugins: true,
@@ -775,10 +809,8 @@ skills:
 
     #[test]
     fn test_no_claude_plugins_flag() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
-        std::env::remove_var("REMIX_PLUGINS_DIR");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
         let args = RunArgs {
             no_claude_plugins: true,
@@ -791,10 +823,8 @@ skills:
 
     #[test]
     fn test_plugins_dir_from_cli() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
-        std::env::remove_var("REMIX_PLUGINS_DIR");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
         let args = RunArgs {
             plugins_dir: Some(PathBuf::from("/custom/plugins")),
@@ -810,11 +840,12 @@ skills:
 
     #[test]
     fn test_plugins_dir_from_env() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
-        std::env::set_var("REMIX_PLUGINS_DIR", "/env/plugins");
+        unsafe {
+            std::env::set_var("REMIX_PLUGINS_DIR", "/env/plugins");
+        }
         let args = default_run_args();
         let config = load_config(&args).unwrap();
         assert!(config
@@ -822,15 +853,15 @@ skills:
             .sources
             .iter()
             .any(|s| s.path == Some(PathBuf::from("/env/plugins"))));
-        std::env::remove_var("REMIX_PLUGINS_DIR");
+        unsafe {
+            std::env::remove_var("REMIX_PLUGINS_DIR");
+        }
     }
 
     #[test]
     fn test_plugins_config_from_yaml() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
-        std::env::remove_var("REMIX_PLUGINS_DIR");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
         let yaml = r#"
 task: "test"
@@ -862,10 +893,8 @@ plugins:
 
     #[test]
     fn test_session_dir_from_cli() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
-        std::env::remove_var("REMIX_SESSION_DIR");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
         let args = RunArgs {
             session_dir: Some(PathBuf::from("/custom/sessions")),
@@ -880,9 +909,8 @@ plugins:
 
     #[test]
     fn test_permission_mode_from_cli() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
         let args = RunArgs {
             permission_mode: Some("bypass_permissions".to_string()),
@@ -897,9 +925,8 @@ plugins:
 
     #[test]
     fn test_invalid_permission_mode_error() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
         let args = RunArgs {
             permission_mode: Some("invalid_mode".to_string()),
@@ -915,9 +942,8 @@ plugins:
 
     #[test]
     fn test_allow_deny_tools_from_cli() {
-        std::env::remove_var("REMIX_LLM_BASE_URL");
-        std::env::remove_var("REMIX_LLM_API_KEY");
-        std::env::remove_var("REMIX_LLM_MODEL");
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
 
         let args = RunArgs {
             allow_tool: vec!["navigate".to_string(), "click".to_string()],

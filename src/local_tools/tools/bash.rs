@@ -57,6 +57,12 @@ pub async fn execute_bash(
         result.push_str(&output.stderr);
     }
 
+    // Apply output filters: strip ANSI codes, deduplicate repeated lines, truncate
+    result = super::output_filter::strip_ansi(&result);
+    result = super::output_filter::dedup_lines(&result);
+    // Default max: 32KB, matching tool_result_max_bytes default
+    result = super::output_filter::truncate_output(&result, 32_768);
+
     if output.exit_code != 0 {
         Ok(ToolExecutionResult {
             content: format!("Exit code: {}\n{}", output.exit_code, result),
@@ -284,5 +290,59 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("stdout line"));
         assert!(result.content.contains("[stderr] stderr line"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_strips_ansi_codes() {
+        let sandbox = MockSandbox::new(CommandOutput {
+            stdout: "\x1b[32m✓ passed\x1b[0m\n\x1b[31m✗ failed\x1b[0m\n".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+        });
+        let config = default_config();
+
+        let result = execute_bash(json!({"command": "test"}), &sandbox, &config)
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(!result.content.contains("\x1b["));
+        assert!(result.content.contains("✓ passed"));
+        assert!(result.content.contains("✗ failed"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_deduplicates_repeated_lines() {
+        let repeated = "building module...\n".repeat(10);
+        let sandbox = MockSandbox::new(CommandOutput {
+            stdout: format!("{}done\n", repeated),
+            stderr: String::new(),
+            exit_code: 0,
+        });
+        let config = default_config();
+
+        let result = execute_bash(json!({"command": "build"}), &sandbox, &config)
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("×10"));
+        assert!(result.content.contains("done"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_truncates_large_output() {
+        let large_output = "x".repeat(50_000);
+        let sandbox = MockSandbox::new(CommandOutput {
+            stdout: large_output,
+            stderr: String::new(),
+            exit_code: 0,
+        });
+        let config = default_config();
+
+        let result = execute_bash(json!({"command": "cat big"}), &sandbox, &config)
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("truncated"));
+        assert!(result.content.len() < 50_000);
     }
 }

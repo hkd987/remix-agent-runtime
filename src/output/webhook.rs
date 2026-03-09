@@ -129,6 +129,7 @@ mod tests {
             error: None,
             total_input_tokens: None,
             total_output_tokens: None,
+            total_cost_usd: None,
         }
     }
 

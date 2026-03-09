@@ -158,6 +158,9 @@ impl AgentState {
             AgentStatus::MaxIterations => {
                 AgentResult::max_iterations(self.steps, total_iterations, duration)
             }
+            AgentStatus::BudgetExceeded => {
+                AgentResult::budget_exceeded(self.steps, total_iterations, duration, 0.0)
+            }
         };
         result.total_input_tokens = input_tokens;
         result.total_output_tokens = output_tokens;
