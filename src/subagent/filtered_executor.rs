@@ -102,6 +102,7 @@ mod tests {
                         name: name.to_string(),
                         description: format!("Tool {name}"),
                         input_schema: json!({"type": "object"}),
+                        cache_control: None,
                     })
                     .collect(),
             }

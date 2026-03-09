@@ -126,6 +126,7 @@ fn local_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["path"]
             }),
+            cache_control: None,
         },
         ToolDefinition {
             name: "write_file".to_string(),
@@ -138,6 +139,7 @@ fn local_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["path", "content"]
             }),
+            cache_control: None,
         },
         ToolDefinition {
             name: "edit_file".to_string(),
@@ -151,6 +153,7 @@ fn local_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["path", "old_string", "new_string"]
             }),
+            cache_control: None,
         },
         ToolDefinition {
             name: "bash".to_string(),
@@ -163,6 +166,7 @@ fn local_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["command"]
             }),
+            cache_control: None,
         },
         ToolDefinition {
             name: "grep".to_string(),
@@ -177,6 +181,7 @@ fn local_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["pattern"]
             }),
+            cache_control: None,
         },
         ToolDefinition {
             name: "glob".to_string(),
@@ -189,6 +194,7 @@ fn local_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["pattern"]
             }),
+            cache_control: None,
         },
     ]
 }
@@ -228,6 +234,7 @@ mod tests {
                 name: "navigate".to_string(),
                 description: "Navigate to URL".to_string(),
                 input_schema: json!({"type": "object"}),
+                cache_control: None,
             }],
         }
     }

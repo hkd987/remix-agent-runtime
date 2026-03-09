@@ -1,7 +1,10 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::pin::Pin;
+use futures_core::Stream;
 use tracing::{debug, error, warn};
 
+use super::stream::{StreamEvent, SseParser};
 use super::types::*;
 use crate::error::AgentError;
 
@@ -24,6 +27,34 @@ impl<L: LlmProvider> LlmProvider for std::sync::Arc<L> {
         tools: Option<&[ToolDefinition]>,
     ) -> Result<MessagesResponse, AgentError> {
         (**self).send_messages(system, messages, tools).await
+    }
+}
+
+/// Extension trait for LLM providers that support streaming responses.
+///
+/// This is a separate trait from LlmProvider so non-streaming backends
+/// don't need to implement it.
+pub trait StreamingLlmProvider: LlmProvider {
+    /// Send a messages request and return a stream of events.
+    ///
+    /// The stream yields `StreamEvent` items as they arrive from the API.
+    /// Events follow the Anthropic SSE streaming protocol.
+    fn send_messages_stream<'a>(
+        &'a self,
+        system: Option<&'a [SystemContent]>,
+        messages: &'a [Message],
+        tools: Option<&'a [ToolDefinition]>,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, AgentError>> + Send + 'a>>;
+}
+
+impl<L: StreamingLlmProvider> StreamingLlmProvider for std::sync::Arc<L> {
+    fn send_messages_stream<'a>(
+        &'a self,
+        system: Option<&'a [SystemContent]>,
+        messages: &'a [Message],
+        tools: Option<&'a [ToolDefinition]>,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, AgentError>> + Send + 'a>> {
+        (**self).send_messages_stream(system, messages, tools)
     }
 }
 
@@ -168,6 +199,107 @@ impl LlmProvider for AnthropicClient {
         }
 
         Err(AgentError::LlmRateLimited)
+    }
+}
+
+impl StreamingLlmProvider for AnthropicClient {
+    fn send_messages_stream<'a>(
+        &'a self,
+        system: Option<&'a [SystemContent]>,
+        messages: &'a [Message],
+        tools: Option<&'a [ToolDefinition]>,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, AgentError>> + Send + 'a>> {
+        let request = MessagesRequest {
+            model: self.model.clone(),
+            max_tokens: self.max_tokens,
+            system: system.map(|s| s.to_vec()),
+            messages: messages.to_vec(),
+            tools: tools.map(|t| t.to_vec()),
+            thinking: self.thinking.clone(),
+            stream: Some(true),
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamEvent, AgentError>>(32);
+        let client = self.client.clone();
+        let url = format!("{}/v1/messages", self.base_url);
+        let api_key = self.api_key.clone();
+        let custom_headers = self.custom_headers.clone();
+        let enable_prompt_caching = self.enable_prompt_caching;
+
+        tokio::spawn(async move {
+            let mut builder = client
+                .post(&url)
+                .header("x-api-key", &api_key)
+                .header("content-type", "application/json")
+                .header("anthropic-version", "2023-06-01");
+
+            if enable_prompt_caching {
+                builder = builder.header("anthropic-beta", "prompt-caching-2024-07-31");
+            }
+
+            for (key, value) in &custom_headers {
+                builder = builder.header(key, value);
+            }
+
+            let response = match builder.json(&request).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(AgentError::Http(e))).await;
+                    return;
+                }
+            };
+
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                let err = if status == reqwest::StatusCode::UNAUTHORIZED
+                    || status == reqwest::StatusCode::FORBIDDEN
+                {
+                    AgentError::LlmAuth(body)
+                } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    AgentError::LlmRateLimited
+                } else {
+                    AgentError::Llm(format!("HTTP {}: {}", status.as_u16(), body))
+                };
+                let _ = tx.send(Err(err)).await;
+                return;
+            }
+
+            let mut byte_stream = response.bytes_stream();
+            let mut parser = SseParser::new();
+
+            use tokio_stream::StreamExt as _;
+            while let Some(chunk_result) = byte_stream.next().await {
+                match chunk_result {
+                    Ok(bytes) => {
+                        let events = parser.feed(&bytes);
+                        for (event_type, data) in events {
+                            match SseParser::parse_event(&event_type, &data) {
+                                Ok(event) => {
+                                    if tx.send(Ok(event)).await.is_err() {
+                                        return; // Receiver dropped
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        event_type = %event_type,
+                                        "Failed to parse stream event"
+                                    );
+                                    // Continue parsing, don't break on individual event parse errors
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(AgentError::Http(e))).await;
+                        return;
+                    }
+                }
+            }
+        });
+
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
     }
 }
 

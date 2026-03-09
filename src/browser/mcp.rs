@@ -251,6 +251,7 @@ mod tests {
                 name: "navigate".to_string(),
                 description: "Navigate to URL".to_string(),
                 input_schema: json!({"type": "object", "properties": {"url": {"type": "string"}}}),
+                cache_control: None,
             }],
             response: ToolExecutionResult {
                 content: "Navigated to https://example.com".to_string(),
