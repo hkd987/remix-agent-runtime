@@ -74,12 +74,17 @@ async fn main() -> ExitCode {
             tracing::info!("Starting agent with config: {}", config.llm);
 
             // Create LLM client (wrapped in Arc for sharing with child agents)
+            let thinking_config = config.llm.thinking_budget_tokens.map(
+                remix_agent_runtime::llm::types::ThinkingConfig::enabled,
+            );
             let llm_client = std::sync::Arc::new(AnthropicClient::new(
                 config.llm.base_url.clone(),
                 config.llm.api_key.clone(),
                 config.llm.model.clone(),
                 config.llm.max_tokens,
                 config.llm.custom_headers.clone(),
+                thinking_config,
+                config.llm.enable_prompt_caching,
             ));
 
             // Spawn browser and connect via MCP

@@ -7,7 +7,7 @@ use crate::config::credentials::{inject_credentials_into_system_prompt, Credenti
 use crate::config::schema::{AgentConfig, CompactionConfig};
 use crate::error::AgentError;
 use crate::llm::client::LlmProvider;
-use crate::llm::types::{ContentBlock, StopReason};
+use crate::llm::types::{CacheControl, ContentBlock, StopReason, SystemContent, ToolResultContent};
 use crate::output::result::{AgentResult, AgentStatus, StepRecord};
 use crate::session::types::{SessionId, SessionStatus};
 use crate::session::SessionStore;
@@ -58,15 +58,22 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         let mut step_records = Vec::new();
 
         for block in assistant_content {
-            if let ContentBlock::ToolUse { id, name, input } = block {
-                debug!(tool = %name, "Executing tool");
-                let step_start = Instant::now();
-                let exec_result = self.tools.execute_tool(name, input.clone()).await;
-                let step_duration = step_start.elapsed().as_millis() as u64;
-                let (content_block, step) =
-                    Self::process_tool_result(id, name, input, exec_result, step_duration, iteration);
-                tool_results.push(content_block);
-                step_records.push(step);
+            match block {
+                ContentBlock::ToolUse { id, name, input } => {
+                    debug!(tool = %name, "Executing tool");
+                    let step_start = Instant::now();
+                    let exec_result = self.tools.execute_tool(name, input.clone()).await;
+                    let step_duration = step_start.elapsed().as_millis() as u64;
+                    let (content_block, step) = Self::process_tool_result(
+                        id, name, input, exec_result, step_duration, iteration,
+                    );
+                    tool_results.push(content_block);
+                    step_records.push(step);
+                }
+                ContentBlock::Thinking { thinking } => {
+                    debug!(thinking_length = thinking.len(), "Model produced thinking block");
+                }
+                _ => {}
             }
         }
 
@@ -95,7 +102,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 };
                 let block = ContentBlock::ToolResult {
                     tool_use_id: id.to_string(),
-                    content: result.content,
+                    content: ToolResultContent::Text(result.content),
                     is_error: if result.is_error { Some(true) } else { None },
                 };
                 (block, step)
@@ -113,7 +120,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 };
                 let block = ContentBlock::ToolResult {
                     tool_use_id: id.to_string(),
-                    content: error_msg,
+                    content: ToolResultContent::Text(error_msg),
                     is_error: Some(true),
                 };
                 (block, step)
@@ -160,32 +167,40 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             None
         };
 
-        let mut system_parts = Vec::new();
+        let mut system_blocks: Vec<SystemContent> = Vec::new();
         if let Some(ref prompt) = self.config.system_prompt {
-            system_parts.push(prompt.clone());
+            system_blocks.push(SystemContent::text(prompt.clone()));
         }
         if let Some(agents_md_prompt) =
             crate::agents_md::inject_agents_md_into_system_prompt(agents_md)
         {
-            system_parts.push(agents_md_prompt);
+            system_blocks.push(SystemContent::text(agents_md_prompt));
         }
         if let Some(cred_prompt) = inject_credentials_into_system_prompt(credentials) {
-            system_parts.push(cred_prompt);
+            system_blocks.push(SystemContent::text(cred_prompt));
         }
         if let Some(ref coord_config) = self.config.coordination_config {
             if let Some(coord_prompt) =
                 crate::coordination::inject_coordination_into_system_prompt(coord_config)
             {
-                system_parts.push(coord_prompt);
+                system_blocks.push(SystemContent::text(coord_prompt));
             }
         }
         if let Some(skill_prompt) = inject_skills_into_system_prompt(skill_set) {
-            system_parts.push(skill_prompt);
+            system_blocks.push(SystemContent::text(skill_prompt));
         }
-        let system_prompt = if system_parts.is_empty() {
+        // Mark the last block as cached
+        if let Some(last) = system_blocks.last_mut() {
+            match last {
+                SystemContent::Text { cache_control, .. } => {
+                    *cache_control = Some(CacheControl::ephemeral());
+                }
+            }
+        }
+        let system_prompt = if system_blocks.is_empty() {
             None
         } else {
-            Some(system_parts.join("\n\n"))
+            Some(system_blocks)
         };
 
         let tool_defs = self.tools.tool_definitions();
@@ -232,10 +247,11 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         let messages_to_compact = &state.messages()[..compact_end];
                         let compaction_messages =
                             compaction::build_compaction_request(messages_to_compact);
+                        let compaction_system = [SystemContent::text(COMPACTION_SYSTEM_PROMPT)];
                         match self
                             .llm
                             .send_messages(
-                                Some(COMPACTION_SYSTEM_PROMPT),
+                                Some(&compaction_system),
                                 &compaction_messages,
                                 None,
                             )
@@ -370,34 +386,42 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         // Restore state from snapshot
         let mut state = AgentState::from_snapshot(&snapshot);
 
-        let mut system_parts = Vec::new();
+        let mut system_blocks: Vec<SystemContent> = Vec::new();
         if let Some(ref prompt) = snapshot.system_prompt {
-            system_parts.push(prompt.clone());
+            system_blocks.push(SystemContent::text(prompt.clone()));
         } else if let Some(ref prompt) = self.config.system_prompt {
-            system_parts.push(prompt.clone());
+            system_blocks.push(SystemContent::text(prompt.clone()));
         }
         if let Some(agents_md_prompt) =
             crate::agents_md::inject_agents_md_into_system_prompt(agents_md)
         {
-            system_parts.push(agents_md_prompt);
+            system_blocks.push(SystemContent::text(agents_md_prompt));
         }
         if let Some(cred_prompt) = inject_credentials_into_system_prompt(credentials) {
-            system_parts.push(cred_prompt);
+            system_blocks.push(SystemContent::text(cred_prompt));
         }
         if let Some(ref coord_config) = self.config.coordination_config {
             if let Some(coord_prompt) =
                 crate::coordination::inject_coordination_into_system_prompt(coord_config)
             {
-                system_parts.push(coord_prompt);
+                system_blocks.push(SystemContent::text(coord_prompt));
             }
         }
         if let Some(skill_prompt) = inject_skills_into_system_prompt(skill_set) {
-            system_parts.push(skill_prompt);
+            system_blocks.push(SystemContent::text(skill_prompt));
         }
-        let system_prompt = if system_parts.is_empty() {
+        // Mark the last block as cached
+        if let Some(last) = system_blocks.last_mut() {
+            match last {
+                SystemContent::Text { cache_control, .. } => {
+                    *cache_control = Some(CacheControl::ephemeral());
+                }
+            }
+        }
+        let system_prompt = if system_blocks.is_empty() {
             None
         } else {
-            Some(system_parts.join("\n\n"))
+            Some(system_blocks)
         };
 
         let tool_defs = self.tools.tool_definitions();
@@ -440,10 +464,11 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         let messages_to_compact = &state.messages()[..compact_end];
                         let compaction_messages =
                             compaction::build_compaction_request(messages_to_compact);
+                        let compaction_system = [SystemContent::text(COMPACTION_SYSTEM_PROMPT)];
                         match self
                             .llm
                             .send_messages(
-                                Some(COMPACTION_SYSTEM_PROMPT),
+                                Some(&compaction_system),
                                 &compaction_messages,
                                 None,
                             )
@@ -613,7 +638,7 @@ mod tests {
     impl LlmProvider for MockLlm {
         async fn send_messages(
             &self,
-            _system: Option<&str>,
+            _system: Option<&[SystemContent]>,
             _messages: &[Message],
             _tools: Option<&[ToolDefinition]>,
         ) -> Result<MessagesResponse, AgentError> {
@@ -696,6 +721,7 @@ mod tests {
             name: "navigate".to_string(),
             description: "Navigate to URL".to_string(),
             input_schema: json!({"type": "object", "properties": {"url": {"type": "string"}}}),
+            cache_control: None,
         }]
     }
 
@@ -1023,6 +1049,8 @@ mod tests {
                     usage: Some(Usage {
                         input_tokens: 100,
                         output_tokens: 50,
+                        cache_creation_input_tokens: None,
+                        cache_read_input_tokens: None,
                     }),
                 },
                 MessagesResponse {
@@ -1035,6 +1063,8 @@ mod tests {
                     usage: Some(Usage {
                         input_tokens: 200,
                         output_tokens: 30,
+                        cache_creation_input_tokens: None,
+                        cache_read_input_tokens: None,
                     }),
                 },
             ])),
@@ -1182,11 +1212,18 @@ mod tests {
         impl LlmProvider for CapturingLlm {
             async fn send_messages(
                 &self,
-                system: Option<&str>,
+                system: Option<&[SystemContent]>,
                 _messages: &[Message],
                 _tools: Option<&[ToolDefinition]>,
             ) -> Result<MessagesResponse, AgentError> {
-                *self.captured_system.lock().unwrap() = system.map(|s| s.to_string());
+                *self.captured_system.lock().unwrap() = system.map(|s| {
+                    s.iter()
+                        .map(|c| match c {
+                            SystemContent::Text { text, .. } => text.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                });
                 Ok(make_end_turn_response("Done"))
             }
         }
@@ -1292,7 +1329,7 @@ mod tests {
         assert!(matches!(
             &tool_results[0],
             ContentBlock::ToolResult { content, is_error, .. }
-            if content == "navigated" && is_error.is_none()
+            if *content == ToolResultContent::Text("navigated".to_string()) && is_error.is_none()
         ));
         assert_eq!(step_records[0].tool, "navigate");
     }
@@ -1350,17 +1387,17 @@ mod tests {
         assert!(matches!(
             &tool_results[0],
             ContentBlock::ToolResult { tool_use_id, content, .. }
-            if tool_use_id == "t1" && content == "read_file_result"
+            if tool_use_id == "t1" && *content == ToolResultContent::Text("read_file_result".to_string())
         ));
         assert!(matches!(
             &tool_results[1],
             ContentBlock::ToolResult { tool_use_id, content, .. }
-            if tool_use_id == "t2" && content == "write_file_result"
+            if tool_use_id == "t2" && *content == ToolResultContent::Text("write_file_result".to_string())
         ));
         assert!(matches!(
             &tool_results[2],
             ContentBlock::ToolResult { tool_use_id, content, .. }
-            if tool_use_id == "t3" && content == "grep_result"
+            if tool_use_id == "t3" && *content == ToolResultContent::Text("grep_result".to_string())
         ));
 
         // Step records also in order

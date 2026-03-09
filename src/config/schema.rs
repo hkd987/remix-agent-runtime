@@ -104,6 +104,10 @@ pub struct LlmConfig {
     pub max_tokens: u32,
     #[serde(default)]
     pub custom_headers: HashMap<String, String>,
+    #[serde(default)]
+    pub thinking_budget_tokens: Option<u32>,
+    #[serde(default = "default_true")]
+    pub enable_prompt_caching: bool,
 }
 
 impl Default for LlmConfig {
@@ -114,6 +118,8 @@ impl Default for LlmConfig {
             model: default_model(),
             max_tokens: default_max_tokens(),
             custom_headers: HashMap::new(),
+            thinking_budget_tokens: None,
+            enable_prompt_caching: true,
         }
     }
 }
@@ -735,6 +741,8 @@ url: "https://example.com/hook"
                 model: "test-model".to_string(),
                 max_tokens: 2048,
                 custom_headers: HashMap::new(),
+                thinking_budget_tokens: None,
+                enable_prompt_caching: true,
             },
             browser: BrowserConfig::default(),
             agent: AgentConfig::default(),
