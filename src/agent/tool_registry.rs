@@ -288,7 +288,9 @@ mod tests {
         assert!(schema["properties"]["max_results"].is_object());
         assert_eq!(schema["properties"]["max_results"]["type"], "integer");
 
-        let required = schema["required"].as_array().expect("required should be an array");
+        let required = schema["required"]
+            .as_array()
+            .expect("required should be an array");
         let required_strs: Vec<&str> = required
             .iter()
             .map(|v| v.as_str().expect("required item should be a string"))

@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::borrow::Cow;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -22,6 +23,16 @@ use super::reminders::ReminderScheduler;
 use super::self_critique;
 use super::state::AgentState;
 use super::tool_registry::ToolRegistry;
+
+/// Tools that are always visible in lazy discovery mode (core local tools).
+const ALWAYS_AVAILABLE_TOOLS: &[&str] = &[
+    "read_file",
+    "write_file",
+    "edit_file",
+    "bash",
+    "grep",
+    "glob",
+];
 
 pub struct AgentRunner<L: LlmProvider, T: ToolExecutor> {
     llm: L,
@@ -239,19 +250,17 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             Some(system_blocks)
         };
 
-        // Feature 1: Lazy tool discovery — build registry
+        // Feature 1: Lazy tool discovery — build registry only when needed
         let all_tool_defs = self.tools.tool_definitions().to_vec();
-        let mut tool_registry = ToolRegistry::new(
-            all_tool_defs.clone(),
-            vec![
-                "read_file".to_string(),
-                "write_file".to_string(),
-                "edit_file".to_string(),
-                "bash".to_string(),
-                "grep".to_string(),
-                "glob".to_string(),
-            ],
-        );
+        let mut tool_registry = if self.config.lazy_tool_discovery {
+            let always_avail = ALWAYS_AVAILABLE_TOOLS
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            Some(ToolRegistry::new(all_tool_defs.clone(), always_avail))
+        } else {
+            None
+        };
 
         // Feature 5: System reminders — build scheduler
         let reminder_scheduler = ReminderScheduler::from_configs(&self.config.reminders);
@@ -288,12 +297,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
 
             // Feature 3: Progressive context compaction
             if let Some(compact_config) = compaction_config {
-                self.run_compaction(
-                    compact_config,
-                    &mut state,
-                    compaction_llm,
-                )
-                .await;
+                self.run_compaction(compact_config, &mut state, compaction_llm)
+                    .await;
             }
 
             state.increment_iteration();
@@ -309,18 +314,19 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             }
 
             // Feature 1 + 4: Resolve tool definitions based on mode
-            let effective_tool_defs = if self.config.lazy_tool_discovery {
-                let discovered = tool_registry.discovered_definitions();
-                if self.config.plan_mode {
-                    Self::filter_read_only_tools(&discovered)
+            let effective_tool_defs: Cow<'_, [ToolDefinition]> =
+                if let Some(ref registry) = tool_registry {
+                    let discovered = registry.discovered_definitions();
+                    if self.config.plan_mode {
+                        Cow::Owned(Self::filter_read_only_tools(&discovered))
+                    } else {
+                        Cow::Owned(discovered)
+                    }
+                } else if self.config.plan_mode {
+                    Cow::Owned(Self::filter_read_only_tools(&all_tool_defs))
                 } else {
-                    discovered
-                }
-            } else if self.config.plan_mode {
-                Self::filter_read_only_tools(&all_tool_defs)
-            } else {
-                all_tool_defs.clone()
-            };
+                    Cow::Borrowed(&all_tool_defs)
+                };
 
             let response = self
                 .llm
@@ -363,27 +369,27 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     }
 
                     // Feature 5: Check reminders before tool execution
-                    let pending_tool_names: Vec<String> = assistant_content
-                        .iter()
-                        .filter_map(|b| match b {
-                            ContentBlock::ToolUse { name, .. } => Some(name.clone()),
-                            _ => None,
-                        })
-                        .collect();
-                    let tool_reminders =
-                        reminder_scheduler.check(state.current_iteration(), &pending_tool_names);
-                    for reminder in tool_reminders {
-                        state.inject_system_notification(&reminder);
+                    if !reminder_scheduler.is_empty() {
+                        let pending_tool_names: Vec<String> = assistant_content
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::ToolUse { name, .. } => Some(name.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        let tool_reminders = reminder_scheduler
+                            .check(state.current_iteration(), &pending_tool_names);
+                        for reminder in tool_reminders {
+                            state.inject_system_notification(&reminder);
+                        }
                     }
 
                     // Feature 6: Self-critique phase
                     if let Some(ref critique_config) = self.config.self_critique {
                         if self_critique::should_critique(critique_config, &assistant_content) {
                             debug!("Running self-critique on planned actions");
-                            let critique_prompt = self_critique::build_critique_prompt(
-                                &assistant_content,
-                                task,
-                            );
+                            let critique_prompt =
+                                self_critique::build_critique_prompt(&assistant_content, task);
                             let critique_system =
                                 [SystemContent::text(self_critique::CRITIQUE_SYSTEM_PROMPT)];
                             let critique_messages = vec![crate::llm::types::Message {
@@ -394,11 +400,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                             }];
                             if let Ok(critique_response) = self
                                 .llm
-                                .send_messages(
-                                    Some(&critique_system),
-                                    &critique_messages,
-                                    None,
-                                )
+                                .send_messages(Some(&critique_system), &critique_messages, None)
                                 .await
                             {
                                 let critique_text = critique_response
@@ -433,7 +435,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         .execute_tools_with_registry(
                             &assistant_content,
                             state.current_iteration(),
-                            &mut tool_registry,
+                            tool_registry.as_mut(),
                         )
                         .await;
                     for step in step_records {
@@ -482,12 +484,12 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         }
     }
 
-    /// Execute tools with registry support for search_tools interception and plan mode blocking.
+    /// Execute tools with optional registry support for search_tools interception and plan mode blocking.
     async fn execute_tools_with_registry(
         &self,
         assistant_content: &[ContentBlock],
         iteration: u32,
-        registry: &mut ToolRegistry,
+        mut registry: Option<&mut ToolRegistry>,
     ) -> (Vec<ContentBlock>, Vec<StepRecord>) {
         let mut tool_results = Vec::new();
         let mut step_records = Vec::new();
@@ -497,36 +499,36 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 ContentBlock::ToolUse { id, name, input } => {
                     // Feature 1: Intercept search_tools meta-tool
                     if ToolRegistry::is_search_tool(name) {
-                        debug!(tool = %name, "Intercepting search_tools meta-tool");
-                        let step_start = Instant::now();
-                        let query = input
-                            .get("query")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let max_results = input
-                            .get("max_results")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(5) as usize;
-                        let results = registry.search(query, max_results);
-                        let result_text = ToolRegistry::format_search_results(&results);
-                        let step_duration = step_start.elapsed().as_millis() as u64;
+                        if let Some(ref mut reg) = registry {
+                            debug!(tool = %name, "Intercepting search_tools meta-tool");
+                            let step_start = Instant::now();
+                            let query = input.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                            let max_results = input
+                                .get("max_results")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(5)
+                                as usize;
+                            let results = reg.search(query, max_results);
+                            let result_text = ToolRegistry::format_search_results(&results);
+                            let step_duration = step_start.elapsed().as_millis() as u64;
 
-                        let step = StepRecord {
-                            iteration,
-                            tool: name.to_string(),
-                            input: input.clone(),
-                            output: Value::String(result_text.clone()),
-                            duration_ms: step_duration,
-                            is_error: None,
-                        };
-                        let result_block = ContentBlock::ToolResult {
-                            tool_use_id: id.to_string(),
-                            content: ToolResultContent::Text(result_text),
-                            is_error: None,
-                        };
-                        tool_results.push(result_block);
-                        step_records.push(step);
-                        continue;
+                            let step = StepRecord {
+                                iteration,
+                                tool: name.to_string(),
+                                input: input.clone(),
+                                output: Value::String(result_text.clone()),
+                                duration_ms: step_duration,
+                                is_error: None,
+                            };
+                            let result_block = ContentBlock::ToolResult {
+                                tool_use_id: id.to_string(),
+                                content: ToolResultContent::Text(result_text),
+                                is_error: None,
+                            };
+                            tool_results.push(result_block);
+                            step_records.push(step);
+                            continue;
+                        } // if let Some(ref mut reg)
                     }
 
                     // Feature 4: Block non-read-only tools in plan mode
@@ -749,17 +751,15 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         };
 
         let all_tool_defs = self.tools.tool_definitions().to_vec();
-        let mut tool_registry = ToolRegistry::new(
-            all_tool_defs.clone(),
-            vec![
-                "read_file".to_string(),
-                "write_file".to_string(),
-                "edit_file".to_string(),
-                "bash".to_string(),
-                "grep".to_string(),
-                "glob".to_string(),
-            ],
-        );
+        let mut tool_registry = if self.config.lazy_tool_discovery {
+            let always_avail = ALWAYS_AVAILABLE_TOOLS
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            Some(ToolRegistry::new(all_tool_defs.clone(), always_avail))
+        } else {
+            None
+        };
         let reminder_scheduler = ReminderScheduler::from_configs(&self.config.reminders);
         let timeout_ms = self.config.timeout_secs * 1000;
         let session_metadata = session_store.load_metadata(session_id).await.ok();
@@ -797,26 +797,26 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
 
             // System reminders
             if !reminder_scheduler.is_empty() {
-                let reminders =
-                    reminder_scheduler.check(state.current_iteration(), &[]);
+                let reminders = reminder_scheduler.check(state.current_iteration(), &[]);
                 for reminder in reminders {
                     state.inject_system_notification(&reminder);
                 }
             }
 
             // Resolve tool definitions
-            let effective_tool_defs = if self.config.lazy_tool_discovery {
-                let discovered = tool_registry.discovered_definitions();
-                if self.config.plan_mode {
-                    Self::filter_read_only_tools(&discovered)
+            let effective_tool_defs: Cow<'_, [ToolDefinition]> =
+                if let Some(ref registry) = tool_registry {
+                    let discovered = registry.discovered_definitions();
+                    if self.config.plan_mode {
+                        Cow::Owned(Self::filter_read_only_tools(&discovered))
+                    } else {
+                        Cow::Owned(discovered)
+                    }
+                } else if self.config.plan_mode {
+                    Cow::Owned(Self::filter_read_only_tools(&all_tool_defs))
                 } else {
-                    discovered
-                }
-            } else if self.config.plan_mode {
-                Self::filter_read_only_tools(&all_tool_defs)
-            } else {
-                all_tool_defs.clone()
-            };
+                    Cow::Borrowed(&all_tool_defs)
+                };
 
             let response = self
                 .llm
@@ -860,19 +860,15 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         .execute_tools_with_registry(
                             &assistant_content,
                             state.current_iteration(),
-                            &mut tool_registry,
+                            tool_registry.as_mut(),
                         )
                         .await;
                     for step in step_records {
                         state.record_step(step);
                     }
                     state.add_tool_results(tool_results);
-                    self.persist_session_iteration(
-                        Some(session_store),
-                        &session_metadata,
-                        &state,
-                    )
-                    .await;
+                    self.persist_session_iteration(Some(session_store), &session_metadata, &state)
+                        .await;
 
                     // Check for inter-agent messages
                     if let Some(messages) = self.tools.check_inbox().await {

@@ -12,6 +12,46 @@ pub enum CompactionStage {
     LowValuePruning,
 }
 
+/// Maximum characters to keep in summarized tool results.
+const SUMMARY_TRUNCATE_CHARS: usize = 100;
+
+/// Truncate a string at a safe UTF-8 char boundary.
+/// Returns true if truncation occurred.
+fn truncate_text(text: &mut String, max_chars: usize) -> bool {
+    if text.len() <= max_chars {
+        return false;
+    }
+    let original_len = text.len();
+    // Find a safe byte boundary at or before max_chars
+    let safe_end = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= max_chars)
+        .last()
+        .unwrap_or(0);
+    *text = format!(
+        "{}... [truncated from {} to {} chars]",
+        &text[..safe_end],
+        original_len,
+        safe_end
+    );
+    true
+}
+
+/// Truncate a string slice at a safe UTF-8 char boundary, returning the truncated &str.
+fn safe_truncate(s: &str, max_chars: usize) -> &str {
+    if s.len() <= max_chars {
+        return s;
+    }
+    let safe_end = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= max_chars)
+        .last()
+        .unwrap_or(0);
+    &s[..safe_end]
+}
+
 /// Determine which compaction stage should be applied based on current token usage.
 /// Returns None if no compaction is needed yet.
 pub fn determine_stage(
@@ -43,30 +83,14 @@ pub fn compress_tool_outputs(messages: &mut [Message], max_chars: usize) -> usiz
             if let ContentBlock::ToolResult { content, .. } = block {
                 match content {
                     ToolResultContent::Text(text) => {
-                        if text.len() > max_chars {
-                            let original_len = text.len();
-                            let truncated = format!(
-                                "{}... [truncated from {} to {} chars]",
-                                &text[..max_chars],
-                                original_len,
-                                max_chars
-                            );
-                            *text = truncated;
+                        if truncate_text(text, max_chars) {
                             compressed_count += 1;
                         }
                     }
                     ToolResultContent::Blocks(blocks) => {
                         for inner_block in blocks.iter_mut() {
                             if let ContentBlock::Text { text } = inner_block {
-                                if text.len() > max_chars {
-                                    let original_len = text.len();
-                                    let truncated = format!(
-                                        "{}... [truncated from {} to {} chars]",
-                                        &text[..max_chars],
-                                        original_len,
-                                        max_chars
-                                    );
-                                    *text = truncated;
+                                if truncate_text(text, max_chars) {
                                     compressed_count += 1;
                                 }
                             }
@@ -79,53 +103,74 @@ pub fn compress_tool_outputs(messages: &mut [Message], max_chars: usize) -> usiz
     compressed_count
 }
 
-/// Stage 2: Merge consecutive ToolUse -> ToolResult pairs into condensed text summaries.
-/// Returns a new message list with merged observations.
-/// Only merges pairs in the first `messages.len() - preserve_recent_n` messages (preserves recent messages).
-pub fn merge_observations(messages: &[Message], preserve_recent_n: usize) -> Vec<Message> {
+/// Detect whether a message contains a ToolUse block (assistant) or ToolResult block (user).
+fn is_tool_use_msg(msg: &Message) -> bool {
+    matches!(msg.role, Role::Assistant)
+        && msg
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+}
+
+fn is_tool_result_msg(msg: &Message) -> bool {
+    matches!(msg.role, Role::User)
+        && msg
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+}
+
+fn is_all_tool_results(msg: &Message) -> bool {
+    matches!(msg.role, Role::User)
+        && msg
+            .content
+            .iter()
+            .all(|b| matches!(b, ContentBlock::ToolResult { .. }))
+}
+
+/// Walk messages up to `preserve_recent_n` from the end, applying `on_pair` to
+/// each consecutive ToolUse->ToolResult pair. The closure returns replacement
+/// messages: empty to drop the pair, one to merge, two to keep both.
+/// Non-pair messages are kept as-is.
+fn process_tool_pairs<F>(messages: &[Message], preserve_recent_n: usize, on_pair: F) -> Vec<Message>
+where
+    F: Fn(&Message, &Message) -> Vec<Message>,
+{
     if messages.len() <= preserve_recent_n {
         return messages.to_vec();
     }
 
-    let merge_boundary = messages.len() - preserve_recent_n;
+    let boundary = messages.len() - preserve_recent_n;
     let mut result: Vec<Message> = Vec::new();
     let mut i = 0;
 
-    while i < merge_boundary {
-        // Look for pattern: Assistant with ToolUse -> User with ToolResult
-        if i + 1 < merge_boundary {
-            let is_tool_use = matches!(messages[i].role, Role::Assistant)
-                && messages[i]
-                    .content
-                    .iter()
-                    .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
-            let is_tool_result = matches!(messages[i + 1].role, Role::User)
-                && messages[i + 1]
-                    .content
-                    .iter()
-                    .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
-
-            if is_tool_use && is_tool_result {
-                // Merge into a summary
-                let summary = summarize_tool_pair(&messages[i], &messages[i + 1]);
-                result.push(Message {
-                    role: Role::User,
-                    content: vec![ContentBlock::Text { text: summary }],
-                });
-                i += 2;
-                continue;
-            }
+    while i < boundary {
+        if i + 1 < boundary && is_tool_use_msg(&messages[i]) && is_tool_result_msg(&messages[i + 1])
+        {
+            let replacements = on_pair(&messages[i], &messages[i + 1]);
+            result.extend(replacements);
+            i += 2;
+        } else {
+            result.push(messages[i].clone());
+            i += 1;
         }
-        result.push(messages[i].clone());
-        i += 1;
     }
 
-    // Append preserved recent messages
-    for msg in &messages[merge_boundary..] {
-        result.push(msg.clone());
-    }
-
+    result.extend_from_slice(&messages[boundary..]);
     result
+}
+
+/// Stage 2: Merge consecutive ToolUse -> ToolResult pairs into condensed text summaries.
+/// Returns a new message list with merged observations.
+/// Only merges pairs in the first `messages.len() - preserve_recent_n` messages (preserves recent messages).
+pub fn merge_observations(messages: &[Message], preserve_recent_n: usize) -> Vec<Message> {
+    process_tool_pairs(messages, preserve_recent_n, |tool_use, tool_result| {
+        let summary = summarize_tool_pair(tool_use, tool_result);
+        vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: summary }],
+        }]
+    })
 }
 
 /// Summarize a ToolUse + ToolResult pair into a condensed text.
@@ -143,15 +188,15 @@ fn summarize_tool_pair(tool_use_msg: &Message, tool_result_msg: &Message) -> Str
             content, is_error, ..
         } = block
         {
-            let error_tag = if is_error == &Some(true) {
+            let error_tag = if matches!(is_error, Some(true)) {
                 " (ERROR)"
             } else {
                 ""
             };
             let text = match content {
                 ToolResultContent::Text(s) => {
-                    if s.len() > 100 {
-                        format!("{}...", &s[..100])
+                    if s.len() > SUMMARY_TRUNCATE_CHARS {
+                        format!("{}...", safe_truncate(s, SUMMARY_TRUNCATE_CHARS))
                     } else {
                         s.clone()
                     }
@@ -180,46 +225,17 @@ pub fn prune_low_value(
     preserve_recent_n: usize,
     min_value_chars: usize,
 ) -> Vec<Message> {
-    if messages.len() <= preserve_recent_n {
-        return messages.to_vec();
-    }
-
-    let merge_boundary = messages.len() - preserve_recent_n;
-    let mut result: Vec<Message> = Vec::new();
-    let mut i = 0;
-
-    while i < merge_boundary {
-        // Look for low-value ToolUse -> ToolResult pairs
-        if i + 1 < merge_boundary {
-            let is_tool_use = matches!(messages[i].role, Role::Assistant)
-                && messages[i]
-                    .content
-                    .iter()
-                    .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
-            let is_tool_result = matches!(messages[i + 1].role, Role::User)
-                && messages[i + 1]
-                    .content
-                    .iter()
-                    .all(|b| matches!(b, ContentBlock::ToolResult { .. }));
-
-            if is_tool_use && is_tool_result {
-                let is_low = is_low_value_exchange(&messages[i + 1], min_value_chars);
-                if is_low {
-                    i += 2; // Skip the pair
-                    continue;
-                }
-            }
+    process_tool_pairs(messages, preserve_recent_n, |tool_use, tool_result| {
+        // prune_low_value requires ALL blocks to be ToolResult (stricter check)
+        if !is_all_tool_results(tool_result) {
+            return vec![tool_use.clone(), tool_result.clone()];
         }
-        result.push(messages[i].clone());
-        i += 1;
-    }
-
-    // Append preserved recent messages
-    for msg in &messages[merge_boundary..] {
-        result.push(msg.clone());
-    }
-
-    result
+        if is_low_value_exchange(tool_result, min_value_chars) {
+            vec![] // Drop low-value pair
+        } else {
+            vec![tool_use.clone(), tool_result.clone()] // Keep both
+        }
+    })
 }
 
 /// Determine if a tool result message represents a low-value exchange.
@@ -231,7 +247,7 @@ fn is_low_value_exchange(result_msg: &Message, min_value_chars: usize) -> bool {
         } = block
         {
             // Errors are always valuable
-            if is_error == &Some(true) {
+            if matches!(is_error, Some(true)) {
                 return false;
             }
             match content {
@@ -668,9 +684,7 @@ mod tests {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: "toolu_1".to_string(),
-                content: ToolResultContent::Blocks(vec![ContentBlock::Text {
-                    text: long_text,
-                }]),
+                content: ToolResultContent::Blocks(vec![ContentBlock::Text { text: long_text }]),
                 is_error: None,
             }],
         }];
@@ -779,10 +793,7 @@ mod tests {
 
     #[test]
     fn test_compress_tool_outputs_skips_non_tool_result_blocks() {
-        let mut messages = vec![
-            make_user_text("Hello"),
-            make_assistant_text("World"),
-        ];
+        let mut messages = vec![make_user_text("Hello"), make_assistant_text("World")];
 
         let count = compress_tool_outputs(&mut messages, 500);
         assert_eq!(count, 0);

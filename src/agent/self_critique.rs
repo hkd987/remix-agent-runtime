@@ -100,12 +100,7 @@ pub fn parse_critique_response(response_text: &str) -> CritiqueResult {
     let reasoning = response_text
         .lines()
         .find(|l| l.to_lowercase().starts_with("reasoning:"))
-        .map(|l| {
-            l.get("reasoning:".len()..)
-                .unwrap_or(l)
-                .trim()
-                .to_string()
-        })
+        .map(|l| l.get("reasoning:".len()..).unwrap_or(l).trim().to_string())
         .unwrap_or_else(|| response_text.to_string());
 
     let suggestions = response_text
@@ -163,7 +158,10 @@ mod tests {
     #[test]
     fn test_should_critique_disabled() {
         let config = SelfCritiqueConfig::default();
-        let actions = vec![make_tool_use("navigate", json!({"url": "https://example.com"}))];
+        let actions = vec![make_tool_use(
+            "navigate",
+            json!({"url": "https://example.com"}),
+        )];
         assert!(!should_critique(&config, &actions));
     }
 
@@ -195,7 +193,10 @@ mod tests {
             trigger_tools: Some(vec!["navigate".to_string(), "execute".to_string()]),
             ..Default::default()
         };
-        let actions = vec![make_tool_use("navigate", json!({"url": "https://example.com"}))];
+        let actions = vec![make_tool_use(
+            "navigate",
+            json!({"url": "https://example.com"}),
+        )];
         assert!(should_critique(&config, &actions));
     }
 
@@ -212,8 +213,12 @@ mod tests {
 
     #[test]
     fn test_build_critique_prompt_includes_task_context() {
-        let actions = vec![make_tool_use("navigate", json!({"url": "https://example.com"}))];
-        let prompt = build_critique_prompt(&actions, "Navigate to example.com and take a screenshot");
+        let actions = vec![make_tool_use(
+            "navigate",
+            json!({"url": "https://example.com"}),
+        )];
+        let prompt =
+            build_critique_prompt(&actions, "Navigate to example.com and take a screenshot");
         assert!(prompt.contains("Navigate to example.com and take a screenshot"));
         assert!(prompt.contains("## Current Task Context"));
     }
@@ -260,7 +265,8 @@ mod tests {
 
     #[test]
     fn test_parse_critique_response_with_suggestions() {
-        let response = "APPROVED: yes\nREASONING: Mostly fine.\nSUGGESTIONS: Add a timeout parameter.";
+        let response =
+            "APPROVED: yes\nREASONING: Mostly fine.\nSUGGESTIONS: Add a timeout parameter.";
         let result = parse_critique_response(response);
         assert!(result.approved);
         assert_eq!(
@@ -281,7 +287,7 @@ mod tests {
         let response = "This is not in the expected format at all.";
         let result = parse_critique_response(response);
         assert!(result.approved); // fail-open
-        // Reasoning falls back to the full response text
+                                  // Reasoning falls back to the full response text
         assert_eq!(result.reasoning, response);
         assert!(result.suggestions.is_none());
     }
