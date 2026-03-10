@@ -71,6 +71,16 @@ impl AgentState {
         &self.messages
     }
 
+    /// Get mutable access to messages (for in-place compaction stages).
+    pub fn messages_mut(&mut self) -> &mut [Message] {
+        &mut self.messages
+    }
+
+    /// Replace the entire message history (used by compaction stages).
+    pub fn replace_messages(&mut self, messages: Vec<Message>) {
+        self.messages = messages;
+    }
+
     pub fn current_iteration(&self) -> u32 {
         self.iteration
     }

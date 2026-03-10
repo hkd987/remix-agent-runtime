@@ -50,6 +50,7 @@ impl MockBackend {
                 description: format!("{prefix} tool: {name}"),
                 input_schema: json!({"type": "object"}),
                 cache_control: None,
+                read_only: false,
             })
             .collect();
         Self {
@@ -91,6 +92,7 @@ impl ShutdownTrackingBackend {
                 description: format!("tracked: {name}"),
                 input_schema: json!({"type": "object"}),
                 cache_control: None,
+                read_only: false,
             }],
             shutdown_flag: flag,
         }

@@ -782,6 +782,7 @@ mod tests {
                 "required": ["url"]
             }),
             cache_control: None,
+            read_only: false,
         }];
 
         let messages = vec![Message {

@@ -30,6 +30,10 @@ pub struct TenantContext {
     pub max_budget_usd: Option<f64>,
     pub max_concurrent_agents: u32,
     pub custom_headers: HashMap<String, String>,
+    /// Dedicated model for compaction summarization (e.g., "claude-haiku-4-5-20251001").
+    /// When None, the primary model is used.
+    #[serde(default)]
+    pub compaction_model: Option<String>,
 }
 
 impl TenantContext {
@@ -47,6 +51,7 @@ impl TenantContext {
             max_budget_usd: None,
             max_concurrent_agents: 5,
             custom_headers: HashMap::new(),
+            compaction_model: None,
         }
     }
 }
@@ -127,6 +132,7 @@ mod tests {
             max_budget_usd: Some(10.0),
             max_concurrent_agents: 3,
             custom_headers: headers,
+            compaction_model: None,
         };
 
         let json = serde_json::to_string(&ctx).unwrap();

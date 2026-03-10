@@ -117,6 +117,7 @@ mod tests {
                 description: format!("{n} tool"),
                 input_schema: json!({"type": "object"}),
                 cache_control: None,
+                read_only: false,
             })
             .collect();
         MockExecutor {

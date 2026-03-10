@@ -185,6 +185,10 @@ impl<L: LlmProvider + 'static> SpawnHandler for DefaultSpawnHandler<L> {
             coordination_config: Some(self.coordination_config.clone()),
             tool_result_max_bytes: 32_768,
             max_budget_usd: None,
+            lazy_tool_discovery: false,
+            plan_mode: false,
+            reminders: Vec::new(),
+            self_critique: None,
         };
 
         // 4. Create AgentRunner and tokio::spawn
@@ -250,6 +254,7 @@ mod tests {
                         description: format!("Tool {name}"),
                         input_schema: json!({"type": "object"}),
                         cache_control: None,
+                        read_only: false,
                     })
                     .collect(),
             }

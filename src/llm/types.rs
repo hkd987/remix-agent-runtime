@@ -117,6 +117,9 @@ pub struct ToolDefinition {
     pub input_schema: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
+    /// Whether this tool only reads state (not sent to API, used for plan mode filtering).
+    #[serde(skip)]
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -358,6 +361,7 @@ mod tests {
                     "required": ["url"]
                 }),
                 cache_control: None,
+                read_only: false,
             }]),
             thinking: None,
             stream: None,
@@ -576,6 +580,7 @@ mod tests {
                 "required": []
             }),
             cache_control: None,
+            read_only: false,
         };
 
         let json_str = serde_json::to_string(&tool).unwrap();
@@ -893,6 +898,7 @@ mod tests {
             description: "Navigate to a URL".to_string(),
             input_schema: json!({"type": "object", "properties": {}}),
             cache_control: Some(CacheControl::ephemeral()),
+            read_only: false,
         };
         let json = serde_json::to_value(&tool).unwrap();
         assert_eq!(json["cache_control"]["type"], "ephemeral");

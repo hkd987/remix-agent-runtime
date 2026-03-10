@@ -370,6 +370,7 @@ async fn main() -> ExitCode {
                         &skill_set,
                         &agents_md,
                         compaction_config.as_ref(),
+                        None,
                     )
                     .await
             } else if let Some(ref fork_id) = args.fork_session {
@@ -394,6 +395,7 @@ async fn main() -> ExitCode {
                                 &skill_set,
                                 &agents_md,
                                 compaction_config.as_ref(),
+                                None,
                             )
                             .await
                     }
@@ -413,6 +415,7 @@ async fn main() -> ExitCode {
                             .as_ref()
                             .map(|s| s as &dyn remix_agent_runtime::session::SessionStorage),
                         compaction_config.as_ref(),
+                        None,
                     )
                     .await
             };

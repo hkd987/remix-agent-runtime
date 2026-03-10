@@ -103,6 +103,7 @@ mod tests {
                         description: format!("Tool {name}"),
                         input_schema: json!({"type": "object"}),
                         cache_control: None,
+                        read_only: false,
                     })
                     .collect(),
             }
