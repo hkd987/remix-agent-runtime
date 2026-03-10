@@ -15,6 +15,22 @@ pub fn create_tenant_llm(context: &TenantContext) -> AnthropicClient {
     )
 }
 
+/// Create a dedicated AnthropicClient for compaction, using a cheaper model.
+/// Returns None if no compaction_model is configured (falls back to primary LLM).
+pub fn create_compaction_llm(context: &TenantContext) -> Option<AnthropicClient> {
+    context.compaction_model.as_ref().map(|model| {
+        AnthropicClient::new(
+            crate::config::schema::default_base_url(),
+            context.api_key.clone(),
+            model.clone(),
+            4096, // compaction responses are short summaries
+            context.custom_headers.clone(),
+            None,  // no thinking for compaction
+            false, // no prompt caching for compaction
+        )
+    })
+}
+
 /// Create an AgentConfig from tenant context.
 pub fn create_tenant_config(context: &TenantContext) -> AgentConfig {
     AgentConfig {
@@ -24,6 +40,10 @@ pub fn create_tenant_config(context: &TenantContext) -> AgentConfig {
         coordination_config: None,
         tool_result_max_bytes: 32768,
         max_budget_usd: context.max_budget_usd,
+        lazy_tool_discovery: false,
+        plan_mode: false,
+        reminders: Vec::new(),
+        self_critique: None,
     }
 }
 
@@ -57,6 +77,7 @@ mod tests {
             timeout_secs: 180,
             max_budget_usd: Some(5.0),
             max_concurrent_agents: 2,
+            compaction_model: None,
             custom_headers: headers,
         }
     }

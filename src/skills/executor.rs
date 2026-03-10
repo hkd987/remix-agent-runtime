@@ -327,6 +327,7 @@ fn virtual_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["name"]
             }),
             cache_control: None,
+            read_only: false,
         },
         ToolDefinition {
             name: "run_skill_script".to_string(),
@@ -351,6 +352,7 @@ fn virtual_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["skill_name", "script"]
             }),
             cache_control: None,
+            read_only: false,
         },
         ToolDefinition {
             name: "read_skill_resource".to_string(),
@@ -370,6 +372,7 @@ fn virtual_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["skill_name", "path"]
             }),
             cache_control: None,
+            read_only: false,
         },
     ]
 }
@@ -411,6 +414,7 @@ mod tests {
                 description: "Navigate to URL".to_string(),
                 input_schema: json!({"type": "object"}),
                 cache_control: None,
+                read_only: false,
             }],
         }
     }

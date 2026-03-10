@@ -184,6 +184,18 @@ pub struct AgentConfig {
     pub tool_result_max_bytes: usize,
     #[serde(default)]
     pub max_budget_usd: Option<f64>,
+    /// When true, only discovered + always-available tools are sent to the LLM.
+    #[serde(default)]
+    pub lazy_tool_discovery: bool,
+    /// When true, restricts available tools to read-only operations.
+    #[serde(default)]
+    pub plan_mode: bool,
+    /// System reminders injected at key points during long sessions.
+    #[serde(default)]
+    pub reminders: Vec<ReminderConfig>,
+    /// Self-critique phase configuration.
+    #[serde(default)]
+    pub self_critique: Option<SelfCritiqueConfig>,
 }
 
 fn default_coordination_config() -> Option<CoordinationConfig> {
@@ -199,6 +211,56 @@ impl Default for AgentConfig {
             coordination_config: Some(CoordinationConfig::default()),
             tool_result_max_bytes: default_tool_result_max_bytes(),
             max_budget_usd: None,
+            lazy_tool_discovery: false,
+            plan_mode: false,
+            reminders: Vec::new(),
+            self_critique: None,
+        }
+    }
+}
+
+/// Configuration for a system reminder.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReminderConfig {
+    pub content: String,
+    #[serde(default)]
+    pub every_n_iterations: Option<u32>,
+    #[serde(default)]
+    pub before_tools: Option<Vec<String>>,
+}
+
+fn default_critique_max_tokens() -> u32 {
+    2048
+}
+
+fn default_max_critique_rounds() -> u32 {
+    2
+}
+
+/// Configuration for the self-critique phase.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SelfCritiqueConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default = "default_critique_max_tokens")]
+    pub max_tokens: u32,
+    /// If specified, only critique when these tools are being used. If None, critique all.
+    #[serde(default)]
+    pub trigger_tools: Option<Vec<String>>,
+    #[serde(default = "default_max_critique_rounds")]
+    pub max_rounds: u32,
+}
+
+impl Default for SelfCritiqueConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: None,
+            max_tokens: 2048,
+            trigger_tools: None,
+            max_rounds: 2,
         }
     }
 }
@@ -433,6 +495,19 @@ pub struct CompactionConfig {
     pub context_window_tokens: u32,
     #[serde(default = "default_preserve_recent_n")]
     pub preserve_recent_n: usize,
+    /// Dedicated model for compaction (e.g., "claude-haiku-4-5-20251001"). Falls back to primary model if None.
+    #[serde(default)]
+    pub compaction_model: Option<String>,
+    /// Max tokens for the compaction model response. Defaults to 4096.
+    #[serde(default = "default_compaction_max_tokens")]
+    pub compaction_max_tokens: Option<u32>,
+    /// Progressive compaction stage thresholds. When None, uses legacy single-pass compaction.
+    #[serde(default)]
+    pub stage_thresholds: Option<StageThresholds>,
+}
+
+fn default_compaction_max_tokens() -> Option<u32> {
+    None
 }
 
 impl Default for CompactionConfig {
@@ -442,6 +517,49 @@ impl Default for CompactionConfig {
             trigger_threshold: 0.95,
             context_window_tokens: 200_000,
             preserve_recent_n: 4,
+            compaction_model: None,
+            compaction_max_tokens: None,
+            stage_thresholds: None,
+        }
+    }
+}
+
+fn default_tool_output_threshold() -> f32 {
+    0.60
+}
+
+fn default_observation_merging_threshold() -> f32 {
+    0.75
+}
+
+fn default_conversation_summary_threshold() -> f32 {
+    0.85
+}
+
+fn default_low_value_pruning_threshold() -> f32 {
+    0.95
+}
+
+/// Per-stage trigger thresholds as fractions of the context window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageThresholds {
+    #[serde(default = "default_tool_output_threshold")]
+    pub tool_output_compression: f32,
+    #[serde(default = "default_observation_merging_threshold")]
+    pub observation_merging: f32,
+    #[serde(default = "default_conversation_summary_threshold")]
+    pub conversation_summary: f32,
+    #[serde(default = "default_low_value_pruning_threshold")]
+    pub low_value_pruning: f32,
+}
+
+impl Default for StageThresholds {
+    fn default() -> Self {
+        Self {
+            tool_output_compression: 0.60,
+            observation_merging: 0.75,
+            conversation_summary: 0.85,
+            low_value_pruning: 0.95,
         }
     }
 }

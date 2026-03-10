@@ -127,6 +127,7 @@ fn local_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["path"]
             }),
             cache_control: None,
+            read_only: false,
         },
         ToolDefinition {
             name: "write_file".to_string(),
@@ -140,6 +141,7 @@ fn local_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["path", "content"]
             }),
             cache_control: None,
+            read_only: false,
         },
         ToolDefinition {
             name: "edit_file".to_string(),
@@ -154,6 +156,7 @@ fn local_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["path", "old_string", "new_string"]
             }),
             cache_control: None,
+            read_only: false,
         },
         ToolDefinition {
             name: "bash".to_string(),
@@ -167,6 +170,7 @@ fn local_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["command"]
             }),
             cache_control: None,
+            read_only: false,
         },
         ToolDefinition {
             name: "grep".to_string(),
@@ -182,6 +186,7 @@ fn local_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["pattern"]
             }),
             cache_control: None,
+            read_only: false,
         },
         ToolDefinition {
             name: "glob".to_string(),
@@ -195,6 +200,7 @@ fn local_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["pattern"]
             }),
             cache_control: None,
+            read_only: false,
         },
     ]
 }
@@ -235,6 +241,7 @@ mod tests {
                 description: "Navigate to URL".to_string(),
                 input_schema: json!({"type": "object"}),
                 cache_control: None,
+                read_only: false,
             }],
         }
     }

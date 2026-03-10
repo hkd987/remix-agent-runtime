@@ -103,6 +103,7 @@ impl<T: ToolExecutor> CoordinationExecutor<T> {
                     "required": ["subject", "description"]
                 }),
                 cache_control: None,
+                read_only: false,
             },
             ToolDefinition {
                 name: "task_list".to_string(),
@@ -113,6 +114,7 @@ impl<T: ToolExecutor> CoordinationExecutor<T> {
                     "required": []
                 }),
                 cache_control: None,
+                read_only: false,
             },
             ToolDefinition {
                 name: "task_get".to_string(),
@@ -128,6 +130,7 @@ impl<T: ToolExecutor> CoordinationExecutor<T> {
                     "required": ["task_id"]
                 }),
                 cache_control: None,
+                read_only: false,
             },
             ToolDefinition {
                 name: "task_update".to_string(),
@@ -178,6 +181,7 @@ impl<T: ToolExecutor> CoordinationExecutor<T> {
                     "required": ["task_id"]
                 }),
                 cache_control: None,
+                read_only: false,
             },
             ToolDefinition {
                 name: "team_create".to_string(),
@@ -197,6 +201,7 @@ impl<T: ToolExecutor> CoordinationExecutor<T> {
                     "required": ["team_name"]
                 }),
                 cache_control: None,
+                read_only: false,
             },
             ToolDefinition {
                 name: "send_message".to_string(),
@@ -233,6 +238,7 @@ impl<T: ToolExecutor> CoordinationExecutor<T> {
                     "required": ["type", "content"]
                 }),
                 cache_control: None,
+                read_only: false,
             },
             ToolDefinition {
                 name: "spawn_agent".to_string(),
@@ -265,6 +271,7 @@ impl<T: ToolExecutor> CoordinationExecutor<T> {
                     "required": ["name", "task"]
                 }),
                 cache_control: None,
+                read_only: false,
             },
         ]
     }
@@ -834,6 +841,7 @@ mod tests {
                         description: format!("Tool {name}"),
                         input_schema: json!({"type": "object"}),
                         cache_control: None,
+                        read_only: false,
                     })
                     .collect(),
             }

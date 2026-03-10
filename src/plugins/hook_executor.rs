@@ -389,6 +389,7 @@ mod tests {
                 description: "Navigate to URL".to_string(),
                 input_schema: json!({"type": "object"}),
                 cache_control: None,
+                read_only: false,
             }],
             response: ToolExecutionResult {
                 content: "Page loaded".to_string(),
@@ -703,6 +704,7 @@ mod tests {
                 description: "Navigate".to_string(),
                 input_schema: json!({"type": "object"}),
                 cache_control: None,
+                read_only: false,
             }],
             response: ToolExecutionResult {
                 content: "Error: not found".to_string(),

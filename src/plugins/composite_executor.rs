@@ -100,6 +100,7 @@ mod tests {
                     description: format!("{prefix} tool: {name}"),
                     input_schema: json!({"type": "object"}),
                     cache_control: None,
+                    read_only: false,
                 })
                 .collect();
             Self {

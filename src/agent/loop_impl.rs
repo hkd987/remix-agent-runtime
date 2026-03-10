@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::borrow::Cow;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -7,7 +8,9 @@ use crate::config::credentials::{inject_credentials_into_system_prompt, Credenti
 use crate::config::schema::{AgentConfig, CompactionConfig};
 use crate::error::AgentError;
 use crate::llm::client::LlmProvider;
-use crate::llm::types::{CacheControl, ContentBlock, StopReason, SystemContent, ToolResultContent};
+use crate::llm::types::{
+    CacheControl, ContentBlock, StopReason, SystemContent, ToolDefinition, ToolResultContent,
+};
 use crate::output::result::{AgentResult, AgentStatus, StepRecord};
 use crate::session::types::{SessionId, SessionStatus};
 use crate::session::SessionStorage;
@@ -15,7 +18,21 @@ use crate::skills::{inject_skills_into_system_prompt, SkillSet};
 
 use super::compaction;
 use super::compaction_prompt::COMPACTION_SYSTEM_PROMPT;
+use super::compaction_stages;
+use super::reminders::ReminderScheduler;
+use super::self_critique;
 use super::state::AgentState;
+use super::tool_registry::ToolRegistry;
+
+/// Tools that are always visible in lazy discovery mode (core local tools).
+const ALWAYS_AVAILABLE_TOOLS: &[&str] = &[
+    "read_file",
+    "write_file",
+    "edit_file",
+    "bash",
+    "grep",
+    "glob",
+];
 
 pub struct AgentRunner<L: LlmProvider, T: ToolExecutor> {
     llm: L,
@@ -38,20 +55,36 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         &self.tools
     }
 
-    /// Returns `true` for tools that only read state and can safely run concurrently.
-    // TODO: Not currently used for concurrency — all tools run sequentially.
-    // Kept for potential future use when parallel read-only execution is implemented.
-    #[allow(dead_code)]
-    fn is_read_only_tool(name: &str) -> bool {
+    /// Returns `true` for tools that only read state.
+    /// Used for plan mode filtering and potential future parallel execution.
+    pub fn is_read_only_tool(name: &str) -> bool {
         matches!(
             name,
-            "read_file" | "grep" | "glob" | "list_files" | "screenshot"
+            "read_file"
+                | "grep"
+                | "glob"
+                | "list_files"
+                | "screenshot"
+                | "get_page_info"
+                | "get_console_logs"
+                | "get_page_content"
+                | "search_tools"
         )
+    }
+
+    /// Filter tool definitions to only include read-only tools (for plan mode).
+    fn filter_read_only_tools(tools: &[ToolDefinition]) -> Vec<ToolDefinition> {
+        tools
+            .iter()
+            .filter(|t| t.read_only || Self::is_read_only_tool(&t.name))
+            .cloned()
+            .collect()
     }
 
     /// Execute tool_use blocks from an assistant response sequentially.
     ///
     /// Returns `(tool_results, step_records)` preserving the original block order.
+    #[cfg(test)]
     async fn execute_tools(
         &self,
         assistant_content: &[ContentBlock],
@@ -146,11 +179,13 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         skill_set: &SkillSet,
         agents_md: &Option<crate::agents_md::AgentsMdContent>,
     ) -> Result<AgentResult, AgentError> {
-        self.run_with_options(task, credentials, skill_set, agents_md, None, None)
+        self.run_with_options(task, credentials, skill_set, agents_md, None, None, None)
             .await
     }
 
-    /// Run the agent loop with optional session persistence and context compaction.
+    /// Run the agent loop with optional session persistence, context compaction,
+    /// and a dedicated compaction LLM.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_with_options(
         &self,
         task: &str,
@@ -159,6 +194,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         agents_md: &Option<crate::agents_md::AgentsMdContent>,
         session_store: Option<&dyn SessionStorage>,
         compaction_config: Option<&CompactionConfig>,
+        compaction_llm: Option<&dyn LlmProvider>,
     ) -> Result<AgentResult, AgentError> {
         let mut state = AgentState::new(task);
 
@@ -214,7 +250,21 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             Some(system_blocks)
         };
 
-        let tool_defs = self.tools.tool_definitions();
+        // Feature 1: Lazy tool discovery — build registry only when needed
+        let all_tool_defs = self.tools.tool_definitions().to_vec();
+        let mut tool_registry = if self.config.lazy_tool_discovery {
+            let always_avail = ALWAYS_AVAILABLE_TOOLS
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            Some(ToolRegistry::new(all_tool_defs.clone(), always_avail))
+        } else {
+            None
+        };
+
+        // Feature 5: System reminders — build scheduler
+        let reminder_scheduler = ReminderScheduler::from_configs(&self.config.reminders);
+
         let timeout_ms = self.config.timeout_secs * 1000;
 
         loop {
@@ -245,54 +295,46 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 return Ok(state.into_result(AgentStatus::Timeout, None));
             }
 
-            // Check if compaction is needed before sending to LLM
+            // Feature 3: Progressive context compaction
             if let Some(compact_config) = compaction_config {
-                if compaction::should_compact(compact_config, state.total_input_tokens()) {
-                    info!(
-                        input_tokens = state.total_input_tokens(),
-                        "Triggering context compaction"
-                    );
-                    let (compact_end, _) = compaction::compute_compaction_split(
-                        state.messages().len(),
-                        compact_config.preserve_recent_n,
-                    );
-                    if compact_end > 0 {
-                        let messages_to_compact = &state.messages()[..compact_end];
-                        let compaction_messages =
-                            compaction::build_compaction_request(messages_to_compact);
-                        let compaction_system = [SystemContent::text(COMPACTION_SYSTEM_PROMPT)];
-                        match self
-                            .llm
-                            .send_messages(Some(&compaction_system), &compaction_messages, None)
-                            .await
-                        {
-                            Ok(summary_response) => {
-                                let summary_text = summary_response
-                                    .content
-                                    .iter()
-                                    .filter_map(|b| match b {
-                                        ContentBlock::Text { text } => Some(text.clone()),
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                state.compact(&summary_text, compact_config.preserve_recent_n);
-                                info!("Context compacted successfully");
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "Context compaction failed, continuing without");
-                            }
-                        }
-                    }
-                }
+                self.run_compaction(compact_config, &mut state, compaction_llm)
+                    .await;
             }
 
             state.increment_iteration();
             debug!(iteration = state.current_iteration(), "Starting iteration");
 
+            // Feature 5: Check system reminders before LLM call
+            if !reminder_scheduler.is_empty() {
+                let pending_tools: Vec<String> = Vec::new(); // pre-execution, no pending tools yet
+                let reminders = reminder_scheduler.check(state.current_iteration(), &pending_tools);
+                for reminder in reminders {
+                    state.inject_system_notification(&reminder);
+                }
+            }
+
+            // Feature 1 + 4: Resolve tool definitions based on mode
+            let effective_tool_defs: Cow<'_, [ToolDefinition]> =
+                if let Some(ref registry) = tool_registry {
+                    let discovered = registry.discovered_definitions();
+                    if self.config.plan_mode {
+                        Cow::Owned(Self::filter_read_only_tools(&discovered))
+                    } else {
+                        Cow::Owned(discovered)
+                    }
+                } else if self.config.plan_mode {
+                    Cow::Owned(Self::filter_read_only_tools(&all_tool_defs))
+                } else {
+                    Cow::Borrowed(&all_tool_defs)
+                };
+
             let response = self
                 .llm
-                .send_messages(system_prompt.as_deref(), state.messages(), Some(tool_defs))
+                .send_messages(
+                    system_prompt.as_deref(),
+                    state.messages(),
+                    Some(&effective_tool_defs),
+                )
                 .await?;
 
             state.accumulate_usage(response.usage.as_ref(), &response.model);
@@ -326,10 +368,75 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                     }
 
+                    // Feature 5: Check reminders before tool execution
+                    if !reminder_scheduler.is_empty() {
+                        let pending_tool_names: Vec<String> = assistant_content
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::ToolUse { name, .. } => Some(name.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        let tool_reminders = reminder_scheduler
+                            .check(state.current_iteration(), &pending_tool_names);
+                        for reminder in tool_reminders {
+                            state.inject_system_notification(&reminder);
+                        }
+                    }
+
+                    // Feature 6: Self-critique phase
+                    if let Some(ref critique_config) = self.config.self_critique {
+                        if self_critique::should_critique(critique_config, &assistant_content) {
+                            debug!("Running self-critique on planned actions");
+                            let critique_prompt =
+                                self_critique::build_critique_prompt(&assistant_content, task);
+                            let critique_system =
+                                [SystemContent::text(self_critique::CRITIQUE_SYSTEM_PROMPT)];
+                            let critique_messages = vec![crate::llm::types::Message {
+                                role: crate::llm::types::Role::User,
+                                content: vec![ContentBlock::Text {
+                                    text: critique_prompt,
+                                }],
+                            }];
+                            if let Ok(critique_response) = self
+                                .llm
+                                .send_messages(Some(&critique_system), &critique_messages, None)
+                                .await
+                            {
+                                let critique_text = critique_response
+                                    .content
+                                    .iter()
+                                    .filter_map(|b| match b {
+                                        ContentBlock::Text { text } => Some(text.clone()),
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                let result = self_critique::parse_critique_response(&critique_text);
+                                if !result.approved {
+                                    info!("Self-critique rejected actions: {}", result.reasoning);
+                                    state.add_assistant_message(assistant_content);
+                                    let feedback = format!(
+                                        "[SELF_CRITIQUE] Your planned actions were rejected.\nReason: {}\n{}Please revise your approach.",
+                                        result.reasoning,
+                                        result.suggestions.map(|s| format!("Suggestions: {s}\n")).unwrap_or_default(),
+                                    );
+                                    state.inject_system_notification(&feedback);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
                     state.add_assistant_message(assistant_content.clone());
 
+                    // Feature 1: Intercept search_tools meta-tool
                     let (tool_results, step_records) = self
-                        .execute_tools(&assistant_content, state.current_iteration())
+                        .execute_tools_with_registry(
+                            &assistant_content,
+                            state.current_iteration(),
+                            tool_registry.as_mut(),
+                        )
                         .await;
                     for step in step_records {
                         state.record_step(step);
@@ -377,7 +484,213 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         }
     }
 
+    /// Execute tools with optional registry support for search_tools interception and plan mode blocking.
+    async fn execute_tools_with_registry(
+        &self,
+        assistant_content: &[ContentBlock],
+        iteration: u32,
+        mut registry: Option<&mut ToolRegistry>,
+    ) -> (Vec<ContentBlock>, Vec<StepRecord>) {
+        let mut tool_results = Vec::new();
+        let mut step_records = Vec::new();
+
+        for block in assistant_content {
+            match block {
+                ContentBlock::ToolUse { id, name, input } => {
+                    // Feature 1: Intercept search_tools meta-tool
+                    if ToolRegistry::is_search_tool(name) {
+                        if let Some(ref mut reg) = registry {
+                            debug!(tool = %name, "Intercepting search_tools meta-tool");
+                            let step_start = Instant::now();
+                            let query = input.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                            let max_results = input
+                                .get("max_results")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(5)
+                                as usize;
+                            let results = reg.search(query, max_results);
+                            let result_text = ToolRegistry::format_search_results(&results);
+                            let step_duration = step_start.elapsed().as_millis() as u64;
+
+                            let step = StepRecord {
+                                iteration,
+                                tool: name.to_string(),
+                                input: input.clone(),
+                                output: Value::String(result_text.clone()),
+                                duration_ms: step_duration,
+                                is_error: None,
+                            };
+                            let result_block = ContentBlock::ToolResult {
+                                tool_use_id: id.to_string(),
+                                content: ToolResultContent::Text(result_text),
+                                is_error: None,
+                            };
+                            tool_results.push(result_block);
+                            step_records.push(step);
+                            continue;
+                        } // if let Some(ref mut reg)
+                    }
+
+                    // Feature 4: Block non-read-only tools in plan mode
+                    if self.config.plan_mode && !Self::is_read_only_tool(name) {
+                        let error_msg = format!(
+                            "Tool '{}' is blocked in plan mode. Only read-only tools are allowed.",
+                            name
+                        );
+                        let step = StepRecord {
+                            iteration,
+                            tool: name.to_string(),
+                            input: input.clone(),
+                            output: Value::String(error_msg.clone()),
+                            duration_ms: 0,
+                            is_error: Some(true),
+                        };
+                        let result_block = ContentBlock::ToolResult {
+                            tool_use_id: id.to_string(),
+                            content: ToolResultContent::Text(error_msg),
+                            is_error: Some(true),
+                        };
+                        tool_results.push(result_block);
+                        step_records.push(step);
+                        continue;
+                    }
+
+                    // Normal tool execution
+                    debug!(tool = %name, "Executing tool");
+                    let step_start = Instant::now();
+                    let exec_result = self.tools.execute_tool(name, input.clone()).await;
+                    let step_duration = step_start.elapsed().as_millis() as u64;
+                    let (content_block, step) = Self::process_tool_result(
+                        id,
+                        name,
+                        input,
+                        exec_result,
+                        step_duration,
+                        iteration,
+                    );
+                    tool_results.push(content_block);
+                    step_records.push(step);
+                }
+                ContentBlock::Thinking { thinking } => {
+                    debug!(
+                        thinking_length = thinking.len(),
+                        "Model produced thinking block"
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        (tool_results, step_records)
+    }
+
+    /// Run compaction with progressive staging support and dedicated compaction LLM.
+    async fn run_compaction(
+        &self,
+        compact_config: &CompactionConfig,
+        state: &mut AgentState,
+        compaction_llm: Option<&dyn LlmProvider>,
+    ) {
+        // Feature 3: Progressive compaction stages
+        if let Some(ref thresholds) = compact_config.stage_thresholds {
+            if let Some(stage) = compaction_stages::determine_stage(
+                thresholds,
+                compact_config.context_window_tokens,
+                state.total_input_tokens(),
+            ) {
+                info!(
+                    stage = ?stage,
+                    input_tokens = state.total_input_tokens(),
+                    "Triggering progressive compaction"
+                );
+                match stage {
+                    compaction_stages::CompactionStage::ToolOutputCompression => {
+                        let messages = state.messages_mut();
+                        let count = compaction_stages::compress_tool_outputs(messages, 500);
+                        if count > 0 {
+                            info!(compressed = count, "Compressed tool outputs");
+                        }
+                    }
+                    compaction_stages::CompactionStage::ObservationMerging => {
+                        let merged = compaction_stages::merge_observations(
+                            state.messages(),
+                            compact_config.preserve_recent_n,
+                        );
+                        state.replace_messages(merged);
+                        info!("Merged observations");
+                    }
+                    compaction_stages::CompactionStage::ConversationSummary => {
+                        // Delegate to LLM-based compaction
+                        self.run_llm_compaction(compact_config, state, compaction_llm)
+                            .await;
+                    }
+                    compaction_stages::CompactionStage::LowValuePruning => {
+                        let pruned = compaction_stages::prune_low_value(
+                            state.messages(),
+                            compact_config.preserve_recent_n,
+                            50,
+                        );
+                        state.replace_messages(pruned);
+                        info!("Pruned low-value exchanges");
+                    }
+                }
+            }
+        } else {
+            // Legacy single-pass compaction
+            if compaction::should_compact(compact_config, state.total_input_tokens()) {
+                self.run_llm_compaction(compact_config, state, compaction_llm)
+                    .await;
+            }
+        }
+    }
+
+    /// Run LLM-based conversation summarization compaction.
+    async fn run_llm_compaction(
+        &self,
+        compact_config: &CompactionConfig,
+        state: &mut AgentState,
+        compaction_llm: Option<&dyn LlmProvider>,
+    ) {
+        info!(
+            input_tokens = state.total_input_tokens(),
+            "Triggering context compaction"
+        );
+        let (compact_end, _) = compaction::compute_compaction_split(
+            state.messages().len(),
+            compact_config.preserve_recent_n,
+        );
+        if compact_end > 0 {
+            let messages_to_compact = &state.messages()[..compact_end];
+            let compaction_messages = compaction::build_compaction_request(messages_to_compact);
+            let compaction_system = [SystemContent::text(COMPACTION_SYSTEM_PROMPT)];
+            // Feature 2: Use dedicated compaction LLM if available
+            let llm_to_use: &dyn LlmProvider = compaction_llm.unwrap_or(&self.llm);
+            match llm_to_use
+                .send_messages(Some(&compaction_system), &compaction_messages, None)
+                .await
+            {
+                Ok(summary_response) => {
+                    let summary_text = summary_response
+                        .content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    state.compact(&summary_text, compact_config.preserve_recent_n);
+                    info!("Context compacted successfully");
+                }
+                Err(e) => {
+                    warn!(error = %e, "Context compaction failed, continuing without");
+                }
+            }
+        }
+    }
+
     /// Resume an existing session and continue the agent loop.
+    #[allow(clippy::too_many_arguments)]
     pub async fn resume(
         &self,
         session_store: &dyn SessionStorage,
@@ -386,6 +699,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         skill_set: &SkillSet,
         agents_md: &Option<crate::agents_md::AgentsMdContent>,
         compaction_config: Option<&CompactionConfig>,
+        compaction_llm: Option<&dyn LlmProvider>,
     ) -> Result<AgentResult, AgentError> {
         let snapshot = session_store.load(session_id).await?;
         info!(
@@ -436,7 +750,17 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             Some(system_blocks)
         };
 
-        let tool_defs = self.tools.tool_definitions();
+        let all_tool_defs = self.tools.tool_definitions().to_vec();
+        let mut tool_registry = if self.config.lazy_tool_discovery {
+            let always_avail = ALWAYS_AVAILABLE_TOOLS
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            Some(ToolRegistry::new(all_tool_defs.clone(), always_avail))
+        } else {
+            None
+        };
+        let reminder_scheduler = ReminderScheduler::from_configs(&self.config.reminders);
         let timeout_ms = self.config.timeout_secs * 1000;
         let session_metadata = session_store.load_metadata(session_id).await.ok();
 
@@ -463,52 +787,44 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 return Ok(state.into_result(AgentStatus::Timeout, None));
             }
 
-            // Check compaction
+            // Compaction with progressive staging and dedicated LLM support
             if let Some(compact_config) = compaction_config {
-                if compaction::should_compact(compact_config, state.total_input_tokens()) {
-                    info!(
-                        input_tokens = state.total_input_tokens(),
-                        "Triggering context compaction"
-                    );
-                    let (compact_end, _) = compaction::compute_compaction_split(
-                        state.messages().len(),
-                        compact_config.preserve_recent_n,
-                    );
-                    if compact_end > 0 {
-                        let messages_to_compact = &state.messages()[..compact_end];
-                        let compaction_messages =
-                            compaction::build_compaction_request(messages_to_compact);
-                        let compaction_system = [SystemContent::text(COMPACTION_SYSTEM_PROMPT)];
-                        match self
-                            .llm
-                            .send_messages(Some(&compaction_system), &compaction_messages, None)
-                            .await
-                        {
-                            Ok(summary_response) => {
-                                let summary_text = summary_response
-                                    .content
-                                    .iter()
-                                    .filter_map(|b| match b {
-                                        ContentBlock::Text { text } => Some(text.clone()),
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                state.compact(&summary_text, compact_config.preserve_recent_n);
-                                info!("Context compacted successfully");
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "Context compaction failed, continuing without");
-                            }
-                        }
-                    }
-                }
+                self.run_compaction(compact_config, &mut state, compaction_llm)
+                    .await;
             }
 
             state.increment_iteration();
+
+            // System reminders
+            if !reminder_scheduler.is_empty() {
+                let reminders = reminder_scheduler.check(state.current_iteration(), &[]);
+                for reminder in reminders {
+                    state.inject_system_notification(&reminder);
+                }
+            }
+
+            // Resolve tool definitions
+            let effective_tool_defs: Cow<'_, [ToolDefinition]> =
+                if let Some(ref registry) = tool_registry {
+                    let discovered = registry.discovered_definitions();
+                    if self.config.plan_mode {
+                        Cow::Owned(Self::filter_read_only_tools(&discovered))
+                    } else {
+                        Cow::Owned(discovered)
+                    }
+                } else if self.config.plan_mode {
+                    Cow::Owned(Self::filter_read_only_tools(&all_tool_defs))
+                } else {
+                    Cow::Borrowed(&all_tool_defs)
+                };
+
             let response = self
                 .llm
-                .send_messages(system_prompt.as_deref(), state.messages(), Some(tool_defs))
+                .send_messages(
+                    system_prompt.as_deref(),
+                    state.messages(),
+                    Some(&effective_tool_defs),
+                )
                 .await?;
 
             state.accumulate_usage(response.usage.as_ref(), &response.model);
@@ -541,7 +857,11 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
 
                     state.add_assistant_message(assistant_content.clone());
                     let (tool_results, step_records) = self
-                        .execute_tools(&assistant_content, state.current_iteration())
+                        .execute_tools_with_registry(
+                            &assistant_content,
+                            state.current_iteration(),
+                            tool_registry.as_mut(),
+                        )
                         .await;
                     for step in step_records {
                         state.record_step(step);
@@ -734,6 +1054,10 @@ mod tests {
             coordination_config: None,
             tool_result_max_bytes: 32768,
             max_budget_usd: None,
+            lazy_tool_discovery: false,
+            plan_mode: false,
+            reminders: Vec::new(),
+            self_critique: None,
         }
     }
 
@@ -743,6 +1067,7 @@ mod tests {
             description: "Navigate to URL".to_string(),
             input_schema: json!({"type": "object", "properties": {"url": {"type": "string"}}}),
             cache_control: None,
+            read_only: false,
         }]
     }
 
@@ -823,6 +1148,10 @@ mod tests {
             coordination_config: None,
             tool_result_max_bytes: 32768,
             max_budget_usd: None,
+            lazy_tool_discovery: false,
+            plan_mode: false,
+            reminders: Vec::new(),
+            self_critique: None,
         };
 
         // LLM always returns tool_use, so we hit max_iterations
@@ -960,6 +1289,10 @@ mod tests {
             coordination_config: None,
             tool_result_max_bytes: 32768,
             max_budget_usd: None,
+            lazy_tool_discovery: false,
+            plan_mode: false,
+            reminders: Vec::new(),
+            self_critique: None,
         };
 
         let llm_responses = Arc::new(Mutex::new(vec![make_end_turn_response("Done")]));

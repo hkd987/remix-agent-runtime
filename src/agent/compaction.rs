@@ -130,6 +130,9 @@ mod tests {
             trigger_threshold: threshold,
             context_window_tokens: context_window,
             preserve_recent_n: 4,
+            compaction_model: None,
+            compaction_max_tokens: None,
+            stage_thresholds: None,
         }
     }
 
