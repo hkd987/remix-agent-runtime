@@ -93,7 +93,7 @@ fn find_line_boundary_after(input: &str, pos: usize) -> usize {
 }
 
 /// Find the largest byte index <= pos that is a valid char boundary.
-fn floor_char_boundary(s: &str, pos: usize) -> usize {
+pub(crate) fn floor_char_boundary(s: &str, pos: usize) -> usize {
     let mut p = pos.min(s.len());
     while p > 0 && !s.is_char_boundary(p) {
         p -= 1;
