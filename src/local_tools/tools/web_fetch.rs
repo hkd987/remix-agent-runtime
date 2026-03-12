@@ -131,9 +131,8 @@ async fn read_body_capped(
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            AgentError::LocalTool(format!("Failed to read response body: {e}"))
-        })?;
+        let chunk = chunk
+            .map_err(|e| AgentError::LocalTool(format!("Failed to read response body: {e}")))?;
         body.extend_from_slice(&chunk);
         if body.len() >= max_bytes {
             body.truncate(max_bytes);
@@ -190,9 +189,7 @@ fn truncate_content(content: String, max_bytes: usize) -> String {
     let boundary = floor_char_boundary(&content, max_bytes);
     let mut result = content;
     result.truncate(boundary);
-    result.push_str(&format!(
-        "\n\n... [content truncated at {max_bytes} bytes]"
-    ));
+    result.push_str(&format!("\n\n... [content truncated at {max_bytes} bytes]"));
     result
 }
 
@@ -343,8 +340,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_web_fetch_non_http_scheme() {
-        let result =
-            execute_web_fetch(json!({"url": "ftp://example.com/file"}), 30, 102_400).await;
+        let result = execute_web_fetch(json!({"url": "ftp://example.com/file"}), 30, 102_400).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Unsupported URL scheme"));
@@ -352,9 +348,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_web_fetch_malformed_headers() {
-        let result =
-            execute_web_fetch(json!({"url": "https://example.com", "headers": "bad"}), 30, 102_400)
-                .await;
+        let result = execute_web_fetch(
+            json!({"url": "https://example.com", "headers": "bad"}),
+            30,
+            102_400,
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Invalid 'headers' parameter"));
@@ -399,19 +398,11 @@ mod tests {
             .await;
 
         let mut headers = HashMap::new();
-        headers.insert(
-            "Authorization".to_string(),
-            "Bearer test-token".to_string(),
-        );
+        headers.insert("Authorization".to_string(), "Bearer test-token".to_string());
 
-        let result = fetch_url(
-            &format!("{}/auth", server.url()),
-            &headers,
-            30,
-            102_400,
-        )
-        .await
-        .unwrap();
+        let result = fetch_url(&format!("{}/auth", server.url()), &headers, 30, 102_400)
+            .await
+            .unwrap();
 
         assert!(!result.is_error);
         assert_eq!(result.content, "authorized");
@@ -453,10 +444,7 @@ mod tests {
     fn test_validate_url_empty_rejected() {
         let result = validate_and_normalize_url("");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("cannot be empty"));
+        assert!(result.unwrap_err().to_string().contains("cannot be empty"));
     }
 
     #[test]
