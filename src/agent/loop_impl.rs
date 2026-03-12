@@ -305,14 +305,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     SessionStatus::Completed,
                 )
                 .await;
-                events::emit(
-                    &self.event_bus,
-                    AgentEvent::AgentCompleted {
-                        status: AgentStatus::MaxIterations,
-                        result: None,
-                        total_duration_ms: state.elapsed_ms(),
-                    },
-                );
+                self.emit_completed(AgentStatus::MaxIterations, None, &state);
                 return Ok(state.into_result(AgentStatus::MaxIterations, None));
             }
 
@@ -325,14 +318,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     SessionStatus::Completed,
                 )
                 .await;
-                events::emit(
-                    &self.event_bus,
-                    AgentEvent::AgentCompleted {
-                        status: AgentStatus::Timeout,
-                        result: None,
-                        total_duration_ms: state.elapsed_ms(),
-                    },
-                );
+                self.emit_completed(AgentStatus::Timeout, None, &state);
                 return Ok(state.into_result(AgentStatus::Timeout, None));
             }
 
@@ -413,14 +399,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                             SessionStatus::Completed,
                         )
                         .await;
-                        events::emit(
-                            &self.event_bus,
-                            AgentEvent::AgentCompleted {
-                                status: AgentStatus::Success,
-                                result: Some(final_text.clone()),
-                                total_duration_ms: state.elapsed_ms(),
-                            },
-                        );
+                        self.emit_completed(AgentStatus::Success, Some(final_text.clone()), &state);
                         return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                     }
 
@@ -525,28 +504,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         .collect::<Vec<_>>()
                         .join("\n");
 
-                    // Emit text and thinking events from the final response
-                    for block in &response.content {
-                        match block {
-                            ContentBlock::Text { text } => {
-                                events::emit(
-                                    &self.event_bus,
-                                    AgentEvent::TextDelta {
-                                        text: text.clone(),
-                                    },
-                                );
-                            }
-                            ContentBlock::Thinking { thinking } => {
-                                events::emit(
-                                    &self.event_bus,
-                                    AgentEvent::ThinkingComplete {
-                                        thinking: thinking.clone(),
-                                    },
-                                );
-                            }
-                            _ => {}
-                        }
-                    }
+                    self.emit_response_content_events(&response.content);
 
                     state.add_assistant_message(response.content);
 
@@ -557,14 +515,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         SessionStatus::Completed,
                     )
                     .await;
-                    events::emit(
-                        &self.event_bus,
-                        AgentEvent::AgentCompleted {
-                            status: AgentStatus::Success,
-                            result: Some(final_text.clone()),
-                            total_duration_ms: state.elapsed_ms(),
-                        },
-                    );
+                    self.emit_completed(AgentStatus::Success, Some(final_text.clone()), &state);
                     return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                 }
             }
@@ -693,6 +644,43 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         }
 
         (tool_results, step_records)
+    }
+
+    /// Emit an AgentCompleted event via the event bus.
+    fn emit_completed(&self, status: AgentStatus, result: Option<String>, state: &AgentState) {
+        events::emit(
+            &self.event_bus,
+            AgentEvent::AgentCompleted {
+                status,
+                result,
+                total_duration_ms: state.elapsed_ms(),
+            },
+        );
+    }
+
+    /// Emit TextDelta and ThinkingComplete events for content blocks in a response.
+    fn emit_response_content_events(&self, content: &[ContentBlock]) {
+        for block in content {
+            match block {
+                ContentBlock::Text { text } => {
+                    events::emit(
+                        &self.event_bus,
+                        AgentEvent::TextDelta {
+                            text: text.clone(),
+                        },
+                    );
+                }
+                ContentBlock::Thinking { thinking } => {
+                    events::emit(
+                        &self.event_bus,
+                        AgentEvent::ThinkingComplete {
+                            thinking: thinking.clone(),
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Run compaction with progressive staging support and dedicated compaction LLM.
@@ -884,14 +872,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     SessionStatus::Completed,
                 )
                 .await;
-                events::emit(
-                    &self.event_bus,
-                    AgentEvent::AgentCompleted {
-                        status: AgentStatus::MaxIterations,
-                        result: None,
-                        total_duration_ms: state.elapsed_ms(),
-                    },
-                );
+                self.emit_completed(AgentStatus::MaxIterations, None, &state);
                 return Ok(state.into_result(AgentStatus::MaxIterations, None));
             }
 
@@ -903,14 +884,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     SessionStatus::Completed,
                 )
                 .await;
-                events::emit(
-                    &self.event_bus,
-                    AgentEvent::AgentCompleted {
-                        status: AgentStatus::Timeout,
-                        result: None,
-                        total_duration_ms: state.elapsed_ms(),
-                    },
-                );
+                self.emit_completed(AgentStatus::Timeout, None, &state);
                 return Ok(state.into_result(AgentStatus::Timeout, None));
             }
 
@@ -985,14 +959,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                             SessionStatus::Completed,
                         )
                         .await;
-                        events::emit(
-                            &self.event_bus,
-                            AgentEvent::AgentCompleted {
-                                status: AgentStatus::Success,
-                                result: Some(final_text.clone()),
-                                total_duration_ms: state.elapsed_ms(),
-                            },
-                        );
+                        self.emit_completed(AgentStatus::Success, Some(final_text.clone()), &state);
                         return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                     }
 
@@ -1033,28 +1000,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         .collect::<Vec<_>>()
                         .join("\n");
 
-                    // Emit text and thinking events from the final response
-                    for block in &response.content {
-                        match block {
-                            ContentBlock::Text { text } => {
-                                events::emit(
-                                    &self.event_bus,
-                                    AgentEvent::TextDelta {
-                                        text: text.clone(),
-                                    },
-                                );
-                            }
-                            ContentBlock::Thinking { thinking } => {
-                                events::emit(
-                                    &self.event_bus,
-                                    AgentEvent::ThinkingComplete {
-                                        thinking: thinking.clone(),
-                                    },
-                                );
-                            }
-                            _ => {}
-                        }
-                    }
+                    self.emit_response_content_events(&response.content);
 
                     state.add_assistant_message(response.content);
                     self.finalize_session(
@@ -1064,14 +1010,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         SessionStatus::Completed,
                     )
                     .await;
-                    events::emit(
-                        &self.event_bus,
-                        AgentEvent::AgentCompleted {
-                            status: AgentStatus::Success,
-                            result: Some(final_text.clone()),
-                            total_duration_ms: state.elapsed_ms(),
-                        },
-                    );
+                    self.emit_completed(AgentStatus::Success, Some(final_text.clone()), &state);
                     return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                 }
             }
