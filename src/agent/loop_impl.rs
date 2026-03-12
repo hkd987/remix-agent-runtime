@@ -216,10 +216,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             &self.event_bus,
             AgentEvent::AgentStarted {
                 task: task.to_string(),
-                timestamp_ms: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
+                timestamp_ms: chrono::Utc::now().timestamp_millis() as u64,
             },
         );
 

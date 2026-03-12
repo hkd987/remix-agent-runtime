@@ -65,21 +65,25 @@ pub async fn start_sse_server(
 mod tests {
     use super::*;
     use crate::output::events::AgentEvent;
+    use std::net::SocketAddr;
+
+    /// Spawn a test server with the given event bus and return its address.
+    async fn spawn_test_server(event_bus: Arc<EventBus>) -> SocketAddr {
+        let app = build_router(event_bus);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
 
     #[tokio::test]
     async fn test_health_endpoint_returns_ok() {
         let bus = Arc::new(EventBus::new(16));
-        let app = build_router(bus);
+        let addr = spawn_test_server(bus).await;
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let client = reqwest::Client::new();
-        let resp = client
+        let resp = reqwest::Client::new()
             .get(format!("http://{addr}/health"))
             .send()
             .await
@@ -92,17 +96,9 @@ mod tests {
     #[tokio::test]
     async fn test_sse_endpoint_returns_event_stream_content_type() {
         let bus = Arc::new(EventBus::new(16));
-        let app = build_router(bus);
+        let addr = spawn_test_server(bus).await;
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let client = reqwest::Client::new();
-        let resp = client
+        let resp = reqwest::Client::new()
             .get(format!("http://{addr}/events"))
             .send()
             .await
@@ -125,18 +121,9 @@ mod tests {
     #[tokio::test]
     async fn test_sse_streams_events_to_client() {
         let bus = Arc::new(EventBus::new(16));
-        let app = build_router(bus.clone());
+        let addr = spawn_test_server(bus.clone()).await;
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        // Connect to SSE endpoint
-        let client = reqwest::Client::new();
-        let resp = client
+        let resp = reqwest::Client::new()
             .get(format!("http://{addr}/events"))
             .send()
             .await
