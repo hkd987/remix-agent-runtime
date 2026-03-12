@@ -180,6 +180,10 @@ pub struct RunArgs {
     /// Effort level (low, medium, high, max)
     #[arg(long)]
     pub effort: Option<EffortLevel>,
+
+    /// Port for SSE event server (enables real-time streaming to UI)
+    #[arg(long, env = "REMIX_SSE_PORT")]
+    pub sse_port: Option<u16>,
 }
 
 #[cfg(test)]
@@ -290,6 +294,8 @@ mod tests {
             "10",
             "--coordination-dir",
             "/tmp/coordination",
+            "--sse-port",
+            "3100",
             "do something",
         ]));
         assert_eq!(args.task, Some("do something".to_string()));
@@ -328,6 +334,7 @@ mod tests {
             args.coordination_dir,
             Some(PathBuf::from("/tmp/coordination"))
         );
+        assert_eq!(args.sse_port, Some(3100));
     }
 
     #[test]
@@ -594,6 +601,23 @@ mod tests {
     fn test_parse_run_effort_default_none() {
         let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
         assert!(args.effort.is_none());
+    }
+
+    #[test]
+    fn test_parse_run_with_sse_port() {
+        let args = extract_run_args(Cli::parse_from([
+            "remix-agent",
+            "run",
+            "--sse-port",
+            "8080",
+        ]));
+        assert_eq!(args.sse_port, Some(8080));
+    }
+
+    #[test]
+    fn test_parse_run_sse_port_default_none() {
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
+        assert!(args.sse_port.is_none());
     }
 
     #[test]
