@@ -250,6 +250,7 @@ mod tests {
             coordination_dir: None,
             continue_session: false,
             effort: None,
+            sse_port: None,
         }
     }
 
@@ -414,6 +415,7 @@ agent:
             coordination_dir: None,
             continue_session: false,
             effort: None,
+            sse_port: None,
         };
         let config = load_config(&args).unwrap();
 

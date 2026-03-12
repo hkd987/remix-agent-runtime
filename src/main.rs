@@ -353,8 +353,30 @@ async fn main() -> ExitCode {
                 None
             };
 
+            // Set up event bus for real-time streaming
+            let event_bus = std::sync::Arc::new(remix_agent_runtime::output::EventBus::new(256));
+
+            // Start SSE server if port is configured
+            #[cfg(feature = "sse")]
+            if let Some(sse_port) = args.sse_port {
+                let bus = event_bus.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        remix_agent_runtime::output::sse_server::start_sse_server(bus, sse_port)
+                            .await
+                    {
+                        eprintln!("SSE server error: {e}");
+                    }
+                });
+            }
+            #[cfg(not(feature = "sse"))]
+            if args.sse_port.is_some() {
+                eprintln!("Warning: --sse-port requires the 'sse' feature. Rebuild with: cargo build --features sse");
+            }
+
             // Handle session resume/fork
-            let runner = AgentRunner::new(llm_client, executor, agent_config);
+            let runner =
+                AgentRunner::new(llm_client, executor, agent_config).with_event_bus(event_bus);
             let result = if let Some(ref session_id) = args.session_id {
                 // Resume existing session
                 let store = session_store.as_ref().unwrap_or_else(|| {
