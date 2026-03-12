@@ -9,11 +9,12 @@ use crate::local_tools::sandbox::{create_sandbox, BashSandbox, PathValidator};
 
 /// Decorator that wraps a ToolExecutor and adds local file/shell tools.
 ///
-/// When `config.enabled` is true, six virtual tools are added:
+/// When `config.enabled` is true, seven virtual tools are added:
 /// - `read_file`, `write_file`, `edit_file` for file operations
 /// - `bash` for sandboxed shell execution
 /// - `grep` for regex search across files
 /// - `glob` for file pattern matching
+/// - `web_fetch` for fetching web pages and returning content as markdown
 ///
 /// When disabled, zero overhead — all calls delegate to the inner executor.
 pub struct LocalToolsExecutor<T: ToolExecutor> {
@@ -104,6 +105,14 @@ impl<T: ToolExecutor> ToolExecutor for LocalToolsExecutor<T> {
                 "glob" => {
                     return super::tools::glob_tool::execute_glob(arguments, &self.path_validator)
                         .await;
+                }
+                "web_fetch" => {
+                    return super::tools::web_fetch::execute_web_fetch(
+                        arguments,
+                        self.config.web_fetch_timeout_secs,
+                        self.config.web_fetch_max_bytes,
+                    )
+                    .await;
                 }
                 _ => {}
             }
@@ -202,6 +211,27 @@ fn local_tool_definitions() -> Vec<ToolDefinition> {
             cache_control: None,
             read_only: false,
         },
+        ToolDefinition {
+            name: "web_fetch".to_string(),
+            description: "Fetch a webpage via HTTP GET and return its content as markdown. Use this for looking up documentation, gathering context from URLs, or reading web content. HTTP URLs are automatically upgraded to HTTPS. For full browser automation (JavaScript rendering, clicking, form filling), use the browser tools instead.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The URL to fetch (http or https, http is auto-upgraded to https)"
+                    },
+                    "headers": {
+                        "type": "object",
+                        "description": "Optional custom HTTP headers to include in the request",
+                        "additionalProperties": { "type": "string" }
+                    }
+                },
+                "required": ["url"]
+            }),
+            cache_control: None,
+            read_only: true,
+        },
     ]
 }
 
@@ -267,8 +297,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let inner = mock_inner();
         let executor = LocalToolsExecutor::new(inner, test_config(&dir)).unwrap();
-        // 1 inner + 6 local tools = 7
-        assert_eq!(executor.tool_definitions().len(), 7);
+        // 1 inner + 7 local tools = 8
+        assert_eq!(executor.tool_definitions().len(), 8);
         let names: Vec<&str> = executor
             .tool_definitions()
             .iter()
@@ -281,6 +311,7 @@ mod tests {
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"grep"));
         assert!(names.contains(&"glob"));
+        assert!(names.contains(&"web_fetch"));
     }
 
     #[test]
@@ -419,7 +450,7 @@ mod tests {
     #[test]
     fn test_tool_definitions_count() {
         let defs = local_tool_definitions();
-        assert_eq!(defs.len(), 6);
+        assert_eq!(defs.len(), 7);
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(
             names,
@@ -429,7 +460,8 @@ mod tests {
                 "edit_file",
                 "bash",
                 "grep",
-                "glob"
+                "glob",
+                "web_fetch",
             ]
         );
     }

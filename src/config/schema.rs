@@ -88,6 +88,14 @@ fn default_write_max_bytes() -> usize {
     10_485_760
 }
 
+fn default_web_fetch_timeout() -> u64 {
+    30
+}
+
+fn default_web_fetch_max_bytes() -> usize {
+    102_400 // 100KB
+}
+
 fn default_webhook_format() -> String {
     "json".to_string()
 }
@@ -328,6 +336,10 @@ pub struct LocalToolsConfig {
     pub bash_allowlist: Vec<String>,
     #[serde(default)]
     pub bash_blocklist: Vec<String>,
+    #[serde(default = "default_web_fetch_timeout")]
+    pub web_fetch_timeout_secs: u64,
+    #[serde(default = "default_web_fetch_max_bytes")]
+    pub web_fetch_max_bytes: usize,
 }
 
 impl Default for LocalToolsConfig {
@@ -340,6 +352,8 @@ impl Default for LocalToolsConfig {
             write_max_bytes: 10_485_760,
             bash_allowlist: Vec::new(),
             bash_blocklist: Vec::new(),
+            web_fetch_timeout_secs: 30,
+            web_fetch_max_bytes: 102_400,
         }
     }
 }
@@ -989,6 +1003,8 @@ agents_md:
         assert_eq!(config.write_max_bytes, 10_485_760);
         assert!(config.bash_allowlist.is_empty());
         assert!(config.bash_blocklist.is_empty());
+        assert_eq!(config.web_fetch_timeout_secs, 30);
+        assert_eq!(config.web_fetch_max_bytes, 102_400);
     }
 
     #[test]
@@ -1005,6 +1021,8 @@ bash_allowlist:
 bash_blocklist:
   - "rm"
   - "dd"
+web_fetch_timeout_secs: 15
+web_fetch_max_bytes: 51200
 "#;
         let config: LocalToolsConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(!config.enabled);
@@ -1014,6 +1032,8 @@ bash_blocklist:
         assert_eq!(config.write_max_bytes, 2097152);
         assert_eq!(config.bash_allowlist, vec!["ls", "cat"]);
         assert_eq!(config.bash_blocklist, vec!["rm", "dd"]);
+        assert_eq!(config.web_fetch_timeout_secs, 15);
+        assert_eq!(config.web_fetch_max_bytes, 51200);
     }
 
     #[test]

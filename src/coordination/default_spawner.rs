@@ -426,12 +426,13 @@ mod tests {
             .map(|t| t.name.as_str())
             .collect();
 
-        // 7 coordination + 1 navigate + 6 local tools = 14
-        assert_eq!(chain.tool_definitions().len(), 14);
+        // 7 coordination + 1 navigate + 7 local tools = 15
+        assert_eq!(chain.tool_definitions().len(), 15);
         assert!(tool_names.contains(&"navigate"));
         assert!(tool_names.contains(&"read_file"));
         assert!(tool_names.contains(&"write_file"));
         assert!(tool_names.contains(&"bash"));
+        assert!(tool_names.contains(&"web_fetch"));
     }
 
     #[test]
