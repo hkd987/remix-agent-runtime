@@ -111,6 +111,14 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             match block {
                 ContentBlock::ToolUse { id, name, input } => {
                     debug!(tool = %name, "Executing tool");
+                    events::emit(
+                        &self.event_bus,
+                        AgentEvent::ToolUseStart {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        },
+                    );
                     let step_start = Instant::now();
                     let exec_result = self.tools.execute_tool(name, input.clone()).await;
                     let step_duration = step_start.elapsed().as_millis() as u64;
@@ -122,6 +130,16 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         step_duration,
                         iteration,
                     );
+                    events::emit(
+                        &self.event_bus,
+                        AgentEvent::ToolUseResult {
+                            id: id.clone(),
+                            name: name.clone(),
+                            output: step.output.clone(),
+                            duration_ms: step.duration_ms,
+                            is_error: step.is_error.unwrap_or(false),
+                        },
+                    );
                     tool_results.push(content_block);
                     step_records.push(step);
                 }
@@ -129,6 +147,12 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     debug!(
                         thinking_length = thinking.len(),
                         "Model produced thinking block"
+                    );
+                    events::emit(
+                        &self.event_bus,
+                        AgentEvent::ThinkingComplete {
+                            thinking: thinking.clone(),
+                        },
                     );
                 }
                 _ => {}
@@ -662,9 +686,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 ContentBlock::Text { text } => {
                     events::emit(
                         &self.event_bus,
-                        AgentEvent::TextDelta {
-                            text: text.clone(),
-                        },
+                        AgentEvent::TextDelta { text: text.clone() },
                     );
                 }
                 ContentBlock::Thinking { thinking } => {
@@ -1915,5 +1937,113 @@ mod tests {
             }
         ));
         assert_eq!(step_records[0].is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_event_bus_emits_tool_events() {
+        let bus = Arc::new(EventBus::new(64));
+        let mut rx = bus.subscribe();
+
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![])),
+        };
+
+        let content = vec![ContentBlock::ToolUse {
+            id: "t1".to_string(),
+            name: "navigate".to_string(),
+            input: json!({"url": "https://example.com"}),
+        }];
+
+        let runner = AgentRunner::new(
+            MockLlm {
+                responses: Arc::new(Mutex::new(vec![])),
+            },
+            tools,
+            default_config(),
+        )
+        .with_event_bus(bus);
+
+        runner.execute_tools(&content, 1).await;
+
+        // Should receive ToolUseStart then ToolUseResult
+        let ev1 = rx.recv().await.unwrap();
+        assert_eq!(ev1.event_type(), "tool_use_start");
+
+        let ev2 = rx.recv().await.unwrap();
+        assert_eq!(ev2.event_type(), "tool_use_result");
+    }
+
+    #[tokio::test]
+    async fn test_event_bus_emits_thinking_events() {
+        let bus = Arc::new(EventBus::new(64));
+        let mut rx = bus.subscribe();
+
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![])),
+        };
+
+        let content = vec![ContentBlock::Thinking {
+            thinking: "Let me think about this...".to_string(),
+        }];
+
+        let runner = AgentRunner::new(
+            MockLlm {
+                responses: Arc::new(Mutex::new(vec![])),
+            },
+            tools,
+            default_config(),
+        )
+        .with_event_bus(bus);
+
+        runner.execute_tools(&content, 1).await;
+
+        let ev = rx.recv().await.unwrap();
+        assert_eq!(ev.event_type(), "thinking_complete");
+    }
+
+    #[tokio::test]
+    async fn test_event_bus_emits_completion_on_end_turn() {
+        let bus = Arc::new(EventBus::new(64));
+        let mut rx = bus.subscribe();
+
+        let llm = MockLlm {
+            responses: Arc::new(Mutex::new(vec![make_end_turn_response("Done!")])),
+        };
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![])),
+        };
+        let runner = AgentRunner::new(llm, tools, default_config()).with_event_bus(bus);
+
+        let result = runner
+            .run("test task", &Default::default(), &Default::default(), &None)
+            .await
+            .unwrap();
+        assert_eq!(result.status, AgentStatus::Success);
+
+        // Collect all events
+        let mut event_types = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            event_types.push(ev.event_type().to_string());
+        }
+
+        assert!(
+            event_types.contains(&"agent_started".to_string()),
+            "Missing agent_started event"
+        );
+        assert!(
+            event_types.contains(&"iteration_started".to_string()),
+            "Missing iteration_started event"
+        );
+        assert!(
+            event_types.contains(&"text_delta".to_string()),
+            "Missing text_delta event"
+        );
+        assert!(
+            event_types.contains(&"agent_completed".to_string()),
+            "Missing agent_completed event"
+        );
     }
 }

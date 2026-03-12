@@ -315,22 +315,19 @@ mod tests {
 
         let ev1 = rx1.recv().await.unwrap();
         let ev2 = rx2.recv().await.unwrap();
-        assert_eq!(
-            serde_json::to_value(&ev1).unwrap()["text"],
-            "hello"
-        );
-        assert_eq!(
-            serde_json::to_value(&ev2).unwrap()["text"],
-            "hello"
-        );
+        assert_eq!(serde_json::to_value(&ev1).unwrap()["text"], "hello");
+        assert_eq!(serde_json::to_value(&ev2).unwrap()["text"], "hello");
     }
 
     #[test]
     fn test_emit_helper_with_none_does_not_panic() {
-        emit(&None, AgentEvent::AgentStarted {
-            task: "test".to_string(),
-            timestamp_ms: 0,
-        });
+        emit(
+            &None,
+            AgentEvent::AgentStarted {
+                task: "test".to_string(),
+                timestamp_ms: 0,
+            },
+        );
     }
 
     #[tokio::test]
