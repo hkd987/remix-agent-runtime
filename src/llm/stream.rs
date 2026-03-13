@@ -82,6 +82,10 @@ pub struct MessageDeltaData {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeltaUsage {
     pub output_tokens: u32,
+    #[serde(default)]
+    pub input_tokens: Option<u32>,
+    #[serde(default)]
+    pub cost: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -390,7 +394,26 @@ mod tests {
         match event {
             StreamEvent::MessageDelta { delta, usage } => {
                 assert_eq!(delta.stop_reason, Some("end_turn".to_string()));
-                assert_eq!(usage.unwrap().output_tokens, 42);
+                let u = usage.unwrap();
+                assert_eq!(u.output_tokens, 42);
+                assert_eq!(u.input_tokens, None);
+                assert_eq!(u.cost, None);
+            }
+            other => panic!("Expected MessageDelta, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_message_delta_with_full_usage() {
+        let data = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":150,"input_tokens":500,"cost":0.003}}"#;
+        let event = SseParser::parse_event("message_delta", data).unwrap();
+        match event {
+            StreamEvent::MessageDelta { delta, usage } => {
+                assert_eq!(delta.stop_reason, Some("end_turn".to_string()));
+                let u = usage.unwrap();
+                assert_eq!(u.output_tokens, 150);
+                assert_eq!(u.input_tokens, Some(500));
+                assert_eq!(u.cost, Some(0.003));
             }
             other => panic!("Expected MessageDelta, got {:?}", other),
         }
