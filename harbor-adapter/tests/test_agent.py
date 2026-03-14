@@ -80,7 +80,7 @@ class TestCreateRunAgentCommands:
         assert isinstance(cmd, str)
         assert cmd.startswith("remix-agent run")
         assert "--no-browser" in cmd
-        assert "--permission-mode bypass-permissions" in cmd
+        assert "--permission-mode bypass_permissions" in cmd
         assert "--max-iterations 200" in cmd
         assert "--output" in cmd
         assert "--verbose" in cmd

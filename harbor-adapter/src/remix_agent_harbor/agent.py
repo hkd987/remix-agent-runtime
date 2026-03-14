@@ -7,9 +7,8 @@ import logging
 import os
 from pathlib import Path
 
-from harbor.agents.context import AgentContext
-from harbor.agents.installed.base import BaseInstalledAgent
-from harbor.agents.installed.types import ExecInput
+from harbor.agents.installed.base import BaseInstalledAgent, ExecInput
+from harbor.models.agent.context import AgentContext
 
 logger = logging.getLogger(__name__)
 
@@ -41,24 +40,31 @@ class RemixAgent(BaseInstalledAgent):
         return Path(__file__).parent / "templates" / "install-remix-agent.sh.j2"
 
     def create_run_agent_commands(self, instruction: str) -> list[ExecInput]:
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        # Support both REMIX_LLM_API_KEY (OpenRouter) and ANTHROPIC_API_KEY (direct)
+        api_key = os.environ.get("REMIX_LLM_API_KEY") or os.environ.get("ANTHROPIC_API_KEY", "")
         if not api_key:
             logger.warning(
-                "ANTHROPIC_API_KEY is not set; remix-agent will likely fail."
+                "Neither REMIX_LLM_API_KEY nor ANTHROPIC_API_KEY is set; remix-agent will likely fail."
             )
 
         model = _strip_provider_prefix(self.model_name)
 
         env: dict[str, str] = {
-            **os.environ,
             "REMIX_LLM_API_KEY": api_key,
             "REMIX_LLM_MODEL": model,
+            "HOME": os.environ.get("HOME", "/root"),
+            "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         }
+
+        # Forward base URL if set (e.g., for OpenRouter)
+        base_url = os.environ.get("REMIX_LLM_BASE_URL", "")
+        if base_url:
+            env["REMIX_LLM_BASE_URL"] = base_url
 
         cmd = (
             "remix-agent run"
             " --no-browser"
-            " --permission-mode bypass-permissions"
+            " --permission-mode bypass_permissions"
             " --max-iterations 200"
             f" --output {OUTPUT_FILE}"
             f" --session-dir {LOGS_DIR / 'sessions'}"
