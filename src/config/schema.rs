@@ -153,6 +153,8 @@ impl fmt::Display for LlmConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserConfig {
     #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
     pub headless: bool,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
@@ -166,6 +168,7 @@ pub struct BrowserConfig {
 impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
+            enabled: default_true(),
             headless: default_true(),
             timeout_secs: default_timeout(),
             viewport_width: default_viewport_width(),
@@ -672,11 +675,47 @@ mod tests {
     #[test]
     fn test_browser_config_defaults() {
         let config = BrowserConfig::default();
+        assert!(config.enabled);
         assert!(config.headless);
         assert_eq!(config.timeout_secs, 300);
         assert_eq!(config.viewport_width, 1280);
         assert_eq!(config.viewport_height, 720);
         assert!(config.browser_path.is_none());
+    }
+
+    #[test]
+    fn test_browser_config_enabled_defaults_to_true() {
+        let config = BrowserConfig::default();
+        assert!(
+            config.enabled,
+            "BrowserConfig.enabled should default to true for backward compatibility"
+        );
+    }
+
+    #[test]
+    fn test_browser_config_yaml_with_enabled_false() {
+        let yaml = r#"
+enabled: false
+headless: true
+"#;
+        let config: BrowserConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.enabled);
+        assert!(config.headless);
+    }
+
+    #[test]
+    fn test_browser_config_yaml_without_enabled_defaults_true() {
+        let yaml = r#"
+headless: false
+timeout_secs: 600
+"#;
+        let config: BrowserConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(
+            config.enabled,
+            "Missing 'enabled' field should default to true"
+        );
+        assert!(!config.headless);
+        assert_eq!(config.timeout_secs, 600);
     }
 
     #[test]

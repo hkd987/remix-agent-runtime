@@ -69,6 +69,9 @@ pub fn load_config(args: &RunArgs) -> Result<AppConfig, AgentError> {
     if let Some(ref browser_path) = args.browser_path {
         config.browser.browser_path = Some(browser_path.clone());
     }
+    if args.no_browser {
+        config.browser.enabled = false;
+    }
 
     // Apply skills configuration
     if let Some(ref skills_dir) = args.skills_dir {
@@ -227,6 +230,7 @@ mod tests {
             timeout: None,
             max_iterations: None,
             headed: false,
+            no_browser: false,
             verbose: false,
             output: None,
             browser_path: None,
@@ -392,6 +396,7 @@ agent:
             timeout: Some(120),
             max_iterations: Some(10),
             headed: true,
+            no_browser: false,
             verbose: false,
             output: None,
             browser_path: Some("/custom/path".to_string()),
@@ -544,6 +549,29 @@ llm:
         };
         let config = load_config(&args).unwrap();
         assert!(!config.browser.headless);
+    }
+
+    #[test]
+    fn test_no_browser_flag() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = RunArgs {
+            no_browser: true,
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert!(!config.browser.enabled);
+    }
+
+    #[test]
+    fn test_no_browser_false_preserves_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = default_run_args();
+        let config = load_config(&args).unwrap();
+        assert!(config.browser.enabled);
     }
 
     #[test]

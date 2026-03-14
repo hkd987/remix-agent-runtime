@@ -89,6 +89,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub headed: bool,
 
+    /// Disable browser connection (terminal-only mode)
+    #[arg(long)]
+    pub no_browser: bool,
+
     /// Enable verbose logging to stderr
     #[arg(short, long)]
     pub verbose: bool,
@@ -257,6 +261,7 @@ mod tests {
             "--max-iterations",
             "100",
             "--headed",
+            "--no-browser",
             "--verbose",
             "--output",
             "result.json",
@@ -307,6 +312,7 @@ mod tests {
         assert_eq!(args.timeout, Some(600));
         assert_eq!(args.max_iterations, Some(100));
         assert!(args.headed);
+        assert!(args.no_browser);
         assert!(args.verbose);
         assert_eq!(args.output, Some(PathBuf::from("result.json")));
         assert_eq!(
@@ -618,6 +624,18 @@ mod tests {
     fn test_parse_run_sse_port_default_none() {
         let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
         assert!(args.sse_port.is_none());
+    }
+
+    #[test]
+    fn test_parse_run_with_no_browser() {
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--no-browser"]));
+        assert!(args.no_browser);
+    }
+
+    #[test]
+    fn test_parse_run_no_browser_default_false() {
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
+        assert!(!args.no_browser);
     }
 
     #[test]

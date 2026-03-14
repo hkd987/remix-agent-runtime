@@ -88,20 +88,26 @@ async fn main() -> ExitCode {
                 config.llm.enable_prompt_caching,
             ));
 
-            // Spawn browser and connect via MCP
-            let command = BrowserManager::build_command(&config.browser);
-            let mcp_client = match McpBrowserClient::connect(command).await {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Error: Failed to connect to remix-browser: {e}");
-                    return ExitStatus::AgentError.into();
+            // Spawn browser and connect via MCP (if enabled)
+            let mcp_client = if config.browser.enabled {
+                let command = BrowserManager::build_command(&config.browser);
+                match McpBrowserClient::connect(command).await {
+                    Ok(c) => {
+                        tracing::info!(
+                            tools = c.tool_definitions().len(),
+                            "Connected to remix-browser"
+                        );
+                        Some(c)
+                    }
+                    Err(e) => {
+                        eprintln!("Error: Failed to connect to remix-browser: {e}");
+                        return ExitStatus::AgentError.into();
+                    }
                 }
+            } else {
+                tracing::info!("Browser disabled, running in terminal-only mode");
+                None
             };
-
-            tracing::info!(
-                tools = mcp_client.tool_definitions().len(),
-                "Connected to remix-browser"
-            );
 
             // Create webhook dispatcher
             let webhook =
@@ -223,7 +229,9 @@ async fn main() -> ExitCode {
 
             // Build CompositeToolExecutor with browser + plugin MCP servers
             let mut composite = CompositeToolExecutor::new();
-            composite.add_backend(Box::new(mcp_client));
+            if let Some(client) = mcp_client {
+                composite.add_backend(Box::new(client));
+            }
 
             if config.plugins.components.mcp_servers {
                 for (plugin, config_path) in plugin_set.all_mcp_configs() {

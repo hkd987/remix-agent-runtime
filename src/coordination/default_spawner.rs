@@ -163,12 +163,22 @@ impl<L: LlmProvider + 'static> SpawnHandler for DefaultSpawnHandler<L> {
             "Spawning child agent"
         );
 
-        // 1. Spawn a new remix-browser via MCP (with retry)
-        let mcp_client = connect_with_retry(&self.browser_config, &definition.name).await?;
+        // 1. Spawn a new remix-browser via MCP (with retry) if browser is enabled
+        let base_executor: Box<dyn ToolExecutor> = if self.browser_config.enabled {
+            let mcp_client = connect_with_retry(&self.browser_config, &definition.name).await?;
+            Box::new(mcp_client)
+        } else {
+            info!(
+                agent = %definition.name,
+                "Browser disabled, spawning child in terminal-only mode"
+            );
+            // Use an empty CompositeToolExecutor as the base (no browser tools)
+            Box::new(CompositeToolExecutor::new())
+        };
 
         // 2. Build child tool chain
         let coord_exec = build_child_chain(
-            Box::new(mcp_client),
+            base_executor,
             &definition,
             &self.skills_config,
             &self.skill_set,
