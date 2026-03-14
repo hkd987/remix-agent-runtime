@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "remix-agent-harbor"
+version = "0.1.0"
+description = "Harbor adapter for running remix-agent against Terminal-Bench 2.0"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "harbor",
+]
+
+[project.entry-points."harbor.agents"]
+remix-agent = "remix_agent_harbor:RemixAgent"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/remix_agent_harbor"]
