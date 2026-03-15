@@ -229,6 +229,34 @@ pub fn load_config(args: &RunArgs) -> Result<AppConfig, AgentError> {
         config.agent.goal_check_on_complete = true;
     }
 
+    // Apply action reminder interval
+    if let Some(interval) = args.action_reminder_interval {
+        config.agent.action_reminder_interval = Some(interval);
+    }
+
+    // Apply dev_tools configuration
+    if args.no_dev_tools {
+        config.dev_tools.enabled = false;
+    }
+    if args.no_lsp {
+        config.dev_tools.lsp.enabled = false;
+    }
+    if args.no_test_harness {
+        config.dev_tools.test_harness.enabled = false;
+    }
+    if args.no_repo_map {
+        config.dev_tools.repo_map.enabled = false;
+    }
+    for entry in &args.lsp_server {
+        if let Some((lang, cmd)) = entry.split_once('=') {
+            config
+                .dev_tools
+                .lsp
+                .server_overrides
+                .insert(lang.to_string(), cmd.to_string());
+        }
+    }
+
     // CLI task overrides YAML task
     if args.task.is_some() {
         config.task = args.task.clone();
@@ -293,6 +321,12 @@ mod tests {
             nudge_on_text_only: false,
             nudge_max_count: None,
             goal_check_on_complete: false,
+            no_dev_tools: false,
+            no_lsp: false,
+            no_test_harness: false,
+            no_repo_map: false,
+            lsp_server: Vec::new(),
+            action_reminder_interval: None,
         }
     }
 
@@ -466,6 +500,12 @@ agent:
             nudge_on_text_only: false,
             nudge_max_count: None,
             goal_check_on_complete: false,
+            action_reminder_interval: None,
+            no_dev_tools: false,
+            no_lsp: false,
+            no_test_harness: false,
+            no_repo_map: false,
+            lsp_server: Vec::new(),
         };
         let config = load_config(&args).unwrap();
 
@@ -1252,5 +1292,47 @@ agent:
         let config = load_config(&args).unwrap();
         assert!(config.agent.nudge_on_text_only);
         assert_eq!(config.agent.nudge_max_count, 10);
+    }
+
+    #[test]
+    fn test_action_reminder_interval_from_cli() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = RunArgs {
+            action_reminder_interval: Some(15),
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert_eq!(config.agent.action_reminder_interval, Some(15));
+    }
+
+    #[test]
+    fn test_action_reminder_interval_default_none() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = default_run_args();
+        let config = load_config(&args).unwrap();
+        assert!(config.agent.action_reminder_interval.is_none());
+    }
+
+    #[test]
+    fn test_action_reminder_interval_cli_overrides_yaml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let yaml = r#"
+agent:
+  action_reminder_interval: 10
+"#;
+        let file = write_yaml_tempfile(yaml);
+        let args = RunArgs {
+            config: Some(file.path().to_path_buf()),
+            action_reminder_interval: Some(20),
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert_eq!(config.agent.action_reminder_interval, Some(20));
     }
 }

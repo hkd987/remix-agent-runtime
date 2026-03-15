@@ -8,11 +8,20 @@ remix-agent-runtime is one piece of a three-part product strategy built around [
 When asked to do work always spin up multiple agents and work as a team to get the job done as fast as possible. High quality code written fast as a team is the goal here. Working together and sharing when needed.
 
  ## Code Quality
- - Always unit test code that we write ALWAYS. 
+ - Always unit test code that we write ALWAYS.
  - Always ensure the code is linted and or type checked
  - Always ensure the project builds
  - Always ensure the code is DRY
  - Always ensure you never use an `Any` type, we will always use high quality types in our code
+
+ ## Code Reuse Rules (prevent recurring audit findings)
+ - **Search for existing utilities before writing new ones.** Before implementing truncation, path resolution, string parsing, ANSI stripping, or output filtering — check `src/local_tools/tools/output_filter.rs` and other shared modules first. Duplicate utility code is a DRY violation.
+ - **Use the correct `AgentError` variant.** The enum is in `src/error.rs` — read it before using error types. Common mistake: using a non-existent `AgentError::Tool()` instead of `AgentError::ToolExecution()`.
+ - **Extract shared patterns across sibling files.** When two files in the same module (e.g., two tool handlers) share 10+ lines of identical logic, extract a helper function immediately — don't leave it for a cleanup pass.
+ - **Make struct fields derived when possible.** If a struct field can be computed from other fields (e.g., summary counts from a Vec of results), use computed methods instead of storing redundant state. This prevents data inconsistency.
+ - **Shared argument/parameter building.** When multiple tools need framework-specific argument construction (e.g., test filters), put the logic on the enum/type itself (`impl TestFramework { fn apply_filters(...) }`) rather than duplicating match blocks in each call site.
+ - **Strip ANSI codes from subprocess output.** Always apply `strip_ansi()` to stdout/stderr from child processes before returning to the agent — raw terminal escape codes waste context window tokens.
+ - **Use typed deserialization over stringly-typed JSON.** When working with protocols like LSP, prefer deserializing into typed structs (e.g., `lsp_types::*`) over manual `.get("field")` chains where feasible.
  
 ## When Planning or testing
  - Always see how you can validate a change you have made to ensure its correct

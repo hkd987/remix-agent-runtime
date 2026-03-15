@@ -34,6 +34,8 @@ pub struct AppConfig {
     pub subagent: SubagentConfig,
     #[serde(default)]
     pub coordination: CoordinationConfig,
+    #[serde(default)]
+    pub dev_tools: DevToolsConfig,
 }
 
 pub fn default_base_url() -> String {
@@ -216,6 +218,9 @@ pub struct AgentConfig {
     /// When true, inject a goal-check prompt before the agent terminates to verify work is complete.
     #[serde(default)]
     pub goal_check_on_complete: bool,
+    /// When set, inject a progress reminder every N iterations to keep the agent action-oriented.
+    #[serde(default)]
+    pub action_reminder_interval: Option<u32>,
 }
 
 pub fn default_nudge_max_count() -> u32 {
@@ -242,6 +247,7 @@ impl Default for AgentConfig {
             nudge_on_text_only: false,
             nudge_max_count: default_nudge_max_count(),
             goal_check_on_complete: false,
+            action_reminder_interval: None,
         }
     }
 }
@@ -674,6 +680,102 @@ impl Default for CoordinationConfig {
     }
 }
 
+fn default_lsp_request_timeout() -> u64 {
+    30
+}
+
+fn default_test_harness_timeout() -> u64 {
+    300
+}
+
+fn default_repo_map_max_files() -> usize {
+    500
+}
+
+fn default_repo_map_max_depth() -> usize {
+    10
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DevToolsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub lsp: LspConfig,
+    #[serde(default)]
+    pub test_harness: TestHarnessConfig,
+    #[serde(default)]
+    pub repo_map: RepoMapConfig,
+}
+
+impl Default for DevToolsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            lsp: LspConfig::default(),
+            test_harness: TestHarnessConfig::default(),
+            repo_map: RepoMapConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LspConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_lsp_request_timeout")]
+    pub request_timeout_secs: u64,
+    #[serde(default)]
+    pub server_overrides: HashMap<String, String>,
+}
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            request_timeout_secs: default_lsp_request_timeout(),
+            server_overrides: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TestHarnessConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_test_harness_timeout")]
+    pub timeout_secs: u64,
+}
+
+impl Default for TestHarnessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout_secs: default_test_harness_timeout(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoMapConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_repo_map_max_files")]
+    pub max_files: usize,
+    #[serde(default = "default_repo_map_max_depth")]
+    pub max_depth: usize,
+}
+
+impl Default for RepoMapConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_files: default_repo_map_max_files(),
+            max_depth: default_repo_map_max_depth(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -948,6 +1050,7 @@ url: "https://example.com/hook"
             permissions: PermissionsConfig::default(),
             subagent: SubagentConfig::default(),
             coordination: CoordinationConfig::default(),
+            dev_tools: DevToolsConfig::default(),
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         let deserialized: AppConfig = serde_yaml::from_str(&yaml).unwrap();

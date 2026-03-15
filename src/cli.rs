@@ -216,6 +216,30 @@ pub struct RunArgs {
     /// Verify goal completion before terminating (one-time check)
     #[arg(long)]
     pub goal_check_on_complete: bool,
+
+    /// Disable all dev tools (LSP, test harness, repo map)
+    #[arg(long)]
+    pub no_dev_tools: bool,
+
+    /// Disable LSP integration
+    #[arg(long)]
+    pub no_lsp: bool,
+
+    /// Disable test harness tools
+    #[arg(long)]
+    pub no_test_harness: bool,
+
+    /// Disable repo map tool
+    #[arg(long)]
+    pub no_repo_map: bool,
+
+    /// Override LSP server command for a language (e.g., "rust=rust-analyzer")
+    #[arg(long = "lsp-server", value_name = "LANG=CMD")]
+    pub lsp_server: Vec<String>,
+
+    /// Inject action reminders every N iterations (e.g., 15)
+    #[arg(long)]
+    pub action_reminder_interval: Option<u32>,
 }
 
 #[cfg(test)]
@@ -340,6 +364,8 @@ mod tests {
             "--nudge-max-count",
             "5",
             "--goal-check-on-complete",
+            "--action-reminder-interval",
+            "15",
             "do something",
         ]));
         assert_eq!(args.task, Some("do something".to_string()));
@@ -390,6 +416,7 @@ mod tests {
         assert!(args.nudge_on_text_only);
         assert_eq!(args.nudge_max_count, Some(5));
         assert!(args.goal_check_on_complete);
+        assert_eq!(args.action_reminder_interval, Some(15));
     }
 
     #[test]
@@ -884,5 +911,22 @@ mod tests {
         let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
         assert!(!args.nudge_on_text_only);
         assert!(args.nudge_max_count.is_none());
+    }
+
+    #[test]
+    fn test_parse_run_with_action_reminder_interval() {
+        let args = extract_run_args(Cli::parse_from([
+            "remix-agent",
+            "run",
+            "--action-reminder-interval",
+            "15",
+        ]));
+        assert_eq!(args.action_reminder_interval, Some(15));
+    }
+
+    #[test]
+    fn test_parse_run_action_reminder_interval_default_none() {
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
+        assert!(args.action_reminder_interval.is_none());
     }
 }

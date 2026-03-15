@@ -1,6 +1,6 @@
 [package]
 name = "remix-agent-runtime"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 license = "MIT"
 description = "LLM-driven browser automation agent runtime powered by remix-browser"
@@ -14,6 +14,7 @@ path = "src/main.rs"
 default = []
 postgres = ["sqlx"]
 sse = ["axum"]
+dev-tools = ["tree-sitter", "tree-sitter-rust", "tree-sitter-typescript", "tree-sitter-python", "tree-sitter-javascript"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -40,6 +41,13 @@ tokio-util = "0.7"
 htmd = "0.5"
 axum = { version = "0.8", features = ["default"], optional = true }
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "json", "chrono", "uuid"], optional = true }
+lsp-types = "0.97"
+which = "7"
+tree-sitter = { version = "0.24", optional = true }
+tree-sitter-rust = { version = "0.23", optional = true }
+tree-sitter-typescript = { version = "0.23", optional = true }
+tree-sitter-python = { version = "0.23", optional = true }
+tree-sitter-javascript = { version = "0.23", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"

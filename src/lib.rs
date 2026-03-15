@@ -4,6 +4,7 @@ pub mod browser;
 pub mod cli;
 pub mod config;
 pub mod coordination;
+pub mod dev_tools;
 pub mod error;
 pub mod llm;
 pub mod local_tools;

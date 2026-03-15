@@ -124,6 +124,48 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         None
     }
 
+    /// Build an action progress reminder if the interval is configured and the
+    /// current iteration is on an interval boundary.
+    fn build_action_reminder(&self, state: &AgentState) -> Option<String> {
+        let interval = self.config.action_reminder_interval?;
+        if interval == 0 {
+            return None;
+        }
+        let iteration = state.current_iteration();
+
+        // Only fire on interval boundaries, starting from the interval (not iteration 0)
+        if iteration == 0 || !iteration.is_multiple_of(interval) {
+            return None;
+        }
+
+        // Check if agent has written any files by looking at step records
+        let has_written_files = state
+            .steps()
+            .iter()
+            .any(|s| s.tool == "write_file" || s.tool == "edit_file");
+
+        let remaining = self.config.max_iterations.saturating_sub(iteration);
+
+        let msg = if has_written_files {
+            format!(
+                "Progress check: You are on iteration {} of {} ({} remaining). \
+                 You have written files - good. Make sure your solution is correct by running tests/verification. \
+                 If tests fail, fix and re-test.",
+                iteration, self.config.max_iterations, remaining
+            )
+        } else {
+            format!(
+                "URGENT: You are on iteration {} of {} ({} remaining) and you have NOT written any output files yet. \
+                 Stop analyzing and START WRITING CODE NOW. \
+                 Write a working solution immediately, even if imperfect. You can iterate and improve it after. \
+                 Check the task description for required output file paths.",
+                iteration, self.config.max_iterations, remaining
+            )
+        };
+
+        Some(msg)
+    }
+
     /// Returns `true` for tools that only read state.
     /// Used for plan mode filtering and potential future parallel execution.
     pub fn is_read_only_tool(name: &str) -> bool {
@@ -415,6 +457,11 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     iteration: state.current_iteration(),
                 },
             );
+
+            // Action progress reminder
+            if let Some(reminder) = self.build_action_reminder(&state) {
+                state.inject_system_notification(&reminder);
+            }
 
             // Feature 5: Check system reminders before LLM call
             if !reminder_scheduler.is_empty() {
@@ -1016,6 +1063,11 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 },
             );
 
+            // Action progress reminder
+            if let Some(reminder) = self.build_action_reminder(&state) {
+                state.inject_system_notification(&reminder);
+            }
+
             // System reminders
             if !reminder_scheduler.is_empty() {
                 let reminders = reminder_scheduler.check(state.current_iteration(), &[]);
@@ -1315,6 +1367,7 @@ mod tests {
             nudge_on_text_only: false,
             nudge_max_count: 3,
             goal_check_on_complete: false,
+            action_reminder_interval: None,
         }
     }
 
@@ -1412,6 +1465,7 @@ mod tests {
             nudge_on_text_only: false,
             nudge_max_count: 3,
             goal_check_on_complete: false,
+            action_reminder_interval: None,
         };
 
         // LLM always returns tool_use, so we hit max_iterations
@@ -1556,6 +1610,7 @@ mod tests {
             nudge_on_text_only: false,
             nudge_max_count: 3,
             goal_check_on_complete: false,
+            action_reminder_interval: None,
         };
 
         let llm_responses = Arc::new(Mutex::new(vec![make_end_turn_response("Done")]));
@@ -2418,5 +2473,264 @@ mod tests {
             "Expected 3 iterations (2 nudges exhausted, 3rd terminates)"
         );
         assert_eq!(result.result, Some("Analysis part 3...".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_action_reminder_fires_on_interval() {
+        // Config with interval 2 and max_iterations 10.
+        // We run 4 iterations of tool use, then end_turn on 5th.
+        // Reminder should fire at iterations 2 and 4 (but not 1 or 3).
+        let config = AgentConfig {
+            action_reminder_interval: Some(2),
+            max_iterations: 10,
+            ..default_config()
+        };
+
+        // We use a capturing LLM to inspect messages sent to it.
+        struct CapturingLlm {
+            responses: Arc<Mutex<Vec<MessagesResponse>>>,
+            captured_messages: Arc<Mutex<Vec<Vec<Message>>>>,
+        }
+
+        #[async_trait]
+        impl LlmProvider for CapturingLlm {
+            async fn send_messages(
+                &self,
+                _system: Option<&[SystemContent]>,
+                messages: &[Message],
+                _tools: Option<&[ToolDefinition]>,
+            ) -> Result<MessagesResponse, AgentError> {
+                self.captured_messages
+                    .lock()
+                    .unwrap()
+                    .push(messages.to_vec());
+                let mut responses = self.responses.lock().unwrap();
+                if responses.is_empty() {
+                    Err(AgentError::Llm("No more mock responses".into()))
+                } else {
+                    Ok(responses.remove(0))
+                }
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let llm = CapturingLlm {
+            responses: Arc::new(Mutex::new(vec![
+                make_tool_use_response("t1", "navigate", json!({"url": "a.com"})), // iteration 1
+                make_tool_use_response("t2", "navigate", json!({"url": "b.com"})), // iteration 2 (reminder fires before this call)
+                make_tool_use_response("t3", "navigate", json!({"url": "c.com"})), // iteration 3
+                make_tool_use_response("t4", "navigate", json!({"url": "d.com"})), // iteration 4 (reminder fires before this call)
+                make_end_turn_response("Done"),                                    // iteration 5
+            ])),
+            captured_messages: captured.clone(),
+        };
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![])),
+        };
+
+        let runner = AgentRunner::new(llm, tools, config);
+        let result = runner
+            .run(
+                "Do something",
+                &CredentialSet::new(),
+                &SkillSet::new(),
+                &None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.total_iterations, 5);
+
+        let all_calls = captured.lock().unwrap();
+        // 5 LLM calls total (iterations 1-5)
+        assert_eq!(all_calls.len(), 5);
+
+        // Helper: check if any message in the call contains "URGENT" or "Progress check"
+        let has_reminder = |call_idx: usize| -> bool {
+            all_calls[call_idx].iter().any(|msg| {
+                msg.content.iter().any(|block| match block {
+                    ContentBlock::Text { text } => {
+                        text.contains("URGENT") || text.contains("Progress check")
+                    }
+                    _ => false,
+                })
+            })
+        };
+
+        // Iteration 1: no reminder (1 % 2 != 0)
+        assert!(!has_reminder(0), "Should not have reminder on iteration 1");
+        // Iteration 2: reminder fires (2 % 2 == 0)
+        assert!(has_reminder(1), "Should have reminder on iteration 2");
+        // Iteration 3: no reminder
+        assert!(!has_reminder(2), "Should not have reminder on iteration 3");
+        // Iteration 4: reminder fires
+        assert!(has_reminder(3), "Should have reminder on iteration 4");
+    }
+
+    #[tokio::test]
+    async fn test_action_reminder_disabled_by_default() {
+        // Default config has action_reminder_interval: None.
+        // Verify no reminders are injected.
+        struct CapturingLlm {
+            responses: Arc<Mutex<Vec<MessagesResponse>>>,
+            captured_messages: Arc<Mutex<Vec<Vec<Message>>>>,
+        }
+
+        #[async_trait]
+        impl LlmProvider for CapturingLlm {
+            async fn send_messages(
+                &self,
+                _system: Option<&[SystemContent]>,
+                messages: &[Message],
+                _tools: Option<&[ToolDefinition]>,
+            ) -> Result<MessagesResponse, AgentError> {
+                self.captured_messages
+                    .lock()
+                    .unwrap()
+                    .push(messages.to_vec());
+                let mut responses = self.responses.lock().unwrap();
+                if responses.is_empty() {
+                    Err(AgentError::Llm("No more mock responses".into()))
+                } else {
+                    Ok(responses.remove(0))
+                }
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let llm = CapturingLlm {
+            responses: Arc::new(Mutex::new(vec![
+                make_tool_use_response("t1", "navigate", json!({"url": "a.com"})),
+                make_tool_use_response("t2", "navigate", json!({"url": "b.com"})),
+                make_end_turn_response("Done"),
+            ])),
+            captured_messages: captured.clone(),
+        };
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![])),
+        };
+
+        let runner = AgentRunner::new(llm, tools, default_config());
+        let result = runner
+            .run(
+                "Do something",
+                &CredentialSet::new(),
+                &SkillSet::new(),
+                &None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+
+        let all_calls = captured.lock().unwrap();
+        for (i, call) in all_calls.iter().enumerate() {
+            let has_reminder = call.iter().any(|msg| {
+                msg.content.iter().any(|block| match block {
+                    ContentBlock::Text { text } => {
+                        text.contains("URGENT") || text.contains("Progress check")
+                    }
+                    _ => false,
+                })
+            });
+            assert!(
+                !has_reminder,
+                "Should not have reminder on any iteration (disabled), but found one on call {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_action_reminder_no_files_written() {
+        let config = AgentConfig {
+            action_reminder_interval: Some(2),
+            max_iterations: 10,
+            ..default_config()
+        };
+        let llm = MockLlm {
+            responses: Arc::new(Mutex::new(vec![])),
+        };
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![])),
+        };
+        let runner = AgentRunner::new(llm, tools, config);
+
+        let mut state = AgentState::new("test task");
+
+        // iteration 0 -> no reminder
+        assert!(runner.build_action_reminder(&state).is_none());
+
+        // iteration 1 -> no reminder (1 % 2 != 0)
+        state.increment_iteration();
+        assert!(runner.build_action_reminder(&state).is_none());
+
+        // iteration 2 -> URGENT reminder (no files written)
+        state.increment_iteration();
+        let reminder = runner.build_action_reminder(&state).unwrap();
+        assert!(reminder.contains("URGENT"));
+        assert!(reminder.contains("NOT written any output files"));
+        assert!(reminder.contains("iteration 2 of 10"));
+    }
+
+    #[test]
+    fn test_build_action_reminder_with_files_written() {
+        let config = AgentConfig {
+            action_reminder_interval: Some(2),
+            max_iterations: 10,
+            ..default_config()
+        };
+        let llm = MockLlm {
+            responses: Arc::new(Mutex::new(vec![])),
+        };
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![])),
+        };
+        let runner = AgentRunner::new(llm, tools, config);
+
+        let mut state = AgentState::new("test task");
+        state.increment_iteration();
+        state.increment_iteration();
+
+        // Record a write_file step
+        state.record_step(StepRecord {
+            iteration: 1,
+            tool: "write_file".to_string(),
+            input: json!({"path": "out.txt"}),
+            output: json!("ok"),
+            duration_ms: 10,
+            is_error: None,
+        });
+
+        let reminder = runner.build_action_reminder(&state).unwrap();
+        assert!(reminder.contains("Progress check"));
+        assert!(reminder.contains("written files - good"));
+        assert!(!reminder.contains("URGENT"));
+    }
+
+    #[test]
+    fn test_build_action_reminder_none_when_disabled() {
+        let config = AgentConfig {
+            action_reminder_interval: None,
+            ..default_config()
+        };
+        let llm = MockLlm {
+            responses: Arc::new(Mutex::new(vec![])),
+        };
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![])),
+        };
+        let runner = AgentRunner::new(llm, tools, config);
+
+        let mut state = AgentState::new("test task");
+        state.increment_iteration();
+        state.increment_iteration();
+
+        assert!(runner.build_action_reminder(&state).is_none());
     }
 }

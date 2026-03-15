@@ -296,6 +296,18 @@ async fn main() -> ExitCode {
                 }
             };
 
+            // Wrap with dev tools executor
+            let executor = remix_agent_runtime::dev_tools::DevToolsExecutor::new(
+                executor,
+                config.dev_tools.clone(),
+            );
+            if config.dev_tools.enabled {
+                tracing::info!(
+                    tools = executor.tool_definitions().len(),
+                    "Dev tools enabled"
+                );
+            }
+
             // Wrap with hook-aware executor
             let executor =
                 HookAwareExecutor::new(executor, hook_registry, config.plugins.hook_timeout_secs);
@@ -469,9 +481,10 @@ async fn main() -> ExitCode {
             }
 
             // Gracefully shut down all MCP connections
-            // Chain: CoordinationExecutor -> PermissionAwareExecutor -> HookAwareExecutor -> LocalToolsExecutor -> SkillAwareExecutor -> CompositeToolExecutor
+            // Chain: CoordinationExecutor -> PermissionAwareExecutor -> HookAwareExecutor -> DevToolsExecutor -> LocalToolsExecutor -> SkillAwareExecutor -> CompositeToolExecutor
             runner
                 .into_tools()
+                .into_inner()
                 .into_inner()
                 .into_inner()
                 .into_inner()
