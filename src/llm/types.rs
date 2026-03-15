@@ -86,6 +86,12 @@ pub enum ContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
+    /// Redacted thinking blocks returned by the API when extended thinking
+    /// content is filtered. We deserialize and preserve them but skip
+    /// serialization of the opaque `data` field when not present.
+    RedactedThinking {
+        data: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
