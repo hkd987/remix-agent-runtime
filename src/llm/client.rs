@@ -58,6 +58,11 @@ impl<L: StreamingLlmProvider> StreamingLlmProvider for std::sync::Arc<L> {
     }
 }
 
+/// Trait for dynamically controlling the thinking/reasoning budget at runtime.
+pub trait ThinkingControl: Send + Sync {
+    fn set_thinking_config(&self, config: Option<ThinkingConfig>);
+}
+
 pub struct AnthropicClient {
     client: reqwest::Client,
     base_url: String,
@@ -65,7 +70,7 @@ pub struct AnthropicClient {
     model: String,
     max_tokens: u32,
     custom_headers: HashMap<String, String>,
-    thinking: Option<ThinkingConfig>,
+    thinking: std::sync::RwLock<Option<ThinkingConfig>>,
     enable_prompt_caching: bool,
 }
 
@@ -86,7 +91,7 @@ impl AnthropicClient {
             model,
             max_tokens,
             custom_headers,
-            thinking,
+            thinking: std::sync::RwLock::new(thinking),
             enable_prompt_caching,
         }
     }
@@ -120,13 +125,18 @@ impl LlmProvider for AnthropicClient {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
     ) -> Result<MessagesResponse, AgentError> {
+        let thinking = self
+            .thinking
+            .read()
+            .expect("thinking RwLock poisoned")
+            .clone();
         let request = MessagesRequest {
             model: self.model.clone(),
             max_tokens: self.max_tokens,
             system: system.map(|s| s.to_vec()),
             messages: messages.to_vec(),
             tools: tools.map(|t| t.to_vec()),
-            thinking: self.thinking.clone(),
+            thinking,
             stream: None,
         };
 
@@ -202,6 +212,12 @@ impl LlmProvider for AnthropicClient {
     }
 }
 
+impl ThinkingControl for AnthropicClient {
+    fn set_thinking_config(&self, config: Option<ThinkingConfig>) {
+        *self.thinking.write().expect("thinking RwLock poisoned") = config;
+    }
+}
+
 impl StreamingLlmProvider for AnthropicClient {
     fn send_messages_stream<'a>(
         &'a self,
@@ -209,13 +225,18 @@ impl StreamingLlmProvider for AnthropicClient {
         messages: &'a [Message],
         tools: Option<&'a [ToolDefinition]>,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, AgentError>> + Send + 'a>> {
+        let thinking = self
+            .thinking
+            .read()
+            .expect("thinking RwLock poisoned")
+            .clone();
         let request = MessagesRequest {
             model: self.model.clone(),
             max_tokens: self.max_tokens,
             system: system.map(|s| s.to_vec()),
             messages: messages.to_vec(),
             tools: tools.map(|t| t.to_vec()),
-            thinking: self.thinking.clone(),
+            thinking,
             stream: Some(true),
         };
 

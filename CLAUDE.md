@@ -22,6 +22,8 @@ When asked to do work always spin up multiple agents and work as a team to get t
  - **Shared argument/parameter building.** When multiple tools need framework-specific argument construction (e.g., test filters), put the logic on the enum/type itself (`impl TestFramework { fn apply_filters(...) }`) rather than duplicating match blocks in each call site.
  - **Strip ANSI codes from subprocess output.** Always apply `strip_ansi()` to stdout/stderr from child processes before returning to the agent — raw terminal escape codes waste context window tokens.
  - **Use typed deserialization over stringly-typed JSON.** When working with protocols like LSP, prefer deserializing into typed structs (e.g., `lsp_types::*`) over manual `.get("field")` chains where feasible.
+ - **Validate threshold ordering in multi-phase configs.** When a config has ordered thresholds (e.g., `planning_threshold < verification_threshold` in `ReasoningStagesConfig`), always add a `validate_config()` function and call it at startup. Inverted thresholds silently produce wrong behavior (unreachable phases) without validation.
+ - **Use `..default_config()` not `..Default::default()` in tests.** Test modules that define a `default_config()` helper should use it consistently for all test AgentConfig construction to prevent missing new fields when the struct grows.
  
 ## When Planning or testing
  - Always see how you can validate a change you have made to ensure its correct

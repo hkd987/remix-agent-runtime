@@ -1,0 +1,105 @@
+# coding-benchmark.yaml
+# Complete example config for running coding benchmarks with remix-agent.
+#
+# Usage:
+#   remix-agent --config examples/harness/coding-benchmark.yaml
+#
+# This config enables the three runtime features designed for benchmark
+# workloads: loop detection, reasoning stages, and iteration budget warnings.
+# The system prompt concatenates three adapter prompts (A2, A3, A4) that guide
+# the agent through environment discovery, a four-stage work cycle, and
+# testability-first development.
+
+# ---------------------------------------------------------------------------
+# Task — replace with the benchmark problem statement at runtime.
+# ---------------------------------------------------------------------------
+task: "Solve the coding task described in the PROBLEM.md file in the working directory."
+
+# ---------------------------------------------------------------------------
+# LLM settings
+# ---------------------------------------------------------------------------
+llm:
+  # Extended thinking budget (tokens) sent with every request.
+  # 10 000 is a reasonable baseline; reasoning_stages below will override
+  # this per-phase once those kick in.
+  thinking_budget_tokens: 10000
+
+# ---------------------------------------------------------------------------
+# Agent settings — the core of the benchmark harness config.
+# ---------------------------------------------------------------------------
+agent:
+  # 75 iterations gives the agent enough room for plan/build/verify/fix
+  # cycles without letting it run away.
+  max_iterations: 75
+
+  # -------------------------------------------------------------------------
+  # System prompt
+  # Concatenates three adapter prompts:
+  #   A2  Environment Discovery
+  #   A3  Planning-First / Four-Stage Cycle
+  #   A4  Testability-First / Edge Case Emphasis
+  # -------------------------------------------------------------------------
+  system_prompt: |
+    Before starting work, discover your environment:
+    1. List the working directory structure (2 levels deep)
+    2. Check available tools (python --version, node --version, cargo --version, etc.)
+    3. Read any README, Makefile, or build configuration files
+    4. Identify the project type and build system
+    Use this context to inform your approach.
+
+    Follow this cycle for every task:
+    1. PLAN: Read the task fully. Scan all relevant files. Identify how you will verify your solution.
+    2. BUILD: Implement the solution. Write tests alongside code when possible.
+    3. VERIFY: Run tests, linters, and type checkers. Compare output against the original requirements — not against your own code.
+    4. FIX: If anything fails, analyze the error, revisit the original spec, and fix. Return to VERIFY.
+    Never skip from PLAN to BUILD without reading existing code first.
+
+    Your solution will be validated programmatically against tests you cannot see.
+    Prioritize: exact specification adherence, edge cases, boundary conditions, error handling.
+    Do not assume lenient validation. Build and run your own tests before finishing.
+
+  # When the LLM responds with plain text (no tool calls), nudge it back into
+  # action so it doesn't stall mid-benchmark.
+  nudge_on_text_only: true
+
+  # Before the agent declares itself done, inject a goal-check prompt that
+  # re-reads the original task and verifies all constraints are satisfied.
+  goal_check_on_complete: true
+
+  # Every 5 iterations, inject a short progress reminder to keep the agent
+  # action-oriented and prevent it from drifting.
+  action_reminder_interval: 5
+
+  # -------------------------------------------------------------------------
+  # Loop detection
+  # Prevents doom-loops where the agent repeats the same tool call.
+  # If the same call appears 3 times within a 10-step window, the agent
+  # receives a nudge to change strategy.
+  # -------------------------------------------------------------------------
+  loop_detection:
+    max_repeats: 3
+    window_size: 10
+
+  # -------------------------------------------------------------------------
+  # Reasoning stages
+  # Varies the thinking budget across three phases of the iteration budget:
+  #
+  #   Planning      (iterations 0 – 30%):  10 000 tokens — deep analysis
+  #   Execution     (iterations 30 – 80%):  5 000 tokens — focused building
+  #   Verification  (iterations 80 – 100%): 10 000 tokens — careful checking
+  #
+  # Thresholds are fractions of max_iterations.
+  # -------------------------------------------------------------------------
+  reasoning_stages:
+    planning_budget_tokens: 10000
+    execution_budget_tokens: 5000
+    verification_budget_tokens: 10000
+    planning_threshold: 0.3
+    verification_threshold: 0.8
+
+  # -------------------------------------------------------------------------
+  # Iteration budget warning
+  # At 70% of max_iterations (iteration 53 of 75), inject a one-time warning
+  # so the agent knows to wrap up and verify rather than start new work.
+  # -------------------------------------------------------------------------
+  iteration_budget_warning_threshold: 0.7

@@ -55,6 +55,7 @@ pub struct AgentRunner<L: LlmProvider, T: ToolExecutor> {
     tools: T,
     config: AgentConfig,
     event_bus: Option<Arc<EventBus>>,
+    thinking_control: Option<Arc<dyn crate::llm::client::ThinkingControl>>,
 }
 
 impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
@@ -64,12 +65,22 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             tools,
             config,
             event_bus: None,
+            thinking_control: None,
         }
     }
 
     /// Attach an event bus for real-time event streaming.
     pub fn with_event_bus(mut self, event_bus: Arc<EventBus>) -> Self {
         self.event_bus = Some(event_bus);
+        self
+    }
+
+    /// Attach a thinking control for dynamic reasoning budget adjustment.
+    pub fn with_thinking_control(
+        mut self,
+        control: Arc<dyn crate::llm::client::ThinkingControl>,
+    ) -> Self {
+        self.thinking_control = Some(control);
         self
     }
 
@@ -170,6 +181,29 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         };
 
         Some(msg)
+    }
+
+    /// Build a one-time budget warning when the agent reaches a configured
+    /// fraction of max_iterations. Returns `None` on all other iterations.
+    fn build_budget_warning(&self, state: &AgentState) -> Option<String> {
+        let threshold = self.config.iteration_budget_warning_threshold?;
+        let threshold_iteration = (threshold * self.config.max_iterations as f32).ceil() as u32;
+        if state.current_iteration() != threshold_iteration {
+            return None;
+        }
+        let remaining = self
+            .config
+            .max_iterations
+            .saturating_sub(state.current_iteration());
+        Some(format!(
+            "[BUDGET WARNING] You have used {}/{} iterations ({:.0}%). \
+             Focus on completing and verifying your current approach rather than starting over. \
+             You have {} iterations remaining.",
+            state.current_iteration(),
+            self.config.max_iterations,
+            (state.current_iteration() as f32 / self.config.max_iterations as f32) * 100.0,
+            remaining
+        ))
     }
 
     /// Returns `true` for tools that only read state.
@@ -337,6 +371,13 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         compaction_config: Option<&CompactionConfig>,
         compaction_llm: Option<&dyn LlmProvider>,
     ) -> Result<AgentResult, AgentError> {
+        // Validate reasoning stages config if present
+        if let Some(ref stages_config) = self.config.reasoning_stages {
+            if let Err(e) = super::reasoning_stages::validate_config(stages_config) {
+                warn!("{}", e);
+            }
+        }
+
         let mut state = AgentState::new(task);
 
         events::emit(
@@ -469,6 +510,20 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 state.inject_system_notification(&reminder);
             }
 
+            // Iteration budget warning (one-time)
+            if let Some(warning) = self.build_budget_warning(&state) {
+                state.inject_system_notification(&warning);
+            }
+
+            // Loop detection
+            if let Some(ref loop_config) = self.config.loop_detection {
+                if let Some(warning) =
+                    super::loop_detection::detect_loop(state.steps(), loop_config)
+                {
+                    state.inject_system_notification(&warning);
+                }
+            }
+
             // Feature 5: Check system reminders before LLM call
             if !reminder_scheduler.is_empty() {
                 let pending_tools: Vec<String> = Vec::new(); // pre-execution, no pending tools yet
@@ -476,6 +531,19 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 for reminder in reminders {
                     state.inject_system_notification(&reminder);
                 }
+            }
+
+            // Reasoning budget stages: adjust thinking budget based on phase
+            if let (Some(ref stages_config), Some(ref thinking_ctl)) =
+                (&self.config.reasoning_stages, &self.thinking_control)
+            {
+                let budget = super::reasoning_stages::compute_thinking_budget(
+                    stages_config,
+                    state.current_iteration(),
+                    self.config.max_iterations,
+                );
+                thinking_ctl
+                    .set_thinking_config(Some(crate::llm::types::ThinkingConfig::enabled(budget)));
             }
 
             // Feature 1 + 4: Resolve tool definitions based on mode
@@ -1402,6 +1470,9 @@ mod tests {
             nudge_max_count: 3,
             goal_check_on_complete: false,
             action_reminder_interval: None,
+            loop_detection: None,
+            reasoning_stages: None,
+            iteration_budget_warning_threshold: None,
         }
     }
 
@@ -1487,19 +1558,7 @@ mod tests {
     async fn test_max_iterations_reached() {
         let config = AgentConfig {
             max_iterations: 2,
-            system_prompt: None,
-            timeout_secs: 300,
-            coordination_config: None,
-            tool_result_max_bytes: 32768,
-            max_budget_usd: None,
-            lazy_tool_discovery: false,
-            plan_mode: false,
-            reminders: Vec::new(),
-            self_critique: None,
-            nudge_on_text_only: false,
-            nudge_max_count: 3,
-            goal_check_on_complete: false,
-            action_reminder_interval: None,
+            ..default_config()
         };
 
         // LLM always returns tool_use, so we hit max_iterations
@@ -1631,20 +1690,8 @@ mod tests {
     #[tokio::test]
     async fn test_system_prompt_with_credentials() {
         let config = AgentConfig {
-            max_iterations: 10,
             system_prompt: Some("You are a browser agent.".to_string()),
-            timeout_secs: 300,
-            coordination_config: None,
-            tool_result_max_bytes: 32768,
-            max_budget_usd: None,
-            lazy_tool_discovery: false,
-            plan_mode: false,
-            reminders: Vec::new(),
-            self_critique: None,
-            nudge_on_text_only: false,
-            nudge_max_count: 3,
-            goal_check_on_complete: false,
-            action_reminder_interval: None,
+            ..default_config()
         };
 
         let llm_responses = Arc::new(Mutex::new(vec![make_end_turn_response("Done")]));
@@ -2589,11 +2636,22 @@ mod tests {
         // Iteration 1: no reminder
         assert_eq!(count_0, 0, "Should not have reminder on iteration 1");
         // Iteration 2: first reminder fires (count increases by 1)
-        assert_eq!(count_1, count_0 + 1, "Should have new reminder on iteration 2");
+        assert_eq!(
+            count_1,
+            count_0 + 1,
+            "Should have new reminder on iteration 2"
+        );
         // Iteration 3: no new reminder (count stays the same)
-        assert_eq!(count_2, count_1, "Should not have new reminder on iteration 3");
+        assert_eq!(
+            count_2, count_1,
+            "Should not have new reminder on iteration 3"
+        );
         // Iteration 4: second reminder fires (count increases by 1)
-        assert_eq!(count_3, count_2 + 1, "Should have new reminder on iteration 4");
+        assert_eq!(
+            count_3,
+            count_2 + 1,
+            "Should have new reminder on iteration 4"
+        );
     }
 
     #[tokio::test]
@@ -2788,5 +2846,87 @@ mod tests {
         // iteration 2 -> fires
         state.increment_iteration();
         assert!(runner.build_action_reminder(&state).is_some());
+    }
+
+    fn make_runner_with_config(config: AgentConfig) -> AgentRunner<MockLlm, MockTools> {
+        let llm = MockLlm {
+            responses: Arc::new(Mutex::new(vec![])),
+        };
+        let tools = MockTools {
+            tools: vec![],
+            results: Arc::new(Mutex::new(vec![])),
+        };
+        AgentRunner::new(llm, tools, config)
+    }
+
+    #[test]
+    fn test_budget_warning_not_configured() {
+        let config = AgentConfig {
+            max_iterations: 50,
+            ..default_config()
+        };
+        let runner = make_runner_with_config(config);
+        let mut state = AgentState::new("test");
+        for _ in 0..40 {
+            state.increment_iteration();
+        }
+        assert!(runner.build_budget_warning(&state).is_none());
+    }
+
+    #[test]
+    fn test_budget_warning_fires_at_threshold() {
+        let config = AgentConfig {
+            max_iterations: 50,
+            iteration_budget_warning_threshold: Some(0.7),
+            ..default_config()
+        };
+        let runner = make_runner_with_config(config);
+        let mut state = AgentState::new("test");
+
+        // 0.7 * 50 = 35, ceil = 35 → fires at iteration 35
+        for _ in 0..34 {
+            state.increment_iteration();
+            assert!(runner.build_budget_warning(&state).is_none());
+        }
+        state.increment_iteration(); // iteration 35
+        let warning = runner.build_budget_warning(&state);
+        assert!(warning.is_some());
+        assert!(warning.unwrap().contains("BUDGET WARNING"));
+    }
+
+    #[test]
+    fn test_budget_warning_fires_only_once() {
+        let config = AgentConfig {
+            max_iterations: 50,
+            iteration_budget_warning_threshold: Some(0.7),
+            ..default_config()
+        };
+        let runner = make_runner_with_config(config);
+        let mut state = AgentState::new("test");
+
+        // Advance to iteration 35 (threshold)
+        for _ in 0..35 {
+            state.increment_iteration();
+        }
+        assert!(runner.build_budget_warning(&state).is_some());
+
+        // Iteration 36 → should not fire again
+        state.increment_iteration();
+        assert!(runner.build_budget_warning(&state).is_none());
+    }
+
+    #[test]
+    fn test_budget_warning_at_100_percent() {
+        let config = AgentConfig {
+            max_iterations: 10,
+            iteration_budget_warning_threshold: Some(1.0),
+            ..default_config()
+        };
+        let runner = make_runner_with_config(config);
+        let mut state = AgentState::new("test");
+        for _ in 0..10 {
+            state.increment_iteration();
+        }
+        assert!(runner.build_budget_warning(&state).is_some());
     }
 }

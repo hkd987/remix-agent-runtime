@@ -257,6 +257,56 @@ pub fn load_config(args: &RunArgs) -> Result<AppConfig, AgentError> {
         }
     }
 
+    // Apply loop detection configuration
+    if args.loop_detection
+        || args.loop_detection_max_repeats.is_some()
+        || args.loop_detection_window.is_some()
+    {
+        let mut ld = config
+            .agent
+            .loop_detection
+            .unwrap_or_else(schema::LoopDetectionConfig::default);
+        if let Some(max_repeats) = args.loop_detection_max_repeats {
+            ld.max_repeats = max_repeats;
+        }
+        if let Some(window) = args.loop_detection_window {
+            ld.window_size = window;
+        }
+        config.agent.loop_detection = Some(ld);
+    }
+
+    // Apply reasoning stages configuration
+    if args.reasoning_stages
+        || args.planning_budget_tokens.is_some()
+        || args.execution_budget_tokens.is_some()
+        || args.verification_budget_tokens.is_some()
+    {
+        let mut rs = config
+            .agent
+            .reasoning_stages
+            .unwrap_or_else(schema::ReasoningStagesConfig::default);
+        if let Some(t) = args.planning_budget_tokens {
+            rs.planning_budget_tokens = t;
+        }
+        if let Some(t) = args.execution_budget_tokens {
+            rs.execution_budget_tokens = t;
+        }
+        if let Some(t) = args.verification_budget_tokens {
+            rs.verification_budget_tokens = t;
+        }
+        config.agent.reasoning_stages = Some(rs);
+    }
+
+    // Apply iteration budget warning threshold
+    if let Some(threshold) = args.iteration_budget_warning_threshold {
+        config.agent.iteration_budget_warning_threshold = Some(threshold);
+    }
+
+    // Apply thinking budget tokens
+    if let Some(tokens) = args.thinking_budget_tokens {
+        config.llm.thinking_budget_tokens = Some(tokens);
+    }
+
     // CLI task overrides YAML task
     if args.task.is_some() {
         config.task = args.task.clone();
@@ -327,6 +377,15 @@ mod tests {
             no_repo_map: false,
             lsp_server: Vec::new(),
             action_reminder_interval: None,
+            loop_detection: false,
+            loop_detection_max_repeats: None,
+            loop_detection_window: None,
+            reasoning_stages: false,
+            planning_budget_tokens: None,
+            execution_budget_tokens: None,
+            verification_budget_tokens: None,
+            iteration_budget_warning_threshold: None,
+            thinking_budget_tokens: None,
         }
     }
 

@@ -397,8 +397,12 @@ async fn main() -> ExitCode {
             }
 
             // Handle session resume/fork
-            let runner =
-                AgentRunner::new(llm_client, executor, agent_config).with_event_bus(event_bus);
+            let thinking_control: std::sync::Arc<
+                dyn remix_agent_runtime::llm::client::ThinkingControl,
+            > = llm_client.clone();
+            let runner = AgentRunner::new(llm_client, executor, agent_config)
+                .with_event_bus(event_bus)
+                .with_thinking_control(thinking_control);
             let result = if let Some(ref session_id) = args.session_id {
                 // Resume existing session
                 let store = session_store.as_ref().unwrap_or_else(|| {

@@ -221,6 +221,15 @@ pub struct AgentConfig {
     /// When set, inject a progress reminder every N iterations to keep the agent action-oriented.
     #[serde(default)]
     pub action_reminder_interval: Option<u32>,
+    /// Loop detection configuration to prevent the agent from repeating the same tool calls.
+    #[serde(default)]
+    pub loop_detection: Option<LoopDetectionConfig>,
+    /// Reasoning budget stages configuration to vary thinking budget across agent phases.
+    #[serde(default)]
+    pub reasoning_stages: Option<ReasoningStagesConfig>,
+    /// Fraction of max_iterations at which to inject a one-time budget warning (e.g., 0.7 = 70%).
+    #[serde(default)]
+    pub iteration_budget_warning_threshold: Option<f32>,
 }
 
 pub fn default_nudge_max_count() -> u32 {
@@ -248,6 +257,9 @@ impl Default for AgentConfig {
             nudge_max_count: default_nudge_max_count(),
             goal_check_on_complete: false,
             action_reminder_interval: None,
+            loop_detection: None,
+            reasoning_stages: None,
+            iteration_budget_warning_threshold: None,
         }
     }
 }
@@ -294,6 +306,90 @@ impl Default for SelfCritiqueConfig {
             max_tokens: 2048,
             trigger_tools: None,
             max_rounds: 2,
+        }
+    }
+}
+
+fn default_loop_max_repeats() -> u32 {
+    3
+}
+
+fn default_loop_window_size() -> u32 {
+    10
+}
+
+/// Configuration for loop/doom-loop detection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LoopDetectionConfig {
+    /// Trigger after this many identical tool calls in the window.
+    #[serde(default = "default_loop_max_repeats")]
+    pub max_repeats: u32,
+    /// Only look at the last N steps.
+    #[serde(default = "default_loop_window_size")]
+    pub window_size: u32,
+    /// Custom override message to inject when a loop is detected.
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+impl Default for LoopDetectionConfig {
+    fn default() -> Self {
+        Self {
+            max_repeats: default_loop_max_repeats(),
+            window_size: default_loop_window_size(),
+            message: None,
+        }
+    }
+}
+
+fn default_planning_budget_tokens() -> u32 {
+    10_000
+}
+
+fn default_execution_budget_tokens() -> u32 {
+    5_000
+}
+
+fn default_verification_budget_tokens() -> u32 {
+    10_000
+}
+
+fn default_planning_threshold() -> f32 {
+    0.3
+}
+
+fn default_verification_threshold() -> f32 {
+    0.8
+}
+
+/// Configuration for reasoning budget stages — varies thinking budget across agent phases.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReasoningStagesConfig {
+    /// Budget tokens for the planning phase (early iterations).
+    #[serde(default = "default_planning_budget_tokens")]
+    pub planning_budget_tokens: u32,
+    /// Budget tokens for the execution phase (middle iterations).
+    #[serde(default = "default_execution_budget_tokens")]
+    pub execution_budget_tokens: u32,
+    /// Budget tokens for the verification phase (late iterations).
+    #[serde(default = "default_verification_budget_tokens")]
+    pub verification_budget_tokens: u32,
+    /// Fraction of max_iterations below which the agent is in planning phase.
+    #[serde(default = "default_planning_threshold")]
+    pub planning_threshold: f32,
+    /// Fraction of max_iterations at or above which the agent is in verification phase.
+    #[serde(default = "default_verification_threshold")]
+    pub verification_threshold: f32,
+}
+
+impl Default for ReasoningStagesConfig {
+    fn default() -> Self {
+        Self {
+            planning_budget_tokens: default_planning_budget_tokens(),
+            execution_budget_tokens: default_execution_budget_tokens(),
+            verification_budget_tokens: default_verification_budget_tokens(),
+            planning_threshold: default_planning_threshold(),
+            verification_threshold: default_verification_threshold(),
         }
     }
 }
@@ -1555,5 +1651,107 @@ denied_tools: []
         assert_eq!(json, serde_json::json!("dont_ask"));
         let deserialized: PermissionModeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(deserialized, PermissionModeConfig::DontAsk);
+    }
+
+    #[test]
+    fn test_loop_detection_config_defaults() {
+        let config = LoopDetectionConfig::default();
+        assert_eq!(config.max_repeats, 3);
+        assert_eq!(config.window_size, 10);
+        assert!(config.message.is_none());
+    }
+
+    #[test]
+    fn test_loop_detection_config_yaml_deser() {
+        let yaml = r#"
+max_repeats: 5
+window_size: 20
+message: "You're looping!"
+"#;
+        let config: LoopDetectionConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.max_repeats, 5);
+        assert_eq!(config.window_size, 20);
+        assert_eq!(config.message, Some("You're looping!".to_string()));
+    }
+
+    #[test]
+    fn test_loop_detection_config_yaml_defaults() {
+        let yaml = "{}";
+        let config: LoopDetectionConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.max_repeats, 3);
+        assert_eq!(config.window_size, 10);
+        assert!(config.message.is_none());
+    }
+
+    #[test]
+    fn test_reasoning_stages_config_defaults() {
+        let config = ReasoningStagesConfig::default();
+        assert_eq!(config.planning_budget_tokens, 10_000);
+        assert_eq!(config.execution_budget_tokens, 5_000);
+        assert_eq!(config.verification_budget_tokens, 10_000);
+        assert!((config.planning_threshold - 0.3).abs() < f32::EPSILON);
+        assert!((config.verification_threshold - 0.8).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_reasoning_stages_config_yaml_deser() {
+        let yaml = r#"
+planning_budget_tokens: 20000
+execution_budget_tokens: 8000
+verification_budget_tokens: 15000
+planning_threshold: 0.2
+verification_threshold: 0.9
+"#;
+        let config: ReasoningStagesConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.planning_budget_tokens, 20_000);
+        assert_eq!(config.execution_budget_tokens, 8_000);
+        assert_eq!(config.verification_budget_tokens, 15_000);
+        assert!((config.planning_threshold - 0.2).abs() < f32::EPSILON);
+        assert!((config.verification_threshold - 0.9).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_reasoning_stages_config_yaml_defaults() {
+        let yaml = "{}";
+        let config: ReasoningStagesConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.planning_budget_tokens, 10_000);
+        assert_eq!(config.execution_budget_tokens, 5_000);
+        assert_eq!(config.verification_budget_tokens, 10_000);
+    }
+
+    #[test]
+    fn test_agent_config_with_harness_features() {
+        let yaml = r#"
+max_iterations: 75
+loop_detection:
+  max_repeats: 4
+  window_size: 15
+reasoning_stages:
+  planning_budget_tokens: 12000
+  execution_budget_tokens: 6000
+  verification_budget_tokens: 12000
+iteration_budget_warning_threshold: 0.75
+"#;
+        let config: AgentConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.max_iterations, 75);
+
+        let loop_config = config.loop_detection.unwrap();
+        assert_eq!(loop_config.max_repeats, 4);
+        assert_eq!(loop_config.window_size, 15);
+
+        let stages = config.reasoning_stages.unwrap();
+        assert_eq!(stages.planning_budget_tokens, 12_000);
+        assert_eq!(stages.execution_budget_tokens, 6_000);
+        assert_eq!(stages.verification_budget_tokens, 12_000);
+
+        assert_eq!(config.iteration_budget_warning_threshold, Some(0.75));
+    }
+
+    #[test]
+    fn test_agent_config_harness_features_default_to_none() {
+        let config = AgentConfig::default();
+        assert!(config.loop_detection.is_none());
+        assert!(config.reasoning_stages.is_none());
+        assert!(config.iteration_budget_warning_threshold.is_none());
     }
 }

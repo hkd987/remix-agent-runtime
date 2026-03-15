@@ -240,6 +240,42 @@ pub struct RunArgs {
     /// Inject action reminders every N iterations (e.g., 15)
     #[arg(long)]
     pub action_reminder_interval: Option<u32>,
+
+    /// Enable loop detection (repeated same tool+input) with default settings
+    #[arg(long)]
+    pub loop_detection: bool,
+
+    /// Max repeated identical tool calls before triggering loop warning (default: 3)
+    #[arg(long)]
+    pub loop_detection_max_repeats: Option<u32>,
+
+    /// Lookback window size for loop detection (default: 10)
+    #[arg(long)]
+    pub loop_detection_window: Option<u32>,
+
+    /// Enable reasoning stages (varies thinking budget across planning/execution/verification)
+    #[arg(long)]
+    pub reasoning_stages: bool,
+
+    /// Thinking budget tokens for planning phase (default: 10000)
+    #[arg(long)]
+    pub planning_budget_tokens: Option<u32>,
+
+    /// Thinking budget tokens for execution phase (default: 5000)
+    #[arg(long)]
+    pub execution_budget_tokens: Option<u32>,
+
+    /// Thinking budget tokens for verification phase (default: 10000)
+    #[arg(long)]
+    pub verification_budget_tokens: Option<u32>,
+
+    /// Inject one-time budget warning at this fraction of max_iterations (e.g., 0.7)
+    #[arg(long)]
+    pub iteration_budget_warning_threshold: Option<f32>,
+
+    /// Base thinking budget tokens for LLM requests
+    #[arg(long)]
+    pub thinking_budget_tokens: Option<u32>,
 }
 
 #[cfg(test)]

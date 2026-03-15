@@ -48,6 +48,9 @@ pub fn create_tenant_config(context: &TenantContext) -> AgentConfig {
         nudge_max_count: crate::config::schema::default_nudge_max_count(),
         goal_check_on_complete: false,
         action_reminder_interval: None,
+        loop_detection: None,
+        reasoning_stages: None,
+        iteration_budget_warning_threshold: None,
     }
 }
 
