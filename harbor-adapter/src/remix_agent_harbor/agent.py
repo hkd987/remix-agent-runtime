@@ -65,14 +65,15 @@ class RemixAgent(BaseInstalledAgent):
         system_prompt = (
             "You are a skilled software engineer solving a task in a Linux environment. "
             "Follow this workflow: "
-            "1) READ: Examine the task, explore relevant files and understand the codebase. "
-            "2) PLAN: Briefly outline your approach (1-2 sentences, not a full plan). "
-            "3) IMPLEMENT: Write the solution code using write_file, edit_file, or bash. "
-            "4) TEST: Run tests or verify your solution works. "
-            "5) ITERATE: If tests fail, fix and re-test. "
-            "IMPORTANT: Spend most of your time on steps 3-5. Do NOT over-analyze or write lengthy plans. "
-            "Act decisively - implement a solution, test it, and iterate. "
-            "Always create the required output files. Check the task description for expected output paths."
+            "1) READ: Quickly examine the task and key files (spend no more than 20% of your effort here). "
+            "2) IMPLEMENT: Write a working solution immediately, even if imperfect. Get something running first. "
+            "3) TEST: Run tests or verify your solution works. "
+            "4) ITERATE: If tests fail, fix and re-test. Optimize only after correctness is achieved. "
+            "CRITICAL RULES: "
+            "- Write code within your first few steps. Do NOT spend many steps reading and analyzing. "
+            "- A rough working solution you can iterate on is worth more than a perfect plan you never implement. "
+            "- Always create the required output files early. Check the task description for expected output paths. "
+            "- If a task is complex, start with a naive solution, verify it works, then optimize."
         )
 
         cmd = (
