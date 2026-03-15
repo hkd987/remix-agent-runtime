@@ -23,10 +23,15 @@ pub struct LocalToolsExecutor<T: ToolExecutor> {
     path_validator: PathValidator,
     sandbox: Box<dyn BashSandbox>,
     all_tools: Vec<ToolDefinition>,
+    tool_result_max_bytes: usize,
 }
 
 impl<T: ToolExecutor> LocalToolsExecutor<T> {
-    pub fn new(inner: T, config: LocalToolsConfig) -> Result<Self, AgentError> {
+    pub fn new(
+        inner: T,
+        config: LocalToolsConfig,
+        tool_result_max_bytes: usize,
+    ) -> Result<Self, AgentError> {
         let sandbox_root = config.sandbox_dir.clone().unwrap_or_else(|| {
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
         });
@@ -46,6 +51,7 @@ impl<T: ToolExecutor> LocalToolsExecutor<T> {
             path_validator,
             sandbox,
             all_tools,
+            tool_result_max_bytes,
         })
     }
 
@@ -96,6 +102,7 @@ impl<T: ToolExecutor> ToolExecutor for LocalToolsExecutor<T> {
                         arguments,
                         self.sandbox.as_ref(),
                         &self.config,
+                        self.tool_result_max_bytes,
                     )
                     .await;
                 }
@@ -296,7 +303,7 @@ mod tests {
     fn test_enabled_adds_virtual_tools() {
         let dir = TempDir::new().unwrap();
         let inner = mock_inner();
-        let executor = LocalToolsExecutor::new(inner, test_config(&dir)).unwrap();
+        let executor = LocalToolsExecutor::new(inner, test_config(&dir), 32_768).unwrap();
         // 1 inner + 7 local tools = 8
         assert_eq!(executor.tool_definitions().len(), 8);
         let names: Vec<&str> = executor
@@ -318,7 +325,7 @@ mod tests {
     fn test_disabled_no_virtual_tools() {
         let dir = TempDir::new().unwrap();
         let inner = mock_inner();
-        let executor = LocalToolsExecutor::new(inner, disabled_config(&dir)).unwrap();
+        let executor = LocalToolsExecutor::new(inner, disabled_config(&dir), 32_768).unwrap();
         assert_eq!(executor.tool_definitions().len(), 1);
         assert_eq!(executor.tool_definitions()[0].name, "navigate");
     }
@@ -327,7 +334,7 @@ mod tests {
     async fn test_unknown_tool_delegates_to_inner() {
         let dir = TempDir::new().unwrap();
         let inner = mock_inner();
-        let executor = LocalToolsExecutor::new(inner, test_config(&dir)).unwrap();
+        let executor = LocalToolsExecutor::new(inner, test_config(&dir), 32_768).unwrap();
 
         let result = executor
             .execute_tool("navigate", json!({"url": "test"}))
@@ -341,7 +348,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("hello.txt"), "Hello from dispatch").unwrap();
         let inner = mock_inner();
-        let executor = LocalToolsExecutor::new(inner, test_config(&dir)).unwrap();
+        let executor = LocalToolsExecutor::new(inner, test_config(&dir), 32_768).unwrap();
 
         let result = executor
             .execute_tool("read_file", json!({"path": "hello.txt"}))
@@ -355,7 +362,7 @@ mod tests {
     async fn test_write_file_dispatch() {
         let dir = TempDir::new().unwrap();
         let inner = mock_inner();
-        let executor = LocalToolsExecutor::new(inner, test_config(&dir)).unwrap();
+        let executor = LocalToolsExecutor::new(inner, test_config(&dir), 32_768).unwrap();
 
         let result = executor
             .execute_tool(
@@ -376,7 +383,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("edit.txt"), "hello world").unwrap();
         let inner = mock_inner();
-        let executor = LocalToolsExecutor::new(inner, test_config(&dir)).unwrap();
+        let executor = LocalToolsExecutor::new(inner, test_config(&dir), 32_768).unwrap();
 
         let result = executor
             .execute_tool(
@@ -396,7 +403,7 @@ mod tests {
     async fn test_bash_dispatch() {
         let dir = TempDir::new().unwrap();
         let inner = mock_inner();
-        let executor = LocalToolsExecutor::new(inner, test_config(&dir)).unwrap();
+        let executor = LocalToolsExecutor::new(inner, test_config(&dir), 32_768).unwrap();
 
         let result = executor
             .execute_tool("bash", json!({"command": "echo sandbox_test"}))
@@ -411,7 +418,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("search.txt"), "find this needle here").unwrap();
         let inner = mock_inner();
-        let executor = LocalToolsExecutor::new(inner, test_config(&dir)).unwrap();
+        let executor = LocalToolsExecutor::new(inner, test_config(&dir), 32_768).unwrap();
 
         let result = executor
             .execute_tool("grep", json!({"pattern": "needle"}))
@@ -427,7 +434,7 @@ mod tests {
         fs::write(dir.path().join("a.txt"), "a").unwrap();
         fs::write(dir.path().join("b.rs"), "b").unwrap();
         let inner = mock_inner();
-        let executor = LocalToolsExecutor::new(inner, test_config(&dir)).unwrap();
+        let executor = LocalToolsExecutor::new(inner, test_config(&dir), 32_768).unwrap();
 
         let result = executor
             .execute_tool("glob", json!({"pattern": "*.txt"}))
@@ -442,7 +449,7 @@ mod tests {
     fn test_into_inner() {
         let dir = TempDir::new().unwrap();
         let inner = mock_inner();
-        let executor = LocalToolsExecutor::new(inner, test_config(&dir)).unwrap();
+        let executor = LocalToolsExecutor::new(inner, test_config(&dir), 32_768).unwrap();
         let recovered = executor.into_inner();
         assert_eq!(recovered.tool_definitions().len(), 1);
     }
@@ -471,7 +478,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("file.txt"), "content").unwrap();
         let inner = mock_inner();
-        let executor = LocalToolsExecutor::new(inner, disabled_config(&dir)).unwrap();
+        let executor = LocalToolsExecutor::new(inner, disabled_config(&dir), 32_768).unwrap();
 
         // Even local tool names should delegate to inner when disabled
         let result = executor

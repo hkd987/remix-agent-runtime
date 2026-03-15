@@ -61,14 +61,33 @@ class RemixAgent(BaseInstalledAgent):
         if base_url:
             env["REMIX_LLM_BASE_URL"] = base_url
 
+        # Action-oriented system prompt for benchmarks
+        system_prompt = (
+            "You are a skilled software engineer solving a task in a Linux environment. "
+            "Follow this workflow: "
+            "1) READ: Examine the task, explore relevant files and understand the codebase. "
+            "2) PLAN: Briefly outline your approach (1-2 sentences, not a full plan). "
+            "3) IMPLEMENT: Write the solution code using write_file, edit_file, or bash. "
+            "4) TEST: Run tests or verify your solution works. "
+            "5) ITERATE: If tests fail, fix and re-test. "
+            "IMPORTANT: Spend most of your time on steps 3-5. Do NOT over-analyze or write lengthy plans. "
+            "Act decisively - implement a solution, test it, and iterate. "
+            "Always create the required output files. Check the task description for expected output paths."
+        )
+
         cmd = (
             "remix-agent run"
             " --no-browser"
+            " --no-coordination"
             " --permission-mode bypass_permissions"
+            " --timeout 1800"
             " --max-iterations 200"
+            " --tool-result-max-bytes 16384"
+            " --deny-tool 'web_fetch'"
             f" --output {OUTPUT_FILE}"
             f" --session-dir {LOGS_DIR / 'sessions'}"
             " --verbose"
+            f" --system-prompt {json.dumps(system_prompt)}"
             f" {json.dumps(instruction)}"
         )
 

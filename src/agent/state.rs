@@ -12,6 +12,10 @@ pub struct AgentState {
     total_input_tokens: u32,
     total_output_tokens: u32,
     total_cost: f64,
+    /// Tracks the effective context size for compaction decisions.
+    /// Unlike `total_input_tokens` (which is cumulative for reporting),
+    /// this resets after compaction to reflect the actual context window usage.
+    effective_input_tokens: u32,
 }
 
 impl AgentState {
@@ -29,6 +33,7 @@ impl AgentState {
             total_input_tokens: 0,
             total_output_tokens: 0,
             total_cost: 0.0,
+            effective_input_tokens: 0,
         }
     }
 
@@ -42,6 +47,7 @@ impl AgentState {
             total_input_tokens: snapshot.metadata.total_input_tokens.unwrap_or(0),
             total_output_tokens: snapshot.metadata.total_output_tokens.unwrap_or(0),
             total_cost: 0.0,
+            effective_input_tokens: 0,
         }
     }
 
@@ -93,6 +99,7 @@ impl AgentState {
         if let Some(u) = usage {
             self.total_input_tokens += u.input_tokens;
             self.total_output_tokens += u.output_tokens;
+            self.effective_input_tokens += u.input_tokens;
             self.total_cost += compute_cost(model, u.input_tokens, u.output_tokens);
         }
     }
@@ -107,6 +114,19 @@ impl AgentState {
 
     pub fn total_output_tokens(&self) -> u32 {
         self.total_output_tokens
+    }
+
+    /// Returns the effective input token count for compaction decisions.
+    /// This tracks the actual context size and resets after compaction,
+    /// unlike `total_input_tokens` which is cumulative for reporting.
+    pub fn effective_input_tokens(&self) -> u32 {
+        self.effective_input_tokens
+    }
+
+    /// Reset effective input tokens after compaction.
+    /// `estimated_tokens` is a rough estimate of the compacted context size.
+    pub fn reset_effective_tokens(&mut self, estimated_tokens: u32) {
+        self.effective_input_tokens = estimated_tokens;
     }
 
     pub fn steps(&self) -> &[StepRecord] {
@@ -140,6 +160,8 @@ impl AgentState {
             }],
         });
         self.messages.extend(preserved);
+        // Reset effective tokens; caller will set the estimated value
+        self.effective_input_tokens = 0;
     }
 
     pub fn into_result(self, status: AgentStatus, final_text: Option<String>) -> AgentResult {
@@ -568,5 +590,211 @@ mod tests {
         assert_eq!(state.current_iteration(), 0);
         assert_eq!(state.total_input_tokens(), 0);
         assert_eq!(state.total_output_tokens(), 0);
+        assert_eq!(state.effective_input_tokens(), 0);
+    }
+
+    #[test]
+    fn test_effective_input_tokens_starts_at_zero() {
+        let state = AgentState::new("task");
+        assert_eq!(state.effective_input_tokens(), 0);
+    }
+
+    #[test]
+    fn test_effective_input_tokens_accumulates_with_usage() {
+        use crate::llm::types::Usage;
+
+        let mut state = AgentState::new("task");
+        state.accumulate_usage(
+            Some(&Usage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }),
+            "claude-sonnet-4-20250514",
+        );
+        assert_eq!(state.effective_input_tokens(), 100);
+        assert_eq!(state.total_input_tokens(), 100);
+
+        state.accumulate_usage(
+            Some(&Usage {
+                input_tokens: 200,
+                output_tokens: 75,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }),
+            "claude-sonnet-4-20250514",
+        );
+        assert_eq!(state.effective_input_tokens(), 300);
+        assert_eq!(state.total_input_tokens(), 300);
+    }
+
+    #[test]
+    fn test_effective_input_tokens_resets_after_compact() {
+        use crate::llm::types::Usage;
+
+        let mut state = AgentState::new("task");
+        state.add_assistant_message(vec![ContentBlock::Text {
+            text: "response 1".to_string(),
+        }]);
+        state.add_tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: "t1".to_string(),
+            content: ToolResultContent::Text("result 1".to_string()),
+            is_error: None,
+        }]);
+        state.add_assistant_message(vec![ContentBlock::Text {
+            text: "response 2".to_string(),
+        }]);
+        state.add_tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: "t2".to_string(),
+            content: ToolResultContent::Text("result 2".to_string()),
+            is_error: None,
+        }]);
+
+        // Accumulate some usage
+        state.accumulate_usage(
+            Some(&Usage {
+                input_tokens: 190_000,
+                output_tokens: 1000,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }),
+            "claude-sonnet-4-20250514",
+        );
+        assert_eq!(state.effective_input_tokens(), 190_000);
+        assert_eq!(state.total_input_tokens(), 190_000);
+
+        // Compact resets effective tokens to 0
+        state.compact("Summary of conversation", 2);
+        assert_eq!(state.effective_input_tokens(), 0);
+        // total_input_tokens remains cumulative
+        assert_eq!(state.total_input_tokens(), 190_000);
+    }
+
+    #[test]
+    fn test_reset_effective_tokens() {
+        use crate::llm::types::Usage;
+
+        let mut state = AgentState::new("task");
+        state.accumulate_usage(
+            Some(&Usage {
+                input_tokens: 100_000,
+                output_tokens: 500,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }),
+            "claude-sonnet-4-20250514",
+        );
+        assert_eq!(state.effective_input_tokens(), 100_000);
+
+        state.reset_effective_tokens(5_000);
+        assert_eq!(state.effective_input_tokens(), 5_000);
+        // total_input_tokens is unaffected
+        assert_eq!(state.total_input_tokens(), 100_000);
+    }
+
+    #[test]
+    fn test_effective_tokens_independent_from_total_after_compaction() {
+        use crate::llm::types::Usage;
+
+        let mut state = AgentState::new("task");
+        state.add_assistant_message(vec![ContentBlock::Text {
+            text: "response".to_string(),
+        }]);
+        state.add_tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: "t1".to_string(),
+            content: ToolResultContent::Text("result".to_string()),
+            is_error: None,
+        }]);
+        state.add_assistant_message(vec![ContentBlock::Text {
+            text: "response 2".to_string(),
+        }]);
+
+        // First accumulation
+        state.accumulate_usage(
+            Some(&Usage {
+                input_tokens: 150_000,
+                output_tokens: 500,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }),
+            "claude-sonnet-4-20250514",
+        );
+
+        // Compact and reset effective tokens
+        state.compact("Summary", 1);
+        state.reset_effective_tokens(2_000);
+
+        // Accumulate more usage after compaction
+        state.accumulate_usage(
+            Some(&Usage {
+                input_tokens: 10_000,
+                output_tokens: 200,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }),
+            "claude-sonnet-4-20250514",
+        );
+
+        // effective tracks only post-compaction context
+        assert_eq!(state.effective_input_tokens(), 12_000);
+        // total is cumulative across the whole session
+        assert_eq!(state.total_input_tokens(), 160_000);
+    }
+
+    #[test]
+    fn test_from_snapshot_effective_tokens_starts_at_zero() {
+        use crate::llm::types::Role;
+        use crate::session::types::{SessionId, SessionMetadata, SessionSnapshot, SessionStatus};
+        use chrono::Utc;
+
+        let now = Utc::now();
+        let snapshot = SessionSnapshot {
+            metadata: SessionMetadata {
+                id: SessionId("test-session".to_string()),
+                created_at: now,
+                updated_at: now,
+                task: "task".to_string(),
+                status: SessionStatus::InProgress,
+                total_input_tokens: Some(50_000),
+                total_output_tokens: Some(5_000),
+                parent_session_id: None,
+            },
+            messages: vec![crate::llm::types::Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "task".to_string(),
+                }],
+            }],
+            steps: vec![],
+            system_prompt: None,
+            iteration: 5,
+        };
+
+        let state = AgentState::from_snapshot(&snapshot);
+        // effective_input_tokens starts fresh on resume
+        assert_eq!(state.effective_input_tokens(), 0);
+        // total is restored from snapshot
+        assert_eq!(state.total_input_tokens(), 50_000);
+    }
+
+    #[test]
+    fn test_compact_noop_does_not_reset_effective_tokens() {
+        use crate::llm::types::Usage;
+
+        let mut state = AgentState::new("task");
+        state.accumulate_usage(
+            Some(&Usage {
+                input_tokens: 5_000,
+                output_tokens: 100,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }),
+            "claude-sonnet-4-20250514",
+        );
+        // Only 1 message, preserve_n=4 → no compaction
+        state.compact("summary", 4);
+        // effective should remain unchanged since compact was a no-op
+        assert_eq!(state.effective_input_tokens(), 5_000);
     }
 }

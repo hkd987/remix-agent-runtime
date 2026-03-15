@@ -31,9 +31,11 @@ pub struct DefaultSpawnHandler<L: LlmProvider + 'static> {
     skill_set: SkillSet,
     coordination_config: CoordinationConfig,
     coordination_context: Arc<CoordinationContext>,
+    tool_result_max_bytes: usize,
 }
 
 impl<L: LlmProvider + 'static> DefaultSpawnHandler<L> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         llm: Arc<L>,
         browser_config: BrowserConfig,
@@ -42,6 +44,7 @@ impl<L: LlmProvider + 'static> DefaultSpawnHandler<L> {
         skill_set: SkillSet,
         coordination_config: CoordinationConfig,
         coordination_context: Arc<CoordinationContext>,
+        tool_result_max_bytes: usize,
     ) -> Self {
         Self {
             llm,
@@ -51,6 +54,7 @@ impl<L: LlmProvider + 'static> DefaultSpawnHandler<L> {
             skill_set,
             coordination_config,
             coordination_context,
+            tool_result_max_bytes,
         }
     }
 }
@@ -59,6 +63,7 @@ impl<L: LlmProvider + 'static> DefaultSpawnHandler<L> {
 ///
 /// Factored out for testability: tests can supply a mock `Box<dyn ToolExecutor>`
 /// instead of a real MCP browser client.
+#[allow(clippy::too_many_arguments)]
 fn build_child_chain(
     base_executor: Box<dyn ToolExecutor>,
     definition: &SpawnDefinition,
@@ -67,6 +72,7 @@ fn build_child_chain(
     local_tools_config: &LocalToolsConfig,
     coordination_config: &CoordinationConfig,
     coordination_context: Arc<CoordinationContext>,
+    tool_result_max_bytes: usize,
 ) -> Result<CoordinationExecutor<Box<dyn ToolExecutor>>, AgentError> {
     // 1. Wrap base in CompositeToolExecutor
     let mut composite = CompositeToolExecutor::new();
@@ -80,7 +86,11 @@ fn build_child_chain(
     );
 
     // 3. Wrap in LocalToolsExecutor
-    let local_exec = LocalToolsExecutor::new(skill_exec, local_tools_config.clone())?;
+    let local_exec = LocalToolsExecutor::new(
+        skill_exec,
+        local_tools_config.clone(),
+        tool_result_max_bytes,
+    )?;
 
     // 4. Optionally wrap in FilteredToolExecutor
     let executor: Box<dyn ToolExecutor> = if !definition.allowed_tools.is_empty() {
@@ -185,6 +195,7 @@ impl<L: LlmProvider + 'static> SpawnHandler for DefaultSpawnHandler<L> {
             &self.local_tools_config,
             &self.coordination_config,
             self.coordination_context.clone(),
+            self.tool_result_max_bytes,
         )?;
 
         // 3. Build child AgentConfig
@@ -193,7 +204,7 @@ impl<L: LlmProvider + 'static> SpawnHandler for DefaultSpawnHandler<L> {
             system_prompt: definition.system_prompt.clone(),
             timeout_secs: definition.timeout_secs,
             coordination_config: Some(self.coordination_config.clone()),
-            tool_result_max_bytes: 32_768,
+            tool_result_max_bytes: self.tool_result_max_bytes,
             max_budget_usd: None,
             lazy_tool_discovery: false,
             plan_mode: false,
@@ -326,6 +337,7 @@ mod tests {
             SkillSet::new(),
             config,
             context,
+            32_768,
         );
 
         assert!(handler.browser_config.headless);
@@ -354,6 +366,7 @@ mod tests {
             &local_config,
             &config,
             context,
+            32_768,
         )
         .unwrap();
 
@@ -394,6 +407,7 @@ mod tests {
             &local_config,
             &config,
             context,
+            32_768,
         )
         .unwrap();
 
@@ -427,6 +441,7 @@ mod tests {
             &local_config,
             &config,
             context,
+            32_768,
         )
         .unwrap();
 
@@ -468,6 +483,7 @@ mod tests {
             &local_config,
             &config,
             context,
+            32_768,
         )
         .unwrap();
 
@@ -526,6 +542,7 @@ mod tests {
             &local_config,
             &config,
             context,
+            32_768,
         )
         .unwrap();
 
@@ -571,6 +588,7 @@ mod tests {
             &local_config,
             &config,
             context,
+            32_768,
         );
         assert!(result.is_err());
     }

@@ -282,6 +282,7 @@ async fn main() -> ExitCode {
             let executor = match remix_agent_runtime::local_tools::LocalToolsExecutor::new(
                 executor,
                 config.local_tools.clone(),
+                config.agent.tool_result_max_bytes,
             ) {
                 Ok(e) => {
                     if config.local_tools.enabled {
@@ -335,6 +336,7 @@ async fn main() -> ExitCode {
                 skill_set.clone(),
                 config.coordination.clone(),
                 coordination_context.clone(),
+                config.agent.tool_result_max_bytes,
             ));
             let executor = CoordinationExecutor::new(
                 executor,

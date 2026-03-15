@@ -9,6 +9,7 @@ pub async fn execute_bash(
     args: Value,
     sandbox: &dyn BashSandbox,
     config: &LocalToolsConfig,
+    max_bytes: usize,
 ) -> Result<ToolExecutionResult, AgentError> {
     let command = args
         .get("command")
@@ -60,8 +61,7 @@ pub async fn execute_bash(
     // Apply output filters: strip ANSI codes, deduplicate repeated lines, truncate
     result = super::output_filter::strip_ansi(&result);
     result = super::output_filter::dedup_lines(&result);
-    // Default max: 32KB, matching tool_result_max_bytes default
-    result = super::output_filter::truncate_output(&result, 32_768);
+    result = super::output_filter::truncate_output(&result, max_bytes);
 
     if output.exit_code != 0 {
         Ok(ToolExecutionResult {
@@ -109,6 +109,8 @@ mod tests {
         }
     }
 
+    const DEFAULT_MAX_BYTES: usize = 32_768;
+
     fn default_config() -> LocalToolsConfig {
         LocalToolsConfig::default()
     }
@@ -122,9 +124,14 @@ mod tests {
         });
         let config = default_config();
 
-        let result = execute_bash(json!({"command": "echo hello world"}), &sandbox, &config)
-            .await
-            .unwrap();
+        let result = execute_bash(
+            json!({"command": "echo hello world"}),
+            &sandbox,
+            &config,
+            DEFAULT_MAX_BYTES,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.content, "hello world\n");
         assert!(!result.is_error);
     }
@@ -142,6 +149,7 @@ mod tests {
             json!({"command": "sleep 1", "timeout_secs": 30}),
             &sandbox,
             &config,
+            DEFAULT_MAX_BYTES,
         )
         .await
         .unwrap();
@@ -161,7 +169,13 @@ mod tests {
             ..Default::default()
         };
 
-        let result = execute_bash(json!({"command": "rm -rf /"}), &sandbox, &config).await;
+        let result = execute_bash(
+            json!({"command": "rm -rf /"}),
+            &sandbox,
+            &config,
+            DEFAULT_MAX_BYTES,
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Command blocked"));
@@ -180,8 +194,13 @@ mod tests {
             ..Default::default()
         };
 
-        let result =
-            execute_bash(json!({"command": "echo test | rm -rf"}), &sandbox, &config).await;
+        let result = execute_bash(
+            json!({"command": "echo test | rm -rf"}),
+            &sandbox,
+            &config,
+            DEFAULT_MAX_BYTES,
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Command blocked"));
@@ -199,9 +218,14 @@ mod tests {
             ..Default::default()
         };
 
-        let result = execute_bash(json!({"command": "ls -la"}), &sandbox, &config)
-            .await
-            .unwrap();
+        let result = execute_bash(
+            json!({"command": "ls -la"}),
+            &sandbox,
+            &config,
+            DEFAULT_MAX_BYTES,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.content, "file1\nfile2\n");
         assert!(!result.is_error);
     }
@@ -218,7 +242,13 @@ mod tests {
             ..Default::default()
         };
 
-        let result = execute_bash(json!({"command": "rm -rf /"}), &sandbox, &config).await;
+        let result = execute_bash(
+            json!({"command": "rm -rf /"}),
+            &sandbox,
+            &config,
+            DEFAULT_MAX_BYTES,
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("not in allowlist"));
@@ -236,9 +266,14 @@ mod tests {
             ..Default::default()
         };
 
-        let result = execute_bash(json!({"command": "any-command"}), &sandbox, &config)
-            .await
-            .unwrap();
+        let result = execute_bash(
+            json!({"command": "any-command"}),
+            &sandbox,
+            &config,
+            DEFAULT_MAX_BYTES,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.content, "anything");
         assert!(!result.is_error);
     }
@@ -252,9 +287,14 @@ mod tests {
         });
         let config = default_config();
 
-        let result = execute_bash(json!({"command": "false"}), &sandbox, &config)
-            .await
-            .unwrap();
+        let result = execute_bash(
+            json!({"command": "false"}),
+            &sandbox,
+            &config,
+            DEFAULT_MAX_BYTES,
+        )
+        .await
+        .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("Exit code: 1"));
         assert!(result.content.contains("[stderr] error occurred"));
@@ -269,7 +309,7 @@ mod tests {
         });
         let config = default_config();
 
-        let result = execute_bash(json!({}), &sandbox, &config).await;
+        let result = execute_bash(json!({}), &sandbox, &config, DEFAULT_MAX_BYTES).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("requires 'command' parameter"));
@@ -284,9 +324,14 @@ mod tests {
         });
         let config = default_config();
 
-        let result = execute_bash(json!({"command": "test"}), &sandbox, &config)
-            .await
-            .unwrap();
+        let result = execute_bash(
+            json!({"command": "test"}),
+            &sandbox,
+            &config,
+            DEFAULT_MAX_BYTES,
+        )
+        .await
+        .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("stdout line"));
         assert!(result.content.contains("[stderr] stderr line"));
@@ -301,9 +346,14 @@ mod tests {
         });
         let config = default_config();
 
-        let result = execute_bash(json!({"command": "test"}), &sandbox, &config)
-            .await
-            .unwrap();
+        let result = execute_bash(
+            json!({"command": "test"}),
+            &sandbox,
+            &config,
+            DEFAULT_MAX_BYTES,
+        )
+        .await
+        .unwrap();
         assert!(!result.is_error);
         assert!(!result.content.contains("\x1b["));
         assert!(result.content.contains("✓ passed"));
@@ -320,9 +370,14 @@ mod tests {
         });
         let config = default_config();
 
-        let result = execute_bash(json!({"command": "build"}), &sandbox, &config)
-            .await
-            .unwrap();
+        let result = execute_bash(
+            json!({"command": "build"}),
+            &sandbox,
+            &config,
+            DEFAULT_MAX_BYTES,
+        )
+        .await
+        .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("×10"));
         assert!(result.content.contains("done"));
@@ -338,11 +393,53 @@ mod tests {
         });
         let config = default_config();
 
-        let result = execute_bash(json!({"command": "cat big"}), &sandbox, &config)
+        let result = execute_bash(
+            json!({"command": "cat big"}),
+            &sandbox,
+            &config,
+            DEFAULT_MAX_BYTES,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("truncated"));
+        assert!(result.content.len() < 50_000);
+    }
+
+    #[tokio::test]
+    async fn test_bash_truncates_at_custom_max_bytes() {
+        let large_output = "x".repeat(20_000);
+        let sandbox = MockSandbox::new(CommandOutput {
+            stdout: large_output,
+            stderr: String::new(),
+            exit_code: 0,
+        });
+        let config = default_config();
+
+        // Use a smaller max_bytes (16KB)
+        let result = execute_bash(json!({"command": "cat big"}), &sandbox, &config, 16_384)
             .await
             .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("truncated"));
-        assert!(result.content.len() < 50_000);
+        assert!(result.content.len() <= 16_384 + 200); // allow margin for truncation message
+    }
+
+    #[tokio::test]
+    async fn test_bash_no_truncation_when_under_max_bytes() {
+        let small_output = "x".repeat(100);
+        let sandbox = MockSandbox::new(CommandOutput {
+            stdout: small_output.clone(),
+            stderr: String::new(),
+            exit_code: 0,
+        });
+        let config = default_config();
+
+        let result = execute_bash(json!({"command": "echo small"}), &sandbox, &config, 16_384)
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(!result.content.contains("truncated"));
+        assert_eq!(result.content, small_output);
     }
 }

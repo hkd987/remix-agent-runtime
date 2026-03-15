@@ -188,6 +188,22 @@ pub struct RunArgs {
     /// Port for SSE event server (enables real-time streaming to UI)
     #[arg(long, env = "REMIX_SSE_PORT")]
     pub sse_port: Option<u16>,
+
+    /// Custom system prompt
+    #[arg(long)]
+    pub system_prompt: Option<String>,
+
+    /// Maximum bytes for tool result output (truncation threshold)
+    #[arg(long, env = "REMIX_TOOL_RESULT_MAX_BYTES")]
+    pub tool_result_max_bytes: Option<usize>,
+
+    /// Override context window size in tokens for compaction
+    #[arg(long, env = "REMIX_CONTEXT_WINDOW")]
+    pub context_window: Option<u32>,
+
+    /// Disable context compaction entirely
+    #[arg(long)]
+    pub disable_compaction: bool,
 }
 
 #[cfg(test)]
@@ -301,6 +317,13 @@ mod tests {
             "/tmp/coordination",
             "--sse-port",
             "3100",
+            "--system-prompt",
+            "You are a helpful agent",
+            "--context-window",
+            "128000",
+            "--disable-compaction",
+            "--tool-result-max-bytes",
+            "16384",
             "do something",
         ]));
         assert_eq!(args.task, Some("do something".to_string()));
@@ -341,6 +364,33 @@ mod tests {
             Some(PathBuf::from("/tmp/coordination"))
         );
         assert_eq!(args.sse_port, Some(3100));
+        assert_eq!(
+            args.system_prompt,
+            Some("You are a helpful agent".to_string())
+        );
+        assert_eq!(args.context_window, Some(128_000));
+        assert!(args.disable_compaction);
+        assert_eq!(args.tool_result_max_bytes, Some(16_384));
+    }
+
+    #[test]
+    fn test_parse_run_with_system_prompt() {
+        let args = extract_run_args(Cli::parse_from([
+            "remix-agent",
+            "run",
+            "--system-prompt",
+            "You are a helpful agent",
+        ]));
+        assert_eq!(
+            args.system_prompt,
+            Some("You are a helpful agent".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_run_system_prompt_default_none() {
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
+        assert!(args.system_prompt.is_none());
     }
 
     #[test]
@@ -719,5 +769,55 @@ mod tests {
     fn test_parse_sessions_show_missing_id_fails() {
         let result = Cli::try_parse_from(["remix-agent", "sessions", "show"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_run_with_context_window() {
+        let args = extract_run_args(Cli::parse_from([
+            "remix-agent",
+            "run",
+            "--context-window",
+            "128000",
+        ]));
+        assert_eq!(args.context_window, Some(128_000));
+    }
+
+    #[test]
+    fn test_parse_run_context_window_default_none() {
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
+        assert!(args.context_window.is_none());
+    }
+
+    #[test]
+    fn test_parse_run_with_disable_compaction() {
+        let args = extract_run_args(Cli::parse_from([
+            "remix-agent",
+            "run",
+            "--disable-compaction",
+        ]));
+        assert!(args.disable_compaction);
+    }
+
+    #[test]
+    fn test_parse_run_disable_compaction_default_false() {
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
+        assert!(!args.disable_compaction);
+    }
+
+    #[test]
+    fn test_parse_run_with_tool_result_max_bytes() {
+        let args = extract_run_args(Cli::parse_from([
+            "remix-agent",
+            "run",
+            "--tool-result-max-bytes",
+            "16384",
+        ]));
+        assert_eq!(args.tool_result_max_bytes, Some(16_384));
+    }
+
+    #[test]
+    fn test_parse_run_tool_result_max_bytes_default_none() {
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
+        assert!(args.tool_result_max_bytes.is_none());
     }
 }

@@ -714,11 +714,11 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             if let Some(stage) = compaction_stages::determine_stage(
                 thresholds,
                 compact_config.context_window_tokens,
-                state.total_input_tokens(),
+                state.effective_input_tokens(),
             ) {
                 info!(
                     stage = ?stage,
-                    input_tokens = state.total_input_tokens(),
+                    input_tokens = state.effective_input_tokens(),
                     "Triggering progressive compaction"
                 );
                 match stage {
@@ -755,7 +755,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             }
         } else {
             // Legacy single-pass compaction
-            if compaction::should_compact(compact_config, state.total_input_tokens()) {
+            if compaction::should_compact(compact_config, state.effective_input_tokens()) {
                 self.run_llm_compaction(compact_config, state, compaction_llm)
                     .await;
             }
@@ -770,7 +770,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         compaction_llm: Option<&dyn LlmProvider>,
     ) {
         info!(
-            input_tokens = state.total_input_tokens(),
+            input_tokens = state.effective_input_tokens(),
             "Triggering context compaction"
         );
         let (compact_end, _) = compaction::compute_compaction_split(
@@ -798,7 +798,15 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         .collect::<Vec<_>>()
                         .join("\n");
                     state.compact(&summary_text, compact_config.preserve_recent_n);
-                    info!("Context compacted successfully");
+                    // Estimate tokens for compacted context (summary + preserved messages)
+                    // A rough estimate: count chars / 4 for the summary, plus a baseline
+                    let summary_chars = summary_text.len() as u32;
+                    let estimated_tokens = summary_chars / 4 + 1000;
+                    state.reset_effective_tokens(estimated_tokens);
+                    info!(
+                        estimated_tokens = estimated_tokens,
+                        "Context compacted successfully"
+                    );
                 }
                 Err(e) => {
                     warn!(error = %e, "Context compaction failed, continuing without");

@@ -81,9 +81,13 @@ class TestCreateRunAgentCommands:
         assert cmd.startswith("remix-agent run")
         assert "--no-browser" in cmd
         assert "--permission-mode bypass_permissions" in cmd
+        assert "--no-coordination" in cmd
+        assert "--deny-tool" in cmd
         assert "--max-iterations 200" in cmd
+        assert "--tool-result-max-bytes 16384" in cmd
         assert "--output" in cmd
         assert "--verbose" in cmd
+        assert "--system-prompt" in cmd
         # Instruction should be JSON-quoted at the end
         assert '"Navigate to google.com"' in cmd
 

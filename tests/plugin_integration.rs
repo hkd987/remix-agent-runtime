@@ -130,7 +130,7 @@ fn build_full_chain(
     hook_registry: HookRegistry,
 ) -> HookAwareExecutor<LocalToolsExecutor<SkillAwareExecutor<CompositeToolExecutor>>> {
     let skill_layer = SkillAwareExecutor::new(composite, skill_set, 60);
-    let local_layer = LocalToolsExecutor::new(skill_layer, local_tools_config)
+    let local_layer = LocalToolsExecutor::new(skill_layer, local_tools_config, 32_768)
         .expect("LocalToolsExecutor::new should not fail in tests");
     HookAwareExecutor::new(local_layer, hook_registry, 30)
 }

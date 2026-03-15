@@ -198,6 +198,24 @@ pub fn load_config(args: &RunArgs) -> Result<AppConfig, AgentError> {
         }
     }
 
+    // Apply system prompt from CLI
+    if let Some(ref system_prompt) = args.system_prompt {
+        config.agent.system_prompt = Some(system_prompt.clone());
+    }
+
+    // Apply tool result max bytes from CLI
+    if let Some(max_bytes) = args.tool_result_max_bytes {
+        config.agent.tool_result_max_bytes = max_bytes;
+    }
+
+    // Apply compaction configuration
+    if let Some(context_window) = args.context_window {
+        config.compaction.context_window_tokens = context_window;
+    }
+    if args.disable_compaction {
+        config.compaction.enabled = false;
+    }
+
     // CLI task overrides YAML task
     if args.task.is_some() {
         config.task = args.task.clone();
@@ -255,6 +273,10 @@ mod tests {
             continue_session: false,
             effort: None,
             sse_port: None,
+            system_prompt: None,
+            tool_result_max_bytes: None,
+            context_window: None,
+            disable_compaction: false,
         }
     }
 
@@ -421,6 +443,10 @@ agent:
             continue_session: false,
             effort: None,
             sse_port: None,
+            system_prompt: None,
+            tool_result_max_bytes: None,
+            context_window: None,
+            disable_compaction: false,
         };
         let config = load_config(&args).unwrap();
 
@@ -971,6 +997,51 @@ plugins:
     }
 
     #[test]
+    fn test_system_prompt_from_cli() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = RunArgs {
+            system_prompt: Some("You are a helpful agent".to_string()),
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert_eq!(
+            config.agent.system_prompt.as_deref(),
+            Some("You are a helpful agent")
+        );
+    }
+
+    #[test]
+    fn test_system_prompt_default_none() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = default_run_args();
+        let config = load_config(&args).unwrap();
+        assert!(config.agent.system_prompt.is_none());
+    }
+
+    #[test]
+    fn test_system_prompt_cli_overrides_yaml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let yaml = r#"
+agent:
+  system_prompt: "yaml prompt"
+"#;
+        let file = write_yaml_tempfile(yaml);
+        let args = RunArgs {
+            config: Some(file.path().to_path_buf()),
+            system_prompt: Some("cli prompt".to_string()),
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert_eq!(config.agent.system_prompt.as_deref(), Some("cli prompt"));
+    }
+
+    #[test]
     fn test_allow_deny_tools_from_cli() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env_vars();
@@ -983,5 +1054,74 @@ plugins:
         let config = load_config(&args).unwrap();
         assert_eq!(config.permissions.allowed_tools, vec!["navigate", "click"]);
         assert_eq!(config.permissions.denied_tools, vec!["bash"]);
+    }
+
+    #[test]
+    fn test_context_window_from_cli() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = RunArgs {
+            context_window: Some(128_000),
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert_eq!(config.compaction.context_window_tokens, 128_000);
+    }
+
+    #[test]
+    fn test_context_window_default_preserved() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = default_run_args();
+        let config = load_config(&args).unwrap();
+        assert_eq!(config.compaction.context_window_tokens, 200_000);
+    }
+
+    #[test]
+    fn test_disable_compaction_flag() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = RunArgs {
+            disable_compaction: true,
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert!(!config.compaction.enabled);
+    }
+
+    #[test]
+    fn test_disable_compaction_default_preserves_enabled() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = default_run_args();
+        let config = load_config(&args).unwrap();
+        assert!(config.compaction.enabled);
+    }
+
+    #[test]
+    fn test_tool_result_max_bytes_from_cli() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = RunArgs {
+            tool_result_max_bytes: Some(16_384),
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert_eq!(config.agent.tool_result_max_bytes, 16_384);
+    }
+
+    #[test]
+    fn test_tool_result_max_bytes_default_preserved() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = default_run_args();
+        let config = load_config(&args).unwrap();
+        assert_eq!(config.agent.tool_result_max_bytes, 32_768);
     }
 }
