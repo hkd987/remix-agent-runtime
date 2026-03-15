@@ -3,9 +3,14 @@ use std::path::{Path, PathBuf};
 use crate::error::AgentError;
 
 /// Validates and resolves paths within a sandbox root directory.
+///
+/// When `bypass_sandbox` is true, path resolution still canonicalizes paths
+/// but does not enforce the `starts_with(root)` containment check. This is
+/// used when the agent runs in `BypassPermissions` mode.
 #[derive(Debug)]
 pub struct PathValidator {
     root: PathBuf,
+    bypass_sandbox: bool,
 }
 
 impl PathValidator {
@@ -13,12 +18,29 @@ impl PathValidator {
         let root = root.canonicalize().map_err(|e| {
             AgentError::LocalTool(format!("Failed to canonicalize sandbox root: {e}"))
         })?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            bypass_sandbox: false,
+        })
+    }
+
+    /// Create a `PathValidator` that skips the sandbox containment check.
+    pub fn new_with_bypass(root: PathBuf, bypass_sandbox: bool) -> Result<Self, AgentError> {
+        let root = root.canonicalize().map_err(|e| {
+            AgentError::LocalTool(format!("Failed to canonicalize sandbox root: {e}"))
+        })?;
+        Ok(Self {
+            root,
+            bypass_sandbox,
+        })
     }
 
     /// Resolve a path, ensuring it stays within the sandbox root.
     /// For existing paths, canonicalize fully.
     /// For new paths (e.g., write_file), canonicalize the parent and append the filename.
+    ///
+    /// When `bypass_sandbox` is true, paths are still canonicalized but the
+    /// containment check is skipped, allowing access to any path on the system.
     pub fn resolve_path(&self, path: &str) -> Result<PathBuf, AgentError> {
         let candidate = if Path::new(path).is_absolute() {
             PathBuf::from(path)
@@ -28,7 +50,7 @@ impl PathValidator {
 
         // Try full canonicalize first (works for existing paths)
         if let Ok(canonical) = candidate.canonicalize() {
-            if canonical.starts_with(&self.root) {
+            if self.bypass_sandbox || canonical.starts_with(&self.root) {
                 return Ok(canonical);
             }
             return Err(AgentError::LocalTool(format!(
@@ -40,7 +62,7 @@ impl PathValidator {
         // For new files: canonicalize parent, append filename
         if let Some(parent) = candidate.parent() {
             if let Ok(canonical_parent) = parent.canonicalize() {
-                if canonical_parent.starts_with(&self.root) {
+                if self.bypass_sandbox || canonical_parent.starts_with(&self.root) {
                     if let Some(filename) = candidate.file_name() {
                         return Ok(canonical_parent.join(filename));
                     }
@@ -176,5 +198,89 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("Failed to canonicalize sandbox root"));
+    }
+
+    // --- bypass_sandbox tests ---
+
+    #[test]
+    fn test_bypass_allows_absolute_path_outside_sandbox() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_file = outside.path().join("data.txt");
+        fs::write(&outside_file, "outside content").unwrap();
+
+        let validator = PathValidator::new_with_bypass(tmp.path().to_path_buf(), true).unwrap();
+        let resolved = validator
+            .resolve_path(outside_file.to_str().unwrap())
+            .unwrap();
+        assert_eq!(resolved, outside_file.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn test_bypass_false_still_blocks_outside_paths() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_file = outside.path().join("data.txt");
+        fs::write(&outside_file, "outside content").unwrap();
+
+        let validator = PathValidator::new_with_bypass(tmp.path().to_path_buf(), false).unwrap();
+        let result = validator.resolve_path(outside_file.to_str().unwrap());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("outside sandbox"));
+    }
+
+    #[test]
+    fn test_bypass_allows_new_file_outside_sandbox() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+
+        let validator = PathValidator::new_with_bypass(tmp.path().to_path_buf(), true).unwrap();
+        let new_file_path = outside.path().join("new_file.txt");
+        let resolved = validator
+            .resolve_path(new_file_path.to_str().unwrap())
+            .unwrap();
+        let expected = outside.path().canonicalize().unwrap().join("new_file.txt");
+        assert_eq!(resolved, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bypass_allows_symlink_outside_sandbox() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_file = outside.path().join("target.txt");
+        fs::write(&outside_file, "symlink target").unwrap();
+
+        let link = tmp.path().join("link.txt");
+        std::os::unix::fs::symlink(&outside_file, &link).unwrap();
+
+        let validator = PathValidator::new_with_bypass(tmp.path().to_path_buf(), true).unwrap();
+        let resolved = validator.resolve_path("link.txt").unwrap();
+        assert_eq!(resolved, outside_file.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn test_bypass_still_canonicalizes_paths() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("subdir")).unwrap();
+        let file_path = tmp.path().join("subdir").join("file.txt");
+        fs::write(&file_path, "content").unwrap();
+
+        let validator = PathValidator::new_with_bypass(tmp.path().to_path_buf(), true).unwrap();
+        // Use a path with ../ that still resolves to an existing file
+        let resolved = validator.resolve_path("subdir/../subdir/file.txt").unwrap();
+        assert_eq!(resolved, file_path.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn test_new_with_bypass_defaults_to_false() {
+        let tmp = TempDir::new().unwrap();
+        let validator = PathValidator::new(tmp.path().to_path_buf()).unwrap();
+        // The default constructor should not bypass — verify outside path is blocked
+        let outside = TempDir::new().unwrap();
+        let outside_file = outside.path().join("file.txt");
+        fs::write(&outside_file, "data").unwrap();
+        let result = validator.resolve_path(outside_file.to_str().unwrap());
+        assert!(result.is_err());
     }
 }

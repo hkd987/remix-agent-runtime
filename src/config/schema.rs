@@ -330,6 +330,17 @@ pub struct LoopDetectionConfig {
     /// Custom override message to inject when a loop is detected.
     #[serde(default)]
     pub message: Option<String>,
+    /// Trigger semantic loop warning after this many failing steps with no
+    /// write_file/edit_file in between. 0 disables. Default: 4.
+    #[serde(default = "default_max_failures_without_write")]
+    pub max_failures_without_write: u32,
+    /// Custom message for semantic loop warning.
+    #[serde(default)]
+    pub semantic_loop_message: Option<String>,
+}
+
+fn default_max_failures_without_write() -> u32 {
+    4
 }
 
 impl Default for LoopDetectionConfig {
@@ -338,6 +349,8 @@ impl Default for LoopDetectionConfig {
             max_repeats: default_loop_max_repeats(),
             window_size: default_loop_window_size(),
             message: None,
+            max_failures_without_write: default_max_failures_without_write(),
+            semantic_loop_message: None,
         }
     }
 }
@@ -461,6 +474,10 @@ pub struct LocalToolsConfig {
     pub web_fetch_timeout_secs: u64,
     #[serde(default = "default_web_fetch_max_bytes")]
     pub web_fetch_max_bytes: usize,
+    /// When true, the path validator allows access outside the sandbox root.
+    /// Set automatically when permission mode is `BypassPermissions`.
+    #[serde(default)]
+    pub bypass_sandbox: bool,
 }
 
 impl Default for LocalToolsConfig {
@@ -475,6 +492,7 @@ impl Default for LocalToolsConfig {
             bash_blocklist: Vec::new(),
             web_fetch_timeout_secs: 30,
             web_fetch_max_bytes: 102_400,
+            bypass_sandbox: false,
         }
     }
 }
@@ -1659,6 +1677,8 @@ denied_tools: []
         assert_eq!(config.max_repeats, 3);
         assert_eq!(config.window_size, 10);
         assert!(config.message.is_none());
+        assert_eq!(config.max_failures_without_write, 4);
+        assert!(config.semantic_loop_message.is_none());
     }
 
     #[test]
@@ -1667,11 +1687,15 @@ denied_tools: []
 max_repeats: 5
 window_size: 20
 message: "You're looping!"
+max_failures_without_write: 6
+semantic_loop_message: "Fix it!"
 "#;
         let config: LoopDetectionConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.max_repeats, 5);
         assert_eq!(config.window_size, 20);
         assert_eq!(config.message, Some("You're looping!".to_string()));
+        assert_eq!(config.max_failures_without_write, 6);
+        assert_eq!(config.semantic_loop_message, Some("Fix it!".to_string()));
     }
 
     #[test]
@@ -1681,6 +1705,8 @@ message: "You're looping!"
         assert_eq!(config.max_repeats, 3);
         assert_eq!(config.window_size, 10);
         assert!(config.message.is_none());
+        assert_eq!(config.max_failures_without_write, 4);
+        assert!(config.semantic_loop_message.is_none());
     }
 
     #[test]

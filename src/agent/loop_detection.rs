@@ -85,6 +85,46 @@ pub fn detect_loop(steps: &[StepRecord], config: &LoopDetectionConfig) -> Option
     })
 }
 
+/// Returns true if the tool name represents a file-writing operation.
+fn is_write_tool(tool: &str) -> bool {
+    matches!(tool, "write_file" | "edit_file")
+}
+
+/// Detect if the agent is stuck re-testing without modifying its solution.
+/// Scans backward from the most recent step. Counts consecutive failing steps
+/// with no write_file/edit_file interleaved. If count >= threshold, returns warning.
+pub fn detect_semantic_loop(steps: &[StepRecord], config: &LoopDetectionConfig) -> Option<String> {
+    if steps.is_empty() || config.max_failures_without_write == 0 {
+        return None;
+    }
+
+    let window_start = steps.len().saturating_sub(config.window_size as usize);
+    let window = &steps[window_start..];
+
+    let mut failure_count: u32 = 0;
+    for step in window.iter().rev() {
+        if is_write_tool(&step.tool) {
+            break;
+        }
+        if step.is_error == Some(true) {
+            failure_count += 1;
+        }
+    }
+
+    if failure_count >= config.max_failures_without_write {
+        Some(config.semantic_loop_message.clone().unwrap_or_else(|| {
+            format!(
+                "[SEMANTIC LOOP DETECTED] You have run {} failing commands without modifying any files. \
+                 Stop re-testing and instead edit your code to fix the underlying issue. \
+                 Read the error output carefully and make a targeted change with write_file or edit_file.",
+                failure_count
+            )
+        }))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +138,17 @@ mod tests {
             output: json!({}),
             duration_ms: 100,
             is_error: None,
+        }
+    }
+
+    fn make_error_step(tool: &str, input: serde_json::Value) -> StepRecord {
+        StepRecord {
+            iteration: 1,
+            tool: tool.to_string(),
+            input,
+            output: json!({}),
+            duration_ms: 100,
+            is_error: Some(true),
         }
     }
 
@@ -125,6 +176,8 @@ mod tests {
             max_repeats: 3,
             window_size: 10,
             message: None,
+            max_failures_without_write: 4,
+            semantic_loop_message: None,
         };
         let steps = vec![
             make_step("bash", json!({"command": "cargo test"})),
@@ -153,6 +206,7 @@ mod tests {
             max_repeats: 3,
             window_size: 10,
             message: None,
+            ..Default::default()
         };
         let steps = vec![
             make_step("bash", json!({"command": "cargo test"})),
@@ -167,6 +221,7 @@ mod tests {
             max_repeats: 3,
             window_size: 3,
             message: None,
+            ..Default::default()
         };
         // The first 3 repeats are outside the window
         let steps = vec![
@@ -186,6 +241,7 @@ mod tests {
             max_repeats: 2,
             window_size: 10,
             message: Some("You're stuck! Try something else.".to_string()),
+            ..Default::default()
         };
         let steps = vec![
             make_step("bash", json!({"command": "make"})),
@@ -204,6 +260,7 @@ mod tests {
             max_repeats: 3,
             window_size: 10,
             message: None,
+            ..Default::default()
         };
         let steps = vec![
             make_step("bash", json!({"command": "cargo test -- test_a"})),
@@ -233,6 +290,7 @@ mod tests {
             max_repeats: 0,
             window_size: 10,
             message: None,
+            ..Default::default()
         };
         let steps = vec![
             make_step("bash", json!({"command": "ls"})),
@@ -248,6 +306,7 @@ mod tests {
             max_repeats: 3,
             window_size: 10,
             message: None,
+            ..Default::default()
         };
         let input = json!({"path": "/src/main.rs", "old_string": "foo", "new_string": "bar"});
         let steps = vec![
@@ -266,5 +325,164 @@ mod tests {
         assert_eq!(config.max_repeats, 3);
         assert_eq!(config.window_size, 10);
         assert!(config.message.is_none());
+        assert_eq!(config.max_failures_without_write, 4);
+        assert!(config.semantic_loop_message.is_none());
+    }
+
+    // --- Semantic loop detection tests ---
+
+    #[test]
+    fn test_semantic_loop_no_steps() {
+        let config = LoopDetectionConfig::default();
+        assert!(detect_semantic_loop(&[], &config).is_none());
+    }
+
+    #[test]
+    fn test_semantic_loop_disabled_with_zero() {
+        let config = LoopDetectionConfig {
+            max_failures_without_write: 0,
+            ..Default::default()
+        };
+        let steps = vec![
+            make_error_step("bash", json!({"command": "cargo test"})),
+            make_error_step("bash", json!({"command": "cargo test"})),
+            make_error_step("bash", json!({"command": "cargo test"})),
+            make_error_step("bash", json!({"command": "cargo test"})),
+        ];
+        assert!(detect_semantic_loop(&steps, &config).is_none());
+    }
+
+    #[test]
+    fn test_semantic_loop_detected() {
+        let config = LoopDetectionConfig {
+            max_failures_without_write: 4,
+            ..Default::default()
+        };
+        let steps = vec![
+            make_error_step("bash", json!({"command": "cargo test"})),
+            make_error_step("bash", json!({"command": "cargo test -- test_a"})),
+            make_error_step("bash", json!({"command": "cargo build"})),
+            make_error_step("bash", json!({"command": "cargo test"})),
+        ];
+        let result = detect_semantic_loop(&steps, &config);
+        assert!(result.is_some());
+        let msg = result.unwrap();
+        assert!(msg.contains("SEMANTIC LOOP DETECTED"));
+        assert!(msg.contains("4"));
+    }
+
+    #[test]
+    fn test_semantic_loop_broken_by_write_file() {
+        let config = LoopDetectionConfig {
+            max_failures_without_write: 3,
+            ..Default::default()
+        };
+        let steps = vec![
+            make_error_step("bash", json!({"command": "cargo test"})),
+            make_error_step("bash", json!({"command": "cargo test"})),
+            make_step(
+                "write_file",
+                json!({"path": "/src/main.rs", "content": "fix"}),
+            ),
+            make_error_step("bash", json!({"command": "cargo test"})),
+            make_error_step("bash", json!({"command": "cargo test"})),
+        ];
+        assert!(detect_semantic_loop(&steps, &config).is_none());
+    }
+
+    #[test]
+    fn test_semantic_loop_broken_by_edit_file() {
+        let config = LoopDetectionConfig {
+            max_failures_without_write: 3,
+            ..Default::default()
+        };
+        let steps = vec![
+            make_error_step("bash", json!({"command": "cargo test"})),
+            make_error_step("bash", json!({"command": "cargo test"})),
+            make_step(
+                "edit_file",
+                json!({"path": "/src/main.rs", "old": "a", "new": "b"}),
+            ),
+            make_error_step("bash", json!({"command": "cargo test"})),
+            make_error_step("bash", json!({"command": "cargo test"})),
+        ];
+        assert!(detect_semantic_loop(&steps, &config).is_none());
+    }
+
+    #[test]
+    fn test_semantic_loop_mixed_success_failure() {
+        let config = LoopDetectionConfig {
+            max_failures_without_write: 4,
+            ..Default::default()
+        };
+        // 3 failures interspersed with 2 successes = only 3 failures counted
+        let steps = vec![
+            make_error_step("bash", json!({"command": "cargo test"})),
+            make_step("bash", json!({"command": "ls"})),
+            make_error_step("bash", json!({"command": "cargo test"})),
+            make_step("read_file", json!({"path": "/a.txt"})),
+            make_error_step("bash", json!({"command": "cargo test"})),
+        ];
+        assert!(detect_semantic_loop(&steps, &config).is_none());
+    }
+
+    #[test]
+    fn test_semantic_loop_custom_message() {
+        let config = LoopDetectionConfig {
+            max_failures_without_write: 2,
+            semantic_loop_message: Some("Fix your code!".to_string()),
+            ..Default::default()
+        };
+        let steps = vec![
+            make_error_step("bash", json!({"command": "cargo test"})),
+            make_error_step("bash", json!({"command": "cargo test"})),
+        ];
+        let result = detect_semantic_loop(&steps, &config);
+        assert_eq!(result, Some("Fix your code!".to_string()));
+    }
+
+    #[test]
+    fn test_semantic_loop_respects_window() {
+        let config = LoopDetectionConfig {
+            max_failures_without_write: 3,
+            window_size: 3,
+            ..Default::default()
+        };
+        // 4 failures total, but window only sees last 3
+        // The first failure is outside the window
+        let steps = vec![
+            make_error_step("bash", json!({"command": "cargo test"})),
+            make_error_step("bash", json!({"command": "cargo test"})),
+            make_step("bash", json!({"command": "ls"})),
+            make_error_step("bash", json!({"command": "cargo test"})),
+        ];
+        // Window sees: [error(cargo test), success(ls), error(cargo test)]
+        // Scanning backward: 1 failure, then 0 (success), then 1 failure = only 1 consecutive from end
+        let result = detect_semantic_loop(&steps, &config);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_semantic_loop_all_success() {
+        let config = LoopDetectionConfig {
+            max_failures_without_write: 2,
+            ..Default::default()
+        };
+        let steps = vec![
+            make_step("bash", json!({"command": "cargo test"})),
+            make_step("bash", json!({"command": "cargo test"})),
+            make_step("bash", json!({"command": "cargo test"})),
+        ];
+        assert!(detect_semantic_loop(&steps, &config).is_none());
+    }
+
+    #[test]
+    fn test_is_write_tool() {
+        assert!(is_write_tool("write_file"));
+        assert!(is_write_tool("edit_file"));
+        assert!(!is_write_tool("bash"));
+        assert!(!is_write_tool("read_file"));
+        assert!(!is_write_tool("grep"));
+        assert!(!is_write_tool("navigate"));
     }
 }

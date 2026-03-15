@@ -45,7 +45,7 @@ async fn main() -> ExitCode {
                 .init();
 
             // Load config
-            let config = match load_config(&args) {
+            let mut config = match load_config(&args) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Error: {e}");
@@ -277,6 +277,15 @@ async fn main() -> ExitCode {
                 skill_set.clone(),
                 config.skills.script_timeout_secs,
             );
+
+            // When bypass_permissions mode is active, allow path validator to
+            // access files outside the sandbox root.
+            if matches!(
+                config.permissions.mode,
+                remix_agent_runtime::config::schema::PermissionModeConfig::BypassPermissions
+            ) {
+                config.local_tools.bypass_sandbox = true;
+            }
 
             // Wrap with local tools executor
             let executor = match remix_agent_runtime::local_tools::LocalToolsExecutor::new(

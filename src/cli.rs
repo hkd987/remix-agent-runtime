@@ -253,6 +253,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub loop_detection_window: Option<u32>,
 
+    /// Max failing commands without a file write before semantic loop warning
+    #[arg(long)]
+    pub loop_detection_max_failures: Option<u32>,
+
     /// Enable reasoning stages (varies thinking budget across planning/execution/verification)
     #[arg(long)]
     pub reasoning_stages: bool,
@@ -407,6 +411,8 @@ mod tests {
             "4",
             "--loop-detection-window",
             "12",
+            "--loop-detection-max-failures",
+            "6",
             "--reasoning-stages",
             "--planning-budget-tokens",
             "12000",
@@ -472,6 +478,7 @@ mod tests {
         assert!(args.loop_detection);
         assert_eq!(args.loop_detection_max_repeats, Some(4));
         assert_eq!(args.loop_detection_window, Some(12));
+        assert_eq!(args.loop_detection_max_failures, Some(6));
         assert!(args.reasoning_stages);
         assert_eq!(args.planning_budget_tokens, Some(12_000));
         assert_eq!(args.execution_budget_tokens, Some(6_000));
@@ -1020,6 +1027,18 @@ mod tests {
         assert!(!args.loop_detection);
         assert!(args.loop_detection_max_repeats.is_none());
         assert!(args.loop_detection_window.is_none());
+        assert!(args.loop_detection_max_failures.is_none());
+    }
+
+    #[test]
+    fn test_parse_run_with_loop_detection_max_failures() {
+        let args = extract_run_args(Cli::parse_from([
+            "remix-agent",
+            "run",
+            "--loop-detection-max-failures",
+            "6",
+        ]));
+        assert_eq!(args.loop_detection_max_failures, Some(6));
     }
 
     #[test]

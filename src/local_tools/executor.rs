@@ -36,7 +36,8 @@ impl<T: ToolExecutor> LocalToolsExecutor<T> {
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
         });
 
-        let path_validator = PathValidator::new(sandbox_root.clone())?;
+        let path_validator =
+            PathValidator::new_with_bypass(sandbox_root.clone(), config.bypass_sandbox)?;
         let sandbox = create_sandbox(sandbox_root)?;
 
         let mut all_tools: Vec<ToolDefinition> = inner.tool_definitions().to_vec();

@@ -522,6 +522,13 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 {
                     state.inject_system_notification(&warning);
                 }
+
+                // Semantic loop detection (test-without-modify)
+                if let Some(warning) =
+                    super::loop_detection::detect_semantic_loop(state.steps(), loop_config)
+                {
+                    state.inject_system_notification(&warning);
+                }
             }
 
             // Feature 5: Check system reminders before LLM call

@@ -106,6 +106,7 @@ class RemixAgent(BaseInstalledAgent):
             " --loop-detection"
             " --loop-detection-max-repeats 3"
             " --loop-detection-window 10"
+            " --loop-detection-max-failures 4"
             # Reasoning stages: plan deep, execute fast, verify carefully
             " --reasoning-stages"
             " --thinking-budget-tokens 10000"

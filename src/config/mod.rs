@@ -261,6 +261,7 @@ pub fn load_config(args: &RunArgs) -> Result<AppConfig, AgentError> {
     if args.loop_detection
         || args.loop_detection_max_repeats.is_some()
         || args.loop_detection_window.is_some()
+        || args.loop_detection_max_failures.is_some()
     {
         let mut ld = config
             .agent
@@ -271,6 +272,9 @@ pub fn load_config(args: &RunArgs) -> Result<AppConfig, AgentError> {
         }
         if let Some(window) = args.loop_detection_window {
             ld.window_size = window;
+        }
+        if let Some(max_failures) = args.loop_detection_max_failures {
+            ld.max_failures_without_write = max_failures;
         }
         config.agent.loop_detection = Some(ld);
     }
@@ -380,6 +384,7 @@ mod tests {
             loop_detection: false,
             loop_detection_max_repeats: None,
             loop_detection_window: None,
+            loop_detection_max_failures: None,
             reasoning_stages: false,
             planning_budget_tokens: None,
             execution_budget_tokens: None,
@@ -568,6 +573,7 @@ agent:
             loop_detection: false,
             loop_detection_max_repeats: None,
             loop_detection_window: None,
+            loop_detection_max_failures: None,
             reasoning_stages: false,
             planning_budget_tokens: None,
             execution_budget_tokens: None,
@@ -1469,6 +1475,22 @@ agent:
         let ld = config.agent.loop_detection.unwrap();
         assert_eq!(ld.max_repeats, 8); // CLI overrides
         assert_eq!(ld.window_size, 5); // YAML preserved
+    }
+
+    #[test]
+    fn test_loop_detection_semantic_from_cli() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = RunArgs {
+            loop_detection_max_failures: Some(6),
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert!(config.agent.loop_detection.is_some());
+        let ld = config.agent.loop_detection.unwrap();
+        assert_eq!(ld.max_failures_without_write, 6);
+        assert_eq!(ld.max_repeats, 3); // default preserved
     }
 
     #[test]
