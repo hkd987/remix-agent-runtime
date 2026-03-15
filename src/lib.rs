@@ -15,3 +15,5 @@ pub mod session;
 pub mod skills;
 pub mod subagent;
 pub mod tenant;
+#[cfg(feature = "tui")]
+pub mod tui;

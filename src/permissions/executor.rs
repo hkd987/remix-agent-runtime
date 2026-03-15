@@ -16,12 +16,22 @@ const PLAN_MODE_ALLOWED: &[&str] = &[
     "read_skill_resource",
 ];
 
+/// Permission request sent through the channel for interactive TUI prompts.
+#[derive(Debug)]
+pub struct PermissionRequest {
+    pub tool_name: String,
+    pub tool_input: serde_json::Value,
+    pub respond: tokio::sync::oneshot::Sender<bool>,
+}
+
 /// Decorator that enforces permission policies before delegating tool calls.
 pub struct PermissionAwareExecutor<T: ToolExecutor> {
     inner: T,
     policy: PermissionPolicy,
     /// Cached filtered tool definitions for Plan mode.
     filtered_tools: Vec<ToolDefinition>,
+    /// Optional channel for sending permission requests to a TUI.
+    permission_tx: Option<tokio::sync::mpsc::Sender<PermissionRequest>>,
 }
 
 impl<T: ToolExecutor> PermissionAwareExecutor<T> {
@@ -41,7 +51,17 @@ impl<T: ToolExecutor> PermissionAwareExecutor<T> {
             inner,
             policy,
             filtered_tools,
+            permission_tx: None,
         }
+    }
+
+    /// Set the permission channel for interactive TUI prompts.
+    pub fn with_permission_channel(
+        mut self,
+        tx: tokio::sync::mpsc::Sender<PermissionRequest>,
+    ) -> Self {
+        self.permission_tx = Some(tx);
+        self
     }
 
     pub fn into_inner(self) -> T {
@@ -75,9 +95,42 @@ impl<T: ToolExecutor> ToolExecutor for PermissionAwareExecutor<T> {
                 is_error: true,
             }),
             PermissionDecision::Ask => {
-                // In non-interactive mode, treat Ask as Allow.
-                // Interactive prompting would be added later.
-                self.inner.execute_tool(name, arguments).await
+                if let Some(ref tx) = self.permission_tx {
+                    let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
+                    let request = PermissionRequest {
+                        tool_name: name.to_string(),
+                        tool_input: arguments.clone(),
+                        respond: respond_tx,
+                    };
+                    // Send the request; if the channel is closed, deny.
+                    if tx.send(request).await.is_err() {
+                        return Ok(ToolExecutionResult {
+                            content: "Permission denied: permission channel closed".to_string(),
+                            is_error: true,
+                        });
+                    }
+                    // Await response with a 30-second timeout.
+                    let allowed =
+                        match tokio::time::timeout(std::time::Duration::from_secs(30), respond_rx)
+                            .await
+                        {
+                            Ok(Ok(true)) => true,
+                            Ok(Ok(false)) => false,
+                            Ok(Err(_)) => false, // Sender dropped → deny
+                            Err(_) => false,     // Timeout → deny
+                        };
+                    if allowed {
+                        self.inner.execute_tool(name, arguments).await
+                    } else {
+                        Ok(ToolExecutionResult {
+                            content: format!("Permission denied: user rejected tool '{name}'"),
+                            is_error: true,
+                        })
+                    }
+                } else {
+                    // In non-interactive mode, treat Ask as Allow.
+                    self.inner.execute_tool(name, arguments).await
+                }
             }
         }
     }
@@ -443,5 +496,133 @@ mod tests {
         // Other tools still pass
         let result = executor.execute_tool("read_file", json!({})).await.unwrap();
         assert!(!result.is_error);
+    }
+
+    // --- Permission channel tests ---
+
+    #[tokio::test]
+    async fn test_permission_channel_allow() {
+        let inner = default_mock();
+        let policy = PermissionPolicy::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let executor = PermissionAwareExecutor::new(inner, policy).with_permission_channel(tx);
+
+        // Spawn a task to respond with Allow
+        tokio::spawn(async move {
+            if let Some(req) = rx.recv().await {
+                assert_eq!(req.tool_name, "navigate");
+                req.respond.send(true).unwrap();
+            }
+        });
+
+        let result = executor
+            .execute_tool("navigate", json!({"url": "https://example.com"}))
+            .await
+            .unwrap();
+        assert_eq!(result.content, "ok");
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_permission_channel_deny() {
+        let inner = default_mock();
+        let policy = PermissionPolicy::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let executor = PermissionAwareExecutor::new(inner, policy).with_permission_channel(tx);
+
+        tokio::spawn(async move {
+            if let Some(req) = rx.recv().await {
+                req.respond.send(false).unwrap();
+            }
+        });
+
+        let result = executor.execute_tool("navigate", json!({})).await.unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("Permission denied"));
+    }
+
+    #[tokio::test]
+    async fn test_permission_channel_timeout() {
+        let inner = default_mock();
+        let policy = PermissionPolicy::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let executor = PermissionAwareExecutor::new(inner, policy).with_permission_channel(tx);
+
+        // Receive but never respond — will timeout
+        tokio::spawn(async move {
+            let _req = rx.recv().await;
+            // Drop the request without responding, causing oneshot RecvError
+        });
+
+        let result = executor.execute_tool("navigate", json!({})).await.unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("Permission denied"));
+    }
+
+    #[tokio::test]
+    async fn test_no_permission_channel_auto_allows() {
+        let inner = default_mock();
+        let policy = PermissionPolicy::default();
+        // No channel set — should auto-allow on Ask
+        let executor = PermissionAwareExecutor::new(inner, policy);
+
+        let result = executor.execute_tool("navigate", json!({})).await.unwrap();
+        assert_eq!(result.content, "ok");
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_permission_channel_closed_denies() {
+        let inner = default_mock();
+        let policy = PermissionPolicy::default();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let executor = PermissionAwareExecutor::new(inner, policy).with_permission_channel(tx);
+
+        // Drop the receiver immediately
+        drop(rx);
+
+        let result = executor.execute_tool("navigate", json!({})).await.unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("Permission denied"));
+        assert!(result.content.contains("channel closed"));
+    }
+
+    #[tokio::test]
+    async fn test_permission_channel_not_used_for_allowed_tools() {
+        let inner = default_mock();
+        let policy = PermissionPolicy {
+            mode: PermissionMode::Default,
+            allowed_tools: vec!["navigate".to_string()],
+            denied_tools: vec![],
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let executor = PermissionAwareExecutor::new(inner, policy).with_permission_channel(tx);
+
+        // If the channel were used, this would hang since nobody reads from rx
+        let result = executor.execute_tool("navigate", json!({})).await.unwrap();
+        assert_eq!(result.content, "ok");
+        assert!(!result.is_error);
+
+        // Verify nothing was sent
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_permission_channel_not_used_for_denied_tools() {
+        let inner = default_mock();
+        let policy = PermissionPolicy {
+            mode: PermissionMode::Default,
+            allowed_tools: vec![],
+            denied_tools: vec!["bash".to_string()],
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let executor = PermissionAwareExecutor::new(inner, policy).with_permission_channel(tx);
+
+        let result = executor.execute_tool("bash", json!({})).await.unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("Permission denied"));
+
+        // Verify nothing was sent to the channel
+        assert!(rx.try_recv().is_err());
     }
 }

@@ -39,6 +39,18 @@ pub enum AgentEvent {
     },
     /// The agent encountered an error.
     AgentError { error: String },
+    /// The agent is awaiting user input (interactive mode).
+    AwaitingInput,
+    /// Token usage update for status bar display.
+    TokenUsage {
+        input_tokens: u32,
+        output_tokens: u32,
+        cache_read_tokens: Option<u32>,
+        cache_write_tokens: Option<u32>,
+        total_cost_usd: Option<f64>,
+    },
+    /// Incremental thinking/reasoning text from the model.
+    ThinkingDelta { text: String },
 }
 
 impl AgentEvent {
@@ -53,6 +65,9 @@ impl AgentEvent {
             AgentEvent::ToolUseResult { .. } => "tool_use_result",
             AgentEvent::AgentCompleted { .. } => "agent_completed",
             AgentEvent::AgentError { .. } => "agent_error",
+            AgentEvent::AwaitingInput => "awaiting_input",
+            AgentEvent::TokenUsage { .. } => "token_usage",
+            AgentEvent::ThinkingDelta { .. } => "thinking_delta",
         }
     }
 }
@@ -216,6 +231,41 @@ mod tests {
     }
 
     #[test]
+    fn test_awaiting_input_serialization() {
+        let event = AgentEvent::AwaitingInput;
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "awaiting_input");
+    }
+
+    #[test]
+    fn test_token_usage_serialization() {
+        let event = AgentEvent::TokenUsage {
+            input_tokens: 500,
+            output_tokens: 150,
+            cache_read_tokens: Some(100),
+            cache_write_tokens: None,
+            total_cost_usd: Some(0.003),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "token_usage");
+        assert_eq!(json["input_tokens"], 500);
+        assert_eq!(json["output_tokens"], 150);
+        assert_eq!(json["cache_read_tokens"], 100);
+        assert!(json["cache_write_tokens"].is_null());
+        assert_eq!(json["total_cost_usd"], 0.003);
+    }
+
+    #[test]
+    fn test_thinking_delta_serialization() {
+        let event = AgentEvent::ThinkingDelta {
+            text: "Let me think...".to_string(),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "thinking_delta");
+        assert_eq!(json["text"], "Let me think...");
+    }
+
+    #[test]
     fn test_event_type_returns_correct_strings() {
         assert_eq!(
             AgentEvent::AgentStarted {
@@ -278,6 +328,25 @@ mod tests {
             }
             .event_type(),
             "agent_error"
+        );
+        assert_eq!(AgentEvent::AwaitingInput.event_type(), "awaiting_input");
+        assert_eq!(
+            AgentEvent::TokenUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                total_cost_usd: None,
+            }
+            .event_type(),
+            "token_usage"
+        );
+        assert_eq!(
+            AgentEvent::ThinkingDelta {
+                text: String::new()
+            }
+            .event_type(),
+            "thinking_delta"
         );
     }
 

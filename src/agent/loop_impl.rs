@@ -10,8 +10,8 @@ use crate::config::schema::{AgentConfig, CompactionConfig};
 use crate::error::AgentError;
 use crate::llm::client::LlmProvider;
 use crate::llm::types::{
-    content_has_tool_use, CacheControl, ContentBlock, StopReason, SystemContent, ToolDefinition,
-    ToolResultContent,
+    content_has_tool_use, CacheControl, ContentBlock, Message, MessagesResponse, StopReason,
+    SystemContent, ToolDefinition, ToolResultContent,
 };
 use crate::output::events::{self, AgentEvent, EventBus};
 use crate::output::result::{AgentResult, AgentStatus, StepRecord};
@@ -1345,6 +1345,618 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             if let Err(e) = r2 {
                 warn!(error = %e, "Failed to save final steps");
             }
+        }
+    }
+}
+
+/// Interactive streaming support for TUI chat mode.
+///
+/// This impl block is gated on `L: StreamingLlmProvider` and provides
+/// the `run_interactive_stream` method for real-time streaming conversations.
+impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L, T> {
+    /// Filter out thinking/redacted_thinking blocks from messages before sending to API.
+    /// Some providers (OpenRouter) reject these blocks on subsequent turns.
+    fn filter_thinking_blocks(messages: &[Message]) -> Vec<Message> {
+        // Fast path: if no messages contain thinking blocks, avoid cloning entirely
+        let has_thinking = messages.iter().any(|msg| {
+            msg.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+                )
+            })
+        });
+        if !has_thinking {
+            return messages.to_vec();
+        }
+
+        messages
+            .iter()
+            .map(|msg| Message {
+                role: msg.role.clone(),
+                content: msg
+                    .content
+                    .iter()
+                    .filter(|block| {
+                        !matches!(
+                            block,
+                            ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+                        )
+                    })
+                    .cloned()
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Run the interactive streaming agent loop.
+    ///
+    /// This method drives a multi-turn conversation where:
+    /// 1. The TUI sends user messages via `input_rx`
+    /// 2. The agent streams LLM responses via `StreamAssembler`, emitting `AgentEvent`s
+    /// 3. Tool execution happens between LLM calls (same as the batch loop)
+    /// 4. On `EndTurn`, the agent signals `AwaitingInput` and waits for the next message
+    /// 5. On `Quit`, the agent returns the final result
+    ///
+    /// Interrupt handling: when the user sends `UserMessage::Interrupt` during
+    /// streaming, the assembler produces a partial response and the loop continues.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_interactive_stream(
+        &mut self,
+        input_rx: &mut tokio::sync::mpsc::Receiver<super::interactive::UserMessage>,
+        signal_tx: &tokio::sync::mpsc::Sender<super::interactive::InteractiveSignal>,
+        credential_set: &CredentialSet,
+        skill_set: &SkillSet,
+        agents_md: &Option<crate::agents_md::AgentsMdContent>,
+        session_store: Option<&dyn SessionStorage>,
+        compaction_config: Option<&CompactionConfig>,
+    ) -> Result<AgentResult, AgentError> {
+        use super::interactive::{InteractiveSignal, StreamAssembler, UserMessage};
+        use crate::llm::types::compute_cost;
+        use tokio_stream::StreamExt as _;
+
+        // Validate reasoning stages config if present
+        if let Some(ref stages_config) = self.config.reasoning_stages {
+            if let Err(e) = super::reasoning_stages::validate_config(stages_config) {
+                warn!("{}", e);
+            }
+        }
+
+        // Wait for the first user message to start the conversation
+        let first_task = loop {
+            match input_rx.recv().await {
+                Some(UserMessage::Chat(msg)) => break msg,
+                Some(UserMessage::Quit) => {
+                    let state = AgentState::new("");
+                    return Ok(state.into_result(AgentStatus::Success, Some(String::new())));
+                }
+                Some(UserMessage::Interrupt) => continue,
+                None => {
+                    return Err(AgentError::Llm(
+                        "Input channel closed before first message".to_string(),
+                    ));
+                }
+            }
+        };
+
+        let mut state = AgentState::new(&first_task);
+
+        events::emit(
+            &self.event_bus,
+            AgentEvent::AgentStarted {
+                task: first_task.clone(),
+                timestamp_ms: chrono::Utc::now().timestamp_millis() as u64,
+            },
+        );
+
+        // Build system prompt (same logic as run_with_options)
+        let system_prompt = self.build_system_blocks(credential_set, skill_set, agents_md);
+
+        // Tool definitions
+        let all_tool_defs = self.tools.tool_definitions().to_vec();
+        let mut tool_registry = if self.config.lazy_tool_discovery {
+            let always_avail = ALWAYS_AVAILABLE_TOOLS
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            Some(ToolRegistry::new(all_tool_defs.clone(), always_avail))
+        } else {
+            None
+        };
+
+        let reminder_scheduler = ReminderScheduler::from_configs(&self.config.reminders);
+        let timeout_ms = self.config.timeout_secs * 1000;
+        let mut nudge_count: u32 = 0;
+        let mut goal_check_fired = false;
+
+        loop {
+            // Check iteration limit
+            if state.current_iteration() >= self.config.max_iterations {
+                info!(
+                    iterations = state.current_iteration(),
+                    "Max iterations reached"
+                );
+                self.emit_completed(AgentStatus::MaxIterations, None, &state);
+                return Ok(state.into_result(AgentStatus::MaxIterations, None));
+            }
+
+            // Check timeout
+            if state.elapsed_ms() >= timeout_ms {
+                info!(elapsed_ms = state.elapsed_ms(), "Timeout reached");
+                self.emit_completed(AgentStatus::Timeout, None, &state);
+                return Ok(state.into_result(AgentStatus::Timeout, None));
+            }
+
+            // Progressive context compaction (no dedicated compaction LLM in interactive mode)
+            if let Some(compact_config) = compaction_config {
+                self.run_compaction(compact_config, &mut state, None).await;
+            }
+
+            state.increment_iteration();
+            debug!(iteration = state.current_iteration(), "Starting iteration");
+
+            events::emit(
+                &self.event_bus,
+                AgentEvent::IterationStarted {
+                    iteration: state.current_iteration(),
+                },
+            );
+
+            // Action progress reminder
+            if let Some(reminder) = self.build_action_reminder(&state) {
+                state.inject_system_notification(&reminder);
+            }
+
+            // Iteration budget warning (one-time)
+            if let Some(warning) = self.build_budget_warning(&state) {
+                state.inject_system_notification(&warning);
+            }
+
+            // Loop detection
+            if let Some(ref loop_config) = self.config.loop_detection {
+                if let Some(warning) =
+                    super::loop_detection::detect_loop(state.steps(), loop_config)
+                {
+                    state.inject_system_notification(&warning);
+                }
+                if let Some(warning) =
+                    super::loop_detection::detect_semantic_loop(state.steps(), loop_config)
+                {
+                    state.inject_system_notification(&warning);
+                }
+            }
+
+            // System reminders
+            if !reminder_scheduler.is_empty() {
+                let reminders =
+                    reminder_scheduler.check(state.current_iteration(), &Vec::<String>::new());
+                for reminder in reminders {
+                    state.inject_system_notification(&reminder);
+                }
+            }
+
+            // Reasoning budget stages
+            if let (Some(ref stages_config), Some(ref thinking_ctl)) =
+                (&self.config.reasoning_stages, &self.thinking_control)
+            {
+                let budget = super::reasoning_stages::compute_thinking_budget(
+                    stages_config,
+                    state.current_iteration(),
+                    self.config.max_iterations,
+                );
+                thinking_ctl
+                    .set_thinking_config(Some(crate::llm::types::ThinkingConfig::enabled(budget)));
+            }
+
+            // Resolve effective tool definitions
+            let effective_tool_defs: std::borrow::Cow<'_, [ToolDefinition]> =
+                if let Some(ref registry) = tool_registry {
+                    let discovered = registry.discovered_definitions();
+                    if self.config.plan_mode {
+                        std::borrow::Cow::Owned(Self::filter_read_only_tools(&discovered))
+                    } else {
+                        std::borrow::Cow::Owned(discovered)
+                    }
+                } else if self.config.plan_mode {
+                    std::borrow::Cow::Owned(Self::filter_read_only_tools(&all_tool_defs))
+                } else {
+                    std::borrow::Cow::Borrowed(&all_tool_defs)
+                };
+
+            // Stream the LLM response and assemble it.
+            // The stream borrows state.messages(), so we scope it to release the
+            // borrow before mutating state.
+            enum StreamOutcome {
+                Complete(MessagesResponse),
+                Interrupted(MessagesResponse),
+                Quit(MessagesResponse),
+                Error(AgentError),
+            }
+
+            let outcome = {
+                let filtered_messages = Self::filter_thinking_blocks(state.messages());
+                let mut stream = self.llm.send_messages_stream(
+                    system_prompt.as_deref(),
+                    &filtered_messages,
+                    Some(&effective_tool_defs),
+                );
+
+                let mut assembler = StreamAssembler::new();
+
+                enum StreamExit {
+                    Interrupt,
+                    Quit,
+                    Closed,
+                }
+                let mut exit_reason: Option<StreamExit> = None;
+
+                loop {
+                    tokio::select! {
+                        biased;
+                        msg = input_rx.recv() => {
+                            match msg {
+                                Some(UserMessage::Interrupt) => {
+                                    info!("User interrupted streaming");
+                                    exit_reason = Some(StreamExit::Interrupt);
+                                    break;
+                                }
+                                Some(UserMessage::Quit) => {
+                                    exit_reason = Some(StreamExit::Quit);
+                                    break;
+                                }
+                                Some(UserMessage::Chat(_)) => {
+                                    // Ignore during streaming
+                                }
+                                None => {
+                                    exit_reason = Some(StreamExit::Closed);
+                                    break;
+                                }
+                            }
+                        }
+                        event_result = stream.next() => {
+                            match event_result {
+                                Some(Ok(event)) => {
+                                    let deltas = assembler.process_event(&event);
+                                    self.emit_stream_deltas(&deltas);
+                                }
+                                Some(Err(e)) => {
+                                    warn!(error = %e, "Stream error");
+                                    drop(stream);
+                                    return Err(e);
+                                }
+                                None => break, // Stream ended
+                            }
+                        }
+                    }
+                }
+
+                drop(stream);
+
+                match exit_reason {
+                    Some(StreamExit::Quit) => match assembler.partial_finish() {
+                        Ok(r) => StreamOutcome::Quit(r),
+                        Err(e) => StreamOutcome::Error(e),
+                    },
+                    Some(StreamExit::Interrupt) => match assembler.partial_finish() {
+                        Ok(r) => StreamOutcome::Interrupted(r),
+                        Err(e) => StreamOutcome::Error(e),
+                    },
+                    Some(StreamExit::Closed) => {
+                        StreamOutcome::Error(AgentError::Llm("Input channel closed".to_string()))
+                    }
+                    None => match assembler.finish() {
+                        Ok(r) => StreamOutcome::Complete(r),
+                        Err(e) => StreamOutcome::Error(e),
+                    },
+                }
+            };
+
+            // Handle outcome - state borrow is now released
+            let (response, interrupted) = match outcome {
+                StreamOutcome::Error(e) => return Err(e),
+                StreamOutcome::Quit(response) => {
+                    state.accumulate_usage(response.usage.as_ref(), &response.model);
+                    if !response.content.is_empty() {
+                        state.add_assistant_message(response.content);
+                    }
+                    self.emit_completed(AgentStatus::Success, None, &state);
+                    return Ok(state.into_result(AgentStatus::Success, None));
+                }
+                StreamOutcome::Interrupted(response) => (response, true),
+                StreamOutcome::Complete(response) => (response, false),
+            };
+
+            state.accumulate_usage(response.usage.as_ref(), &response.model);
+
+            // Emit final token usage
+            if let Some(ref usage) = response.usage {
+                let cost = compute_cost(&response.model, usage.input_tokens, usage.output_tokens);
+                events::emit(
+                    &self.event_bus,
+                    AgentEvent::TokenUsage {
+                        input_tokens: usage.input_tokens,
+                        output_tokens: usage.output_tokens,
+                        cache_read_tokens: usage.cache_read_input_tokens,
+                        cache_write_tokens: usage.cache_creation_input_tokens,
+                        total_cost_usd: Some(cost),
+                    },
+                );
+            }
+
+            if interrupted {
+                // On interrupt: save partial response and go back to awaiting input
+                if !response.content.is_empty() {
+                    state.add_assistant_message(response.content);
+                }
+                let _ = signal_tx.send(InteractiveSignal::AwaitingInput).await;
+                events::emit(&self.event_bus, AgentEvent::AwaitingInput);
+
+                // Wait for next user message
+                match input_rx.recv().await {
+                    Some(UserMessage::Chat(msg)) => {
+                        state.inject_system_notification(&msg);
+                        nudge_count = 0;
+                        goal_check_fired = false;
+                        continue;
+                    }
+                    Some(UserMessage::Quit) => {
+                        self.emit_completed(AgentStatus::Success, None, &state);
+                        return Ok(state.into_result(AgentStatus::Success, None));
+                    }
+                    Some(UserMessage::Interrupt) => continue,
+                    None => {
+                        return Err(AgentError::Llm("Input channel closed".to_string()));
+                    }
+                }
+            }
+
+            // Process the assembled response (same logic as batch loop)
+            match response.stop_reason {
+                StopReason::ToolUse => {
+                    let assistant_content = response.content;
+                    let has_tool_use = content_has_tool_use(&assistant_content);
+
+                    if !has_tool_use {
+                        let Some(assistant_content) =
+                            self.try_nudge(&mut state, assistant_content, &mut nudge_count)
+                        else {
+                            continue;
+                        };
+                        let Some(assistant_content) = self.try_goal_check(
+                            &mut state,
+                            assistant_content,
+                            &mut goal_check_fired,
+                        ) else {
+                            continue;
+                        };
+                        // No tool_use despite stop_reason=tool_use: treat as end_turn
+                        warn!("LLM returned stop_reason=tool_use but no tool_use blocks; treating as end_turn");
+                        let final_text = Self::extract_text(&assistant_content);
+                        state.add_assistant_message(assistant_content);
+
+                        let _ = signal_tx.send(InteractiveSignal::AwaitingInput).await;
+                        events::emit(&self.event_bus, AgentEvent::AwaitingInput);
+
+                        // Wait for next user message
+                        match input_rx.recv().await {
+                            Some(UserMessage::Chat(msg)) => {
+                                state.inject_system_notification(&msg);
+                                nudge_count = 0;
+                                goal_check_fired = false;
+                                continue;
+                            }
+                            Some(UserMessage::Quit) => {
+                                self.emit_completed(
+                                    AgentStatus::Success,
+                                    Some(final_text.clone()),
+                                    &state,
+                                );
+                                return Ok(
+                                    state.into_result(AgentStatus::Success, Some(final_text))
+                                );
+                            }
+                            Some(UserMessage::Interrupt) => continue,
+                            None => {
+                                return Err(AgentError::Llm("Input channel closed".to_string()));
+                            }
+                        }
+                    }
+
+                    // Execute tools
+                    state.add_assistant_message(assistant_content.clone());
+                    let (tool_results, step_records) = self
+                        .execute_tools_with_registry(
+                            &assistant_content,
+                            state.current_iteration(),
+                            tool_registry.as_mut(),
+                        )
+                        .await;
+                    for step in step_records {
+                        state.record_step(step);
+                    }
+                    state.add_tool_results(tool_results);
+
+                    // Persist session
+                    self.persist_session_iteration(session_store, &None, &state)
+                        .await;
+
+                    // Check for inter-agent messages
+                    if let Some(messages) = self.tools.check_inbox().await {
+                        if !messages.is_empty() {
+                            let inbox_text = format!(
+                                "<inbox_messages>\n{}\n</inbox_messages>",
+                                messages.join("\n---\n")
+                            );
+                            state.inject_system_notification(&inbox_text);
+                        }
+                    }
+                }
+                StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
+                    let content = if !content_has_tool_use(&response.content) {
+                        let Some(content) =
+                            self.try_nudge(&mut state, response.content, &mut nudge_count)
+                        else {
+                            continue;
+                        };
+                        content
+                    } else {
+                        response.content
+                    };
+
+                    let Some(content) =
+                        self.try_goal_check(&mut state, content, &mut goal_check_fired)
+                    else {
+                        continue;
+                    };
+
+                    state.add_assistant_message(content);
+
+                    // Signal TUI that we're ready for input
+                    let _ = signal_tx.send(InteractiveSignal::AwaitingInput).await;
+                    events::emit(&self.event_bus, AgentEvent::AwaitingInput);
+
+                    // Wait for next user message
+                    match input_rx.recv().await {
+                        Some(UserMessage::Chat(msg)) => {
+                            state.inject_system_notification(&msg);
+                            nudge_count = 0;
+                            goal_check_fired = false;
+                            continue;
+                        }
+                        Some(UserMessage::Quit) => {
+                            let final_text = Self::extract_final_text(&state);
+                            self.emit_completed(
+                                AgentStatus::Success,
+                                Some(final_text.clone()),
+                                &state,
+                            );
+                            return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
+                        }
+                        Some(UserMessage::Interrupt) => continue,
+                        None => {
+                            return Err(AgentError::Llm("Input channel closed".to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Emit AgentEvents corresponding to stream deltas.
+    fn emit_stream_deltas(&self, deltas: &[super::interactive::StreamDelta]) {
+        for delta in deltas {
+            match delta {
+                super::interactive::StreamDelta::TextDelta(text) => {
+                    events::emit(
+                        &self.event_bus,
+                        AgentEvent::TextDelta { text: text.clone() },
+                    );
+                }
+                super::interactive::StreamDelta::ThinkingDelta(text) => {
+                    events::emit(
+                        &self.event_bus,
+                        AgentEvent::ThinkingDelta { text: text.clone() },
+                    );
+                }
+                super::interactive::StreamDelta::ToolUseStart { id, name } => {
+                    events::emit(
+                        &self.event_bus,
+                        AgentEvent::ToolUseStart {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: Value::Null,
+                        },
+                    );
+                }
+                super::interactive::StreamDelta::UsageUpdate {
+                    input_tokens,
+                    output_tokens,
+                    cache_read,
+                    cache_write,
+                    cost,
+                } => {
+                    events::emit(
+                        &self.event_bus,
+                        AgentEvent::TokenUsage {
+                            input_tokens: *input_tokens,
+                            output_tokens: *output_tokens,
+                            cache_read_tokens: *cache_read,
+                            cache_write_tokens: *cache_write,
+                            total_cost_usd: *cost,
+                        },
+                    );
+                }
+                super::interactive::StreamDelta::InputJsonDelta(_) => {
+                    // Input JSON deltas don't map to an AgentEvent
+                }
+            }
+        }
+    }
+
+    /// Extract text content from content blocks.
+    fn extract_text(content: &[ContentBlock]) -> String {
+        content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Extract the final text from the last assistant message in state.
+    fn extract_final_text(state: &AgentState) -> String {
+        state
+            .messages()
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, crate::llm::types::Role::Assistant))
+            .map(|m| Self::extract_text(&m.content))
+            .unwrap_or_default()
+    }
+
+    /// Build system prompt blocks (shared logic for interactive and batch modes).
+    fn build_system_blocks(
+        &self,
+        credentials: &CredentialSet,
+        skill_set: &SkillSet,
+        agents_md: &Option<crate::agents_md::AgentsMdContent>,
+    ) -> Option<Vec<SystemContent>> {
+        let mut system_blocks: Vec<SystemContent> = Vec::new();
+        if let Some(ref prompt) = self.config.system_prompt {
+            system_blocks.push(SystemContent::text(prompt.clone()));
+        }
+        if let Some(agents_md_prompt) =
+            crate::agents_md::inject_agents_md_into_system_prompt(agents_md)
+        {
+            system_blocks.push(SystemContent::text(agents_md_prompt));
+        }
+        if let Some(cred_prompt) = inject_credentials_into_system_prompt(credentials) {
+            system_blocks.push(SystemContent::text(cred_prompt));
+        }
+        if let Some(ref coord_config) = self.config.coordination_config {
+            if let Some(coord_prompt) =
+                crate::coordination::inject_coordination_into_system_prompt(coord_config)
+            {
+                system_blocks.push(SystemContent::text(coord_prompt));
+            }
+        }
+        if let Some(skill_prompt) = inject_skills_into_system_prompt(skill_set) {
+            system_blocks.push(SystemContent::text(skill_prompt));
+        }
+        // Mark the last block as cached
+        if let Some(last) = system_blocks.last_mut() {
+            match last {
+                SystemContent::Text { cache_control, .. } => {
+                    *cache_control = Some(CacheControl::ephemeral());
+                }
+            }
+        }
+        if system_blocks.is_empty() {
+            None
+        } else {
+            Some(system_blocks)
         }
     }
 }

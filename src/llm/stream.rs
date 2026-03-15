@@ -61,6 +61,8 @@ pub enum ContentBlockStartData {
     ToolUse { id: String, name: String },
     #[serde(rename = "thinking")]
     Thinking { thinking: String },
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -72,6 +74,8 @@ pub enum Delta {
     InputJsonDelta { partial_json: String },
     #[serde(rename = "thinking_delta")]
     ThinkingDelta { thinking: String },
+    #[serde(rename = "signature_delta")]
+    SignatureDelta { signature: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -228,9 +232,10 @@ impl SseParser {
                     error: wrapper.error,
                 })
             }
-            other => Err(AgentError::Llm(format!(
-                "Unknown stream event type: {other}"
-            ))),
+            _other => {
+                // Silently ignore unknown event types (e.g. "data" from some providers)
+                Ok(StreamEvent::Ping)
+            }
         }
     }
 }
@@ -435,7 +440,8 @@ mod tests {
     #[test]
     fn test_parse_unknown_event_type() {
         let result = SseParser::parse_event("unknown_type", "{}");
-        assert!(result.is_err());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), StreamEvent::Ping);
     }
 
     #[test]

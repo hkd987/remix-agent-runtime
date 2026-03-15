@@ -16,6 +16,9 @@ pub struct Cli {
 pub enum Commands {
     /// Run an agent task
     Run(Box<RunArgs>),
+    /// Launch an interactive chat session
+    #[cfg(feature = "tui")]
+    Chat(Box<ChatArgs>),
     /// Manage sessions
     Sessions(SessionsArgs),
 }
@@ -280,6 +283,233 @@ pub struct RunArgs {
     /// Base thinking budget tokens for LLM requests
     #[arg(long)]
     pub thinking_budget_tokens: Option<u32>,
+}
+
+/// Arguments for the interactive chat command.
+/// Shares most fields with RunArgs but has different defaults for interactive use.
+#[cfg(feature = "tui")]
+#[derive(clap::Args, Debug)]
+pub struct ChatArgs {
+    /// Path to YAML configuration file
+    #[arg(short, long)]
+    pub config: Option<PathBuf>,
+
+    /// LLM provider base URL
+    #[arg(long, env = "REMIX_LLM_BASE_URL")]
+    pub base_url: Option<String>,
+
+    /// LLM API key
+    #[arg(long, env = "REMIX_LLM_API_KEY")]
+    pub api_key: Option<String>,
+
+    /// LLM model identifier
+    #[arg(long, env = "REMIX_LLM_MODEL")]
+    pub model: Option<String>,
+
+    /// Maximum tokens per LLM response
+    #[arg(long)]
+    pub max_tokens: Option<u32>,
+
+    /// Maximum agent loop iterations per turn (default: 75)
+    #[arg(long)]
+    pub max_iterations: Option<u32>,
+
+    /// Run browser in headed mode (visible)
+    #[arg(long)]
+    pub headed: bool,
+
+    /// Disable browser connection (terminal-only mode)
+    #[arg(long)]
+    pub no_browser: bool,
+
+    /// Enable verbose logging to stderr
+    #[arg(short, long)]
+    pub verbose: bool,
+
+    /// Path to remix-browser binary
+    #[arg(long, env = "REMIX_BROWSER_PATH")]
+    pub browser_path: Option<String>,
+
+    /// Additional directory to scan for skills
+    #[arg(long, env = "REMIX_SKILLS_DIR")]
+    pub skills_dir: Option<PathBuf>,
+
+    /// Disable skill discovery
+    #[arg(long)]
+    pub no_skills: bool,
+
+    /// Directory to search for AGENTS.md files
+    #[arg(long, env = "REMIX_AGENTS_MD_DIR")]
+    pub agents_md_dir: Option<PathBuf>,
+
+    /// Disable AGENTS.md discovery
+    #[arg(long)]
+    pub no_agents_md: bool,
+
+    /// Disable local filesystem tools
+    #[arg(long)]
+    pub no_local_tools: bool,
+
+    /// Sandbox root directory for local tools
+    #[arg(long, env = "REMIX_SANDBOX_DIR")]
+    pub sandbox_dir: Option<PathBuf>,
+
+    /// Disable all plugin discovery
+    #[arg(long)]
+    pub no_plugins: bool,
+
+    /// Additional directory to scan for plugins
+    #[arg(long, env = "REMIX_PLUGINS_DIR")]
+    pub plugins_dir: Option<PathBuf>,
+
+    /// Disable Claude Code plugin cache discovery
+    #[arg(long)]
+    pub no_claude_plugins: bool,
+
+    /// Resume the most recent session
+    #[arg(long = "continue", alias = "resume")]
+    pub continue_session: bool,
+
+    /// Resume a specific session by ID
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    /// Override session storage directory
+    #[arg(long, env = "REMIX_SESSION_DIR")]
+    pub session_dir: Option<PathBuf>,
+
+    /// Permission mode (default, accept_edits, bypass_permissions, plan)
+    #[arg(long)]
+    pub permission_mode: Option<String>,
+
+    /// Allow specific tool patterns (repeatable)
+    #[arg(long)]
+    pub allow_tool: Vec<String>,
+
+    /// Deny specific tool patterns (repeatable)
+    #[arg(long)]
+    pub deny_tool: Vec<String>,
+
+    /// Disable multi-agent coordination
+    #[arg(long)]
+    pub no_coordination: bool,
+
+    /// Maximum concurrent worker agents
+    #[arg(long)]
+    pub max_workers: Option<u32>,
+
+    /// Override coordination storage directory
+    #[arg(long, env = "REMIX_COORDINATION_DIR")]
+    pub coordination_dir: Option<PathBuf>,
+
+    /// Custom system prompt (overrides built-in interactive prompt)
+    #[arg(long)]
+    pub system_prompt: Option<String>,
+
+    /// Override context window size in tokens for compaction
+    #[arg(long, env = "REMIX_CONTEXT_WINDOW")]
+    pub context_window: Option<u32>,
+
+    /// Disable context compaction
+    #[arg(long)]
+    pub disable_compaction: bool,
+
+    /// Disable all dev tools (LSP, test harness, repo map)
+    #[arg(long)]
+    pub no_dev_tools: bool,
+
+    /// Disable LSP integration
+    #[arg(long)]
+    pub no_lsp: bool,
+
+    /// Disable test harness tools
+    #[arg(long)]
+    pub no_test_harness: bool,
+
+    /// Disable repo map tool
+    #[arg(long)]
+    pub no_repo_map: bool,
+
+    /// Override LSP server command for a language (e.g., "rust=rust-analyzer")
+    #[arg(long = "lsp-server", value_name = "LANG=CMD")]
+    pub lsp_server: Vec<String>,
+
+    /// Base thinking budget tokens for LLM requests (default: 10000)
+    #[arg(long)]
+    pub thinking_budget_tokens: Option<u32>,
+
+    /// Maximum bytes for tool result output
+    #[arg(long, env = "REMIX_TOOL_RESULT_MAX_BYTES")]
+    pub tool_result_max_bytes: Option<usize>,
+}
+
+#[cfg(feature = "tui")]
+impl ChatArgs {
+    /// Convert ChatArgs into a RunArgs with interactive-optimized defaults.
+    pub fn to_run_args(&self) -> RunArgs {
+        RunArgs {
+            task: None,
+            config: self.config.clone(),
+            base_url: self.base_url.clone(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+            max_tokens: self.max_tokens,
+            timeout: None,
+            max_iterations: self.max_iterations.or(Some(75)),
+            headed: self.headed,
+            no_browser: self.no_browser,
+            verbose: self.verbose,
+            output: None,
+            browser_path: self.browser_path.clone(),
+            skills_dir: self.skills_dir.clone(),
+            no_skills: self.no_skills,
+            agents_md_dir: self.agents_md_dir.clone(),
+            no_agents_md: self.no_agents_md,
+            no_local_tools: self.no_local_tools,
+            sandbox_dir: self.sandbox_dir.clone(),
+            no_plugins: self.no_plugins,
+            plugins_dir: self.plugins_dir.clone(),
+            no_claude_plugins: self.no_claude_plugins,
+            session_id: self.session_id.clone(),
+            fork_session: None,
+            session_dir: self.session_dir.clone(),
+            permission_mode: self
+                .permission_mode
+                .clone()
+                .or_else(|| Some("accept_edits".to_string())),
+            allow_tool: self.allow_tool.clone(),
+            deny_tool: self.deny_tool.clone(),
+            no_coordination: self.no_coordination,
+            max_workers: self.max_workers,
+            coordination_dir: self.coordination_dir.clone(),
+            continue_session: self.continue_session,
+            effort: None,
+            sse_port: None,
+            system_prompt: self.system_prompt.clone(),
+            tool_result_max_bytes: self.tool_result_max_bytes,
+            context_window: self.context_window,
+            disable_compaction: self.disable_compaction,
+            nudge_on_text_only: false,
+            nudge_max_count: None,
+            goal_check_on_complete: false,
+            no_dev_tools: self.no_dev_tools,
+            no_lsp: self.no_lsp,
+            no_test_harness: self.no_test_harness,
+            no_repo_map: self.no_repo_map,
+            lsp_server: self.lsp_server.clone(),
+            action_reminder_interval: None,
+            loop_detection: true,
+            loop_detection_max_repeats: Some(3),
+            loop_detection_window: Some(10),
+            loop_detection_max_failures: None,
+            reasoning_stages: true,
+            planning_budget_tokens: Some(10000),
+            execution_budget_tokens: Some(5000),
+            verification_budget_tokens: Some(10000),
+            iteration_budget_warning_threshold: None,
+            thinking_budget_tokens: self.thinking_budget_tokens.or(Some(10000)),
+        }
+    }
 }
 
 #[cfg(test)]
