@@ -138,12 +138,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             return None;
         }
 
-        // Check if agent has written any files by looking at step records
-        let has_written_files = state
-            .steps()
-            .iter()
-            .any(|s| s.tool == "write_file" || s.tool == "edit_file");
-
+        let has_written_files = state.has_written_files();
         let remaining = self.config.max_iterations.saturating_sub(iteration);
 
         let msg = if has_written_files {
@@ -1352,6 +1347,34 @@ mod tests {
         }
     }
 
+    /// A capturing LLM mock that records all messages sent to it.
+    /// Shared across tests that need to inspect injected messages.
+    struct CapturingLlm {
+        responses: Arc<Mutex<Vec<MessagesResponse>>>,
+        captured_messages: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for CapturingLlm {
+        async fn send_messages(
+            &self,
+            _system: Option<&[SystemContent]>,
+            messages: &[Message],
+            _tools: Option<&[ToolDefinition]>,
+        ) -> Result<MessagesResponse, AgentError> {
+            self.captured_messages
+                .lock()
+                .unwrap()
+                .push(messages.to_vec());
+            let mut responses = self.responses.lock().unwrap();
+            if responses.is_empty() {
+                Err(AgentError::Llm("No more mock responses".into()))
+            } else {
+                Ok(responses.remove(0))
+            }
+        }
+    }
+
     fn default_config() -> AgentConfig {
         AgentConfig {
             max_iterations: 10,
@@ -1876,12 +1899,12 @@ mod tests {
         use std::path::PathBuf;
 
         // Capture the system prompt passed to the LLM
-        struct CapturingLlm {
+        struct SystemCapturingLlm {
             captured_system: Arc<Mutex<Option<String>>>,
         }
 
         #[async_trait]
-        impl LlmProvider for CapturingLlm {
+        impl LlmProvider for SystemCapturingLlm {
             async fn send_messages(
                 &self,
                 system: Option<&[SystemContent]>,
@@ -1901,7 +1924,7 @@ mod tests {
         }
 
         let captured = Arc::new(Mutex::new(None));
-        let llm = CapturingLlm {
+        let llm = SystemCapturingLlm {
             captured_system: captured.clone(),
         };
         let tools = MockTools {
@@ -2486,33 +2509,6 @@ mod tests {
             ..default_config()
         };
 
-        // We use a capturing LLM to inspect messages sent to it.
-        struct CapturingLlm {
-            responses: Arc<Mutex<Vec<MessagesResponse>>>,
-            captured_messages: Arc<Mutex<Vec<Vec<Message>>>>,
-        }
-
-        #[async_trait]
-        impl LlmProvider for CapturingLlm {
-            async fn send_messages(
-                &self,
-                _system: Option<&[SystemContent]>,
-                messages: &[Message],
-                _tools: Option<&[ToolDefinition]>,
-            ) -> Result<MessagesResponse, AgentError> {
-                self.captured_messages
-                    .lock()
-                    .unwrap()
-                    .push(messages.to_vec());
-                let mut responses = self.responses.lock().unwrap();
-                if responses.is_empty() {
-                    Err(AgentError::Llm("No more mock responses".into()))
-                } else {
-                    Ok(responses.remove(0))
-                }
-            }
-        }
-
         let captured = Arc::new(Mutex::new(Vec::new()));
         let llm = CapturingLlm {
             responses: Arc::new(Mutex::new(vec![
@@ -2582,32 +2578,6 @@ mod tests {
     async fn test_action_reminder_disabled_by_default() {
         // Default config has action_reminder_interval: None.
         // Verify no reminders are injected.
-        struct CapturingLlm {
-            responses: Arc<Mutex<Vec<MessagesResponse>>>,
-            captured_messages: Arc<Mutex<Vec<Vec<Message>>>>,
-        }
-
-        #[async_trait]
-        impl LlmProvider for CapturingLlm {
-            async fn send_messages(
-                &self,
-                _system: Option<&[SystemContent]>,
-                messages: &[Message],
-                _tools: Option<&[ToolDefinition]>,
-            ) -> Result<MessagesResponse, AgentError> {
-                self.captured_messages
-                    .lock()
-                    .unwrap()
-                    .push(messages.to_vec());
-                let mut responses = self.responses.lock().unwrap();
-                if responses.is_empty() {
-                    Err(AgentError::Llm("No more mock responses".into()))
-                } else {
-                    Ok(responses.remove(0))
-                }
-            }
-        }
-
         let captured = Arc::new(Mutex::new(Vec::new()));
         let llm = CapturingLlm {
             responses: Arc::new(Mutex::new(vec![
@@ -2741,5 +2711,60 @@ mod tests {
         state.increment_iteration();
 
         assert!(runner.build_action_reminder(&state).is_none());
+    }
+
+    #[test]
+    fn test_build_action_reminder_interval_zero() {
+        let config = AgentConfig {
+            action_reminder_interval: Some(0),
+            ..default_config()
+        };
+        let llm = MockLlm {
+            responses: Arc::new(Mutex::new(vec![])),
+        };
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![])),
+        };
+        let runner = AgentRunner::new(llm, tools, config);
+
+        let mut state = AgentState::new("test");
+        state.increment_iteration();
+        state.increment_iteration();
+
+        assert!(
+            runner.build_action_reminder(&state).is_none(),
+            "interval=0 should disable reminders"
+        );
+    }
+
+    #[test]
+    fn test_build_action_reminder_interval_one() {
+        let config = AgentConfig {
+            action_reminder_interval: Some(1),
+            max_iterations: 5,
+            ..default_config()
+        };
+        let llm = MockLlm {
+            responses: Arc::new(Mutex::new(vec![])),
+        };
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![])),
+        };
+        let runner = AgentRunner::new(llm, tools, config);
+
+        let mut state = AgentState::new("test");
+
+        // iteration 0 -> no reminder
+        assert!(runner.build_action_reminder(&state).is_none());
+
+        // iteration 1 -> fires (every iteration)
+        state.increment_iteration();
+        assert!(runner.build_action_reminder(&state).is_some());
+
+        // iteration 2 -> fires
+        state.increment_iteration();
+        assert!(runner.build_action_reminder(&state).is_some());
     }
 }

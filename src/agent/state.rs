@@ -16,6 +16,8 @@ pub struct AgentState {
     /// Unlike `total_input_tokens` (which is cumulative for reporting),
     /// this resets after compaction to reflect the actual context window usage.
     effective_input_tokens: u32,
+    /// Cached flag: true once a `write_file` or `edit_file` step has been recorded.
+    has_written_files: bool,
 }
 
 impl AgentState {
@@ -34,11 +36,16 @@ impl AgentState {
             total_output_tokens: 0,
             total_cost: 0.0,
             effective_input_tokens: 0,
+            has_written_files: false,
         }
     }
 
     /// Restore state from a session snapshot (used when resuming a session).
     pub fn from_snapshot(snapshot: &SessionSnapshot) -> Self {
+        let has_written_files = snapshot
+            .steps
+            .iter()
+            .any(|s| s.tool == "write_file" || s.tool == "edit_file");
         Self {
             messages: snapshot.messages.clone(),
             steps: snapshot.steps.clone(),
@@ -48,6 +55,7 @@ impl AgentState {
             total_output_tokens: snapshot.metadata.total_output_tokens.unwrap_or(0),
             total_cost: 0.0,
             effective_input_tokens: 0,
+            has_written_files,
         }
     }
 
@@ -66,7 +74,15 @@ impl AgentState {
     }
 
     pub fn record_step(&mut self, step: StepRecord) {
+        if step.tool == "write_file" || step.tool == "edit_file" {
+            self.has_written_files = true;
+        }
         self.steps.push(step);
+    }
+
+    /// Returns `true` if any recorded step used `write_file` or `edit_file`.
+    pub fn has_written_files(&self) -> bool {
+        self.has_written_files
     }
 
     pub fn increment_iteration(&mut self) {
@@ -796,5 +812,93 @@ mod tests {
         state.compact("summary", 4);
         // effective should remain unchanged since compact was a no-op
         assert_eq!(state.effective_input_tokens(), 5_000);
+    }
+
+    #[test]
+    fn test_has_written_files_defaults_to_false() {
+        let state = AgentState::new("task");
+        assert!(!state.has_written_files());
+    }
+
+    #[test]
+    fn test_has_written_files_set_on_write_file() {
+        let mut state = AgentState::new("task");
+        state.record_step(StepRecord {
+            iteration: 1,
+            tool: "write_file".to_string(),
+            input: json!({"path": "out.txt"}),
+            output: json!("ok"),
+            duration_ms: 10,
+            is_error: None,
+        });
+        assert!(state.has_written_files());
+    }
+
+    #[test]
+    fn test_has_written_files_set_on_edit_file() {
+        let mut state = AgentState::new("task");
+        state.record_step(StepRecord {
+            iteration: 1,
+            tool: "edit_file".to_string(),
+            input: json!({"path": "out.txt"}),
+            output: json!("ok"),
+            duration_ms: 10,
+            is_error: None,
+        });
+        assert!(state.has_written_files());
+    }
+
+    #[test]
+    fn test_has_written_files_not_set_on_other_tools() {
+        let mut state = AgentState::new("task");
+        state.record_step(StepRecord {
+            iteration: 1,
+            tool: "navigate".to_string(),
+            input: json!({}),
+            output: json!({}),
+            duration_ms: 10,
+            is_error: None,
+        });
+        assert!(!state.has_written_files());
+    }
+
+    #[test]
+    fn test_from_snapshot_detects_written_files() {
+        use crate::llm::types::Role;
+        use crate::session::types::{SessionId, SessionMetadata, SessionSnapshot, SessionStatus};
+        use chrono::Utc;
+
+        let now = Utc::now();
+        let snapshot = SessionSnapshot {
+            metadata: SessionMetadata {
+                id: SessionId("test".to_string()),
+                created_at: now,
+                updated_at: now,
+                task: "task".to_string(),
+                status: SessionStatus::InProgress,
+                total_input_tokens: None,
+                total_output_tokens: None,
+                parent_session_id: None,
+            },
+            messages: vec![crate::llm::types::Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "task".to_string(),
+                }],
+            }],
+            steps: vec![StepRecord {
+                iteration: 1,
+                tool: "edit_file".to_string(),
+                input: json!({}),
+                output: json!({}),
+                duration_ms: 0,
+                is_error: None,
+            }],
+            system_prompt: None,
+            iteration: 2,
+        };
+
+        let state = AgentState::from_snapshot(&snapshot);
+        assert!(state.has_written_files());
     }
 }
