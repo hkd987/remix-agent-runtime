@@ -93,6 +93,19 @@ impl AgentState {
         &self.messages
     }
 
+    /// Extract the original task text from the first user message.
+    pub fn original_task(&self) -> Option<&str> {
+        self.messages.first().and_then(|msg| {
+            msg.content.iter().find_map(|block| {
+                if let ContentBlock::Text { text } = block {
+                    Some(text.as_str())
+                } else {
+                    None
+                }
+            })
+        })
+    }
+
     /// Get mutable access to messages (for in-place compaction stages).
     pub fn messages_mut(&mut self) -> &mut [Message] {
         &mut self.messages
@@ -900,5 +913,24 @@ mod tests {
 
         let state = AgentState::from_snapshot(&snapshot);
         assert!(state.has_written_files());
+    }
+
+    #[test]
+    fn test_original_task_returns_first_message_text() {
+        let state = AgentState::new("Write a compressor for data.txt");
+        assert_eq!(
+            state.original_task(),
+            Some("Write a compressor for data.txt")
+        );
+    }
+
+    #[test]
+    fn test_original_task_survives_additional_messages() {
+        let mut state = AgentState::new("Solve the puzzle");
+        state.add_assistant_message(vec![ContentBlock::Text {
+            text: "Working on it...".to_string(),
+        }]);
+        state.inject_system_notification("Reminder: keep going");
+        assert_eq!(state.original_task(), Some("Solve the puzzle"));
     }
 }

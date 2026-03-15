@@ -31,7 +31,14 @@ use super::tool_registry::ToolRegistry;
 const NUDGE_MESSAGE: &str = "You provided analysis but did not take any action. Continue with the implementation. Use tools to make progress on the task.";
 
 /// Message injected for a one-time goal check before the agent terminates.
-const GOAL_CHECK_MESSAGE: &str = "Before you finish, verify your work is complete: 1) Check that all required output files exist (review the task for expected paths) 2) Run any provided test/eval scripts to confirm correctness 3) If anything is missing or failing, fix it now. If everything checks out, respond with your final summary.";
+const GOAL_CHECK_BASE: &str = "STOP. Before you finish, re-read the ORIGINAL TASK below and verify ALL requirements and constraints are met:\n\n\
+    <original_task>\n{task}\n</original_task>\n\n\
+    Now verify:\n\
+    1) Re-read every constraint in the task above. Check each one explicitly.\n\
+    2) Check that all required output files exist at the expected paths.\n\
+    3) Run any provided test/eval scripts to confirm correctness.\n\
+    4) If ANYTHING is missing, failing, or violates a constraint, fix it now.\n\
+    If everything checks out, respond with your final summary.";
 
 /// Tools that are always visible in lazy discovery mode (core local tools).
 const ALWAYS_AVAILABLE_TOOLS: &[&str] = &[
@@ -122,7 +129,9 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         info!("Goal check: verifying work completion before termination");
         self.emit_response_content_events(&content);
         state.add_assistant_message(content);
-        state.inject_system_notification(GOAL_CHECK_MESSAGE);
+        let task_text = state.original_task().unwrap_or("(task not available)");
+        let goal_msg = GOAL_CHECK_BASE.replace("{task}", task_text);
+        state.inject_system_notification(&goal_msg);
         None
     }
 
