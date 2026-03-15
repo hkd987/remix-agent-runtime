@@ -1,3 +1,6 @@
 /target
 .env
 harbor-adapter/src/remix_agent_harbor/__pycache__/
+benchmark-run.log
+benchmark-run-v040.log
+benchmark-results/
