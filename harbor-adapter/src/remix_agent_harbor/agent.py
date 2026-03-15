@@ -83,6 +83,7 @@ class RemixAgent(BaseInstalledAgent):
             " --timeout 1800"
             " --max-iterations 200"
             " --tool-result-max-bytes 16384"
+            " --nudge-on-text-only"
             " --deny-tool 'web_fetch'"
             f" --output {OUTPUT_FILE}"
             f" --session-dir {LOGS_DIR / 'sessions'}"

@@ -166,6 +166,13 @@ pub struct MessagesResponse {
     pub usage: Option<Usage>,
 }
 
+/// Returns `true` if any block in the slice is a `ToolUse` variant.
+pub fn content_has_tool_use(content: &[ContentBlock]) -> bool {
+    content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+}
+
 /// Per-token pricing (input, output) in USD. Returns (input_cost_per_token, output_cost_per_token).
 pub fn model_pricing(model: &str) -> (f64, f64) {
     // Claude pricing per million tokens
@@ -827,6 +834,34 @@ mod tests {
     fn test_cache_control_ephemeral_constructor() {
         let cc = CacheControl::ephemeral();
         assert_eq!(cc.cache_type, "ephemeral");
+    }
+
+    #[test]
+    fn test_content_has_tool_use_with_tool_use() {
+        let content = vec![
+            ContentBlock::Text {
+                text: "hello".to_string(),
+            },
+            ContentBlock::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "navigate".to_string(),
+                input: json!({}),
+            },
+        ];
+        assert!(content_has_tool_use(&content));
+    }
+
+    #[test]
+    fn test_content_has_tool_use_without_tool_use() {
+        let content = vec![ContentBlock::Text {
+            text: "hello".to_string(),
+        }];
+        assert!(!content_has_tool_use(&content));
+    }
+
+    #[test]
+    fn test_content_has_tool_use_empty() {
+        assert!(!content_has_tool_use(&[]));
     }
 
     #[test]

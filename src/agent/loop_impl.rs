@@ -10,7 +10,8 @@ use crate::config::schema::{AgentConfig, CompactionConfig};
 use crate::error::AgentError;
 use crate::llm::client::LlmProvider;
 use crate::llm::types::{
-    CacheControl, ContentBlock, StopReason, SystemContent, ToolDefinition, ToolResultContent,
+    content_has_tool_use, CacheControl, ContentBlock, StopReason, SystemContent, ToolDefinition,
+    ToolResultContent,
 };
 use crate::output::events::{self, AgentEvent, EventBus};
 use crate::output::result::{AgentResult, AgentStatus, StepRecord};
@@ -25,6 +26,9 @@ use super::reminders::ReminderScheduler;
 use super::self_critique;
 use super::state::AgentState;
 use super::tool_registry::ToolRegistry;
+
+/// Message injected when the LLM returns text-only without using any tools.
+const NUDGE_MESSAGE: &str = "You provided analysis but did not take any action. Continue with the implementation. Use tools to make progress on the task.";
 
 /// Tools that are always visible in lazy discovery mode (core local tools).
 const ALWAYS_AVAILABLE_TOOLS: &[&str] = &[
@@ -67,6 +71,26 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
     /// Get a reference to the inner tool executor (non-consuming).
     pub fn tools_ref(&self) -> &T {
         &self.tools
+    }
+
+    /// Attempt to nudge the LLM to continue using tools.
+    /// Returns `None` if a nudge was applied (caller should `continue` the loop).
+    /// Returns `Some(content)` if no nudge was applied (content returned for further processing).
+    fn try_nudge(
+        &self,
+        state: &mut AgentState,
+        content: Vec<ContentBlock>,
+        nudge_count: &mut u32,
+    ) -> Option<Vec<ContentBlock>> {
+        if !self.config.nudge_on_text_only || *nudge_count >= self.config.nudge_max_count {
+            return Some(content);
+        }
+        *nudge_count += 1;
+        info!(nudge_count = *nudge_count, max = self.config.nudge_max_count, "Text-only response detected, nudging LLM to continue");
+        self.emit_response_content_events(&content);
+        state.add_assistant_message(content);
+        state.inject_system_notification(NUDGE_MESSAGE);
+        None
     }
 
     /// Returns `true` for tools that only read state.
@@ -312,6 +336,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         let reminder_scheduler = ReminderScheduler::from_configs(&self.config.reminders);
 
         let timeout_ms = self.config.timeout_secs * 1000;
+        let mut nudge_count: u32 = 0;
 
         loop {
             if state.current_iteration() >= self.config.max_iterations {
@@ -399,10 +424,11 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     let assistant_content = response.content.clone();
 
                     // Check if there are actually tool_use blocks; if not, treat as end_turn.
-                    let has_tool_use = assistant_content
-                        .iter()
-                        .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+                    let has_tool_use = content_has_tool_use(&assistant_content);
                     if !has_tool_use {
+                        let Some(assistant_content) = self.try_nudge(&mut state, assistant_content, &mut nudge_count) else {
+                            continue;
+                        };
                         warn!("LLM returned stop_reason=tool_use but no tool_use blocks; treating as end_turn");
                         let final_text = assistant_content
                             .iter()
@@ -515,8 +541,16 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     }
                 }
                 StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
-                    let final_text = response
-                        .content
+                    let content = if !content_has_tool_use(&response.content) {
+                        let Some(content) = self.try_nudge(&mut state, response.content, &mut nudge_count) else {
+                            continue;
+                        };
+                        content
+                    } else {
+                        response.content
+                    };
+
+                    let final_text = content
                         .iter()
                         .filter_map(|block| match block {
                             ContentBlock::Text { text } => Some(text.clone()),
@@ -525,9 +559,9 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         .collect::<Vec<_>>()
                         .join("\n");
 
-                    self.emit_response_content_events(&response.content);
+                    self.emit_response_content_events(&content);
 
-                    state.add_assistant_message(response.content);
+                    state.add_assistant_message(content);
 
                     self.finalize_session(
                         session_store,
@@ -889,6 +923,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         let reminder_scheduler = ReminderScheduler::from_configs(&self.config.reminders);
         let timeout_ms = self.config.timeout_secs * 1000;
         let session_metadata = session_store.load_metadata(session_id).await.ok();
+        let mut nudge_count: u32 = 0;
 
         loop {
             if state.current_iteration() >= self.config.max_iterations {
@@ -966,10 +1001,11 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             match response.stop_reason {
                 StopReason::ToolUse => {
                     let assistant_content = response.content.clone();
-                    let has_tool_use = assistant_content
-                        .iter()
-                        .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+                    let has_tool_use = content_has_tool_use(&assistant_content);
                     if !has_tool_use {
+                        let Some(assistant_content) = self.try_nudge(&mut state, assistant_content, &mut nudge_count) else {
+                            continue;
+                        };
                         let final_text = assistant_content
                             .iter()
                             .filter_map(|block| match block {
@@ -1017,8 +1053,16 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     }
                 }
                 StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
-                    let final_text = response
-                        .content
+                    let content = if !content_has_tool_use(&response.content) {
+                        let Some(content) = self.try_nudge(&mut state, response.content, &mut nudge_count) else {
+                            continue;
+                        };
+                        content
+                    } else {
+                        response.content
+                    };
+
+                    let final_text = content
                         .iter()
                         .filter_map(|block| match block {
                             ContentBlock::Text { text } => Some(text.clone()),
@@ -1027,9 +1071,9 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         .collect::<Vec<_>>()
                         .join("\n");
 
-                    self.emit_response_content_events(&response.content);
+                    self.emit_response_content_events(&content);
 
-                    state.add_assistant_message(response.content);
+                    state.add_assistant_message(content);
                     self.finalize_session(
                         Some(session_store),
                         &session_metadata,
@@ -1197,6 +1241,8 @@ mod tests {
             plan_mode: false,
             reminders: Vec::new(),
             self_critique: None,
+            nudge_on_text_only: false,
+            nudge_max_count: 3,
         }
     }
 
@@ -1291,6 +1337,8 @@ mod tests {
             plan_mode: false,
             reminders: Vec::new(),
             self_critique: None,
+            nudge_on_text_only: false,
+            nudge_max_count: 3,
         };
 
         // LLM always returns tool_use, so we hit max_iterations
@@ -1432,6 +1480,8 @@ mod tests {
             plan_mode: false,
             reminders: Vec::new(),
             self_critique: None,
+            nudge_on_text_only: false,
+            nudge_max_count: 3,
         };
 
         let llm_responses = Arc::new(Mutex::new(vec![make_end_turn_response("Done")]));
@@ -2053,5 +2103,106 @@ mod tests {
             event_types.contains(&"agent_completed".to_string()),
             "Missing agent_completed event"
         );
+    }
+
+    #[tokio::test]
+    async fn test_nudge_on_text_only_continues_loop() {
+        let config = AgentConfig {
+            nudge_on_text_only: true,
+            nudge_max_count: 2,
+            ..default_config()
+        };
+
+        // With nudge_max_count=2: nudge on responses 1 & 2, then terminate on response 3
+        let llm = MockLlm {
+            responses: Arc::new(Mutex::new(vec![
+                make_end_turn_response("Let me analyze this..."),
+                make_end_turn_response("I think the approach should be..."),
+                make_end_turn_response("Done"),
+            ])),
+        };
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![])),
+        };
+
+        let runner = AgentRunner::new(llm, tools, config);
+        let result = runner
+            .run("Do something", &CredentialSet::new(), &SkillSet::new(), &None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        // Nudged twice (iterations 1 and 2), then terminated on 3rd
+        assert_eq!(
+            result.total_iterations, 3,
+            "Expected 3 iterations (2 nudges + termination), got {}",
+            result.total_iterations
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nudge_disabled_terminates_immediately() {
+        let config = AgentConfig {
+            nudge_on_text_only: false,
+            ..default_config()
+        };
+
+        let llm = MockLlm {
+            responses: Arc::new(Mutex::new(vec![make_end_turn_response(
+                "Here is my analysis...",
+            )])),
+        };
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![])),
+        };
+
+        let runner = AgentRunner::new(llm, tools, config);
+        let result = runner
+            .run("Do something", &CredentialSet::new(), &SkillSet::new(), &None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(
+            result.total_iterations, 1,
+            "Expected immediate termination with nudge disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nudge_exhausted_terminates() {
+        let config = AgentConfig {
+            nudge_on_text_only: true,
+            nudge_max_count: 2,
+            ..default_config()
+        };
+
+        let llm = MockLlm {
+            responses: Arc::new(Mutex::new(vec![
+                make_end_turn_response("Analysis part 1..."),
+                make_end_turn_response("Analysis part 2..."),
+                make_end_turn_response("Analysis part 3..."),
+            ])),
+        };
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![])),
+        };
+
+        let runner = AgentRunner::new(llm, tools, config);
+        let result = runner
+            .run("Do something", &CredentialSet::new(), &SkillSet::new(), &None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        // 2 nudges exhausted, then 3rd iteration terminates normally
+        assert_eq!(
+            result.total_iterations, 3,
+            "Expected 3 iterations (2 nudges exhausted, 3rd terminates)"
+        );
+        assert_eq!(result.result, Some("Analysis part 3...".to_string()));
     }
 }

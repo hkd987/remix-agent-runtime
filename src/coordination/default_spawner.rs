@@ -210,6 +210,8 @@ impl<L: LlmProvider + 'static> SpawnHandler for DefaultSpawnHandler<L> {
             plan_mode: false,
             reminders: Vec::new(),
             self_critique: None,
+            nudge_on_text_only: false,
+            nudge_max_count: crate::config::schema::default_nudge_max_count(),
         };
 
         // 4. Create AgentRunner and tokio::spawn

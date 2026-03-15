@@ -204,6 +204,14 @@ pub struct RunArgs {
     /// Disable context compaction entirely
     #[arg(long)]
     pub disable_compaction: bool,
+
+    /// Nudge the LLM to continue when it returns text-only responses without tool use
+    #[arg(long)]
+    pub nudge_on_text_only: bool,
+
+    /// Maximum number of text-only nudges before terminating (default: 3)
+    #[arg(long)]
+    pub nudge_max_count: Option<u32>,
 }
 
 #[cfg(test)]
@@ -324,6 +332,9 @@ mod tests {
             "--disable-compaction",
             "--tool-result-max-bytes",
             "16384",
+            "--nudge-on-text-only",
+            "--nudge-max-count",
+            "5",
             "do something",
         ]));
         assert_eq!(args.task, Some("do something".to_string()));
@@ -371,6 +382,8 @@ mod tests {
         assert_eq!(args.context_window, Some(128_000));
         assert!(args.disable_compaction);
         assert_eq!(args.tool_result_max_bytes, Some(16_384));
+        assert!(args.nudge_on_text_only);
+        assert_eq!(args.nudge_max_count, Some(5));
     }
 
     #[test]
@@ -819,5 +832,35 @@ mod tests {
     fn test_parse_run_tool_result_max_bytes_default_none() {
         let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
         assert!(args.tool_result_max_bytes.is_none());
+    }
+
+    #[test]
+    fn test_parse_run_with_nudge_on_text_only() {
+        let args = extract_run_args(Cli::parse_from([
+            "remix-agent",
+            "run",
+            "--nudge-on-text-only",
+        ]));
+        assert!(args.nudge_on_text_only);
+        assert!(args.nudge_max_count.is_none());
+    }
+
+    #[test]
+    fn test_parse_run_with_nudge_max_count() {
+        let args = extract_run_args(Cli::parse_from([
+            "remix-agent",
+            "run",
+            "--nudge-max-count",
+            "10",
+        ]));
+        assert_eq!(args.nudge_max_count, Some(10));
+        assert!(!args.nudge_on_text_only);
+    }
+
+    #[test]
+    fn test_parse_run_nudge_defaults() {
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
+        assert!(!args.nudge_on_text_only);
+        assert!(args.nudge_max_count.is_none());
     }
 }

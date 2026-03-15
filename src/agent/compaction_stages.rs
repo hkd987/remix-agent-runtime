@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::schema::StageThresholds;
-use crate::llm::types::{ContentBlock, Message, Role, ToolResultContent};
+use crate::llm::types::{content_has_tool_use, ContentBlock, Message, Role, ToolResultContent};
 
 /// Compaction stages in order of aggressiveness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -105,11 +105,7 @@ pub fn compress_tool_outputs(messages: &mut [Message], max_chars: usize) -> usiz
 
 /// Detect whether a message contains a ToolUse block (assistant) or ToolResult block (user).
 fn is_tool_use_msg(msg: &Message) -> bool {
-    matches!(msg.role, Role::Assistant)
-        && msg
-            .content
-            .iter()
-            .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+    matches!(msg.role, Role::Assistant) && content_has_tool_use(&msg.content)
 }
 
 fn is_tool_result_msg(msg: &Message) -> bool {

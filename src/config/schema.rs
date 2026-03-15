@@ -207,6 +207,16 @@ pub struct AgentConfig {
     /// Self-critique phase configuration.
     #[serde(default)]
     pub self_critique: Option<SelfCritiqueConfig>,
+    /// When true, nudge the LLM to continue if it returns text-only with no tool calls.
+    #[serde(default)]
+    pub nudge_on_text_only: bool,
+    /// Maximum number of nudges before allowing the loop to terminate normally.
+    #[serde(default = "default_nudge_max_count")]
+    pub nudge_max_count: u32,
+}
+
+pub fn default_nudge_max_count() -> u32 {
+    3
 }
 
 fn default_coordination_config() -> Option<CoordinationConfig> {
@@ -226,6 +236,8 @@ impl Default for AgentConfig {
             plan_mode: false,
             reminders: Vec::new(),
             self_critique: None,
+            nudge_on_text_only: false,
+            nudge_max_count: default_nudge_max_count(),
         }
     }
 }
