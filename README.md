@@ -1,8 +1,8 @@
 # remix-agent-runtime
 
-LLM-driven browser automation agent runtime. Give it a task in plain English, and it uses an LLM to control a real Chrome browser until the job is done.
+LLM-driven autonomous agent runtime for browser automation and software engineering. Give it a task in plain English, and it uses an LLM to control a real Chrome browser, write code, run tests, and solve problems end-to-end.
 
-`remix-agent-runtime` is the orchestration layer that connects [remix-browser](https://github.com/hkd987/remix-browser) (headless Chrome via MCP) with any LLM provider to create an autonomous browser automation agent. It works with Anthropic, OpenRouter, AWS Bedrock, or any provider compatible with the Anthropic Messages API format. Credentials are secured by [remix-credentials](https://github.com/hkd987/remix-credentials).
+`remix-agent-runtime` is the orchestration layer that connects [remix-browser](https://github.com/hkd987/remix-browser) (headless Chrome via MCP) with any LLM provider to create an autonomous agent. It works with Anthropic, OpenRouter, AWS Bedrock, or any provider compatible with the Anthropic Messages API format. The runtime can operate in browser mode, terminal-only mode (`--no-browser`), or both simultaneously. Credentials are secured by [remix-credentials](https://github.com/hkd987/remix-credentials).
 
 ## How it works
 
@@ -35,7 +35,7 @@ LLM-driven browser automation agent runtime. Give it a task in plain English, an
  │    │  └──────────────────┬──────────────────────┘    │    │
  │    │                     │                            │    │
  │    │  ┌──────────────────┴──────────────────────┐    │    │
- │    │  │ LocalToolsExecutor (6 sandboxed tools)  │    │    │
+ │    │  │ LocalToolsExecutor (7 sandboxed tools)  │    │    │
  │    │  └──────────────────┬──────────────────────┘    │    │
  │    │                     │                            │    │
  │    │  ┌──────────────────┴──────────────────────┐    │    │
@@ -129,6 +129,8 @@ remix-agent run "Navigate to example.com and tell me what's on the page"
 remix-agent run [OPTIONS] [TASK]
 ```
 
+**Core:**
+
 | Flag | Short | Env Var | Description |
 |------|-------|---------|-------------|
 | `--config <PATH>` | `-c` | -- | Path to YAML configuration file |
@@ -136,39 +138,126 @@ remix-agent run [OPTIONS] [TASK]
 | `--base-url <URL>` | -- | `REMIX_LLM_BASE_URL` | LLM provider base URL (default: Anthropic) |
 | `--model <NAME>` | -- | `REMIX_LLM_MODEL` | Model ID (default: `claude-sonnet-4-20250514`) |
 | `--max-tokens <N>` | -- | -- | Max tokens per response (default: 8192) |
+| `--thinking-budget-tokens <N>` | -- | -- | Thinking/reasoning budget tokens for extended thinking |
 | `--timeout <SECS>` | -- | -- | Max duration in seconds |
 | `--max-iterations <N>` | -- | -- | Max agent loop iterations (default: 50) |
-| `--headed` | -- | -- | Show the browser window |
+| `--system-prompt <TEXT>` | -- | -- | Custom system prompt |
+| `--effort <LEVEL>` | -- | -- | Effort level: `low`, `medium`, `high`, `max` |
 | `--verbose` | `-v` | -- | Debug logging to stderr |
 | `--output <PATH>` | `-o` | -- | Write JSON results to file |
-| `--browser-path <PATH>` | -- | `REMIX_BROWSER_PATH` | Path to remix-browser binary |
-| `--agents-md-dir <PATH>` | -- | `REMIX_AGENTS_MD_DIR` | Override AGENTS.md search directory |
-| `--no-agents-md` | -- | -- | Disable AGENTS.md discovery |
-| `--no-local-tools` | -- | -- | Disable local filesystem tools |
-| `--sandbox-dir <PATH>` | -- | `REMIX_SANDBOX_DIR` | Sandbox root for local tools |
-| `--skills-dir <PATH>` | -- | `REMIX_SKILLS_DIR` | Additional skills directory |
-| `--no-skills` | -- | -- | Disable skill discovery |
-| `--no-plugins` | -- | -- | Disable all plugin discovery |
-| `--plugins-dir <PATH>` | -- | `REMIX_PLUGINS_DIR` | Additional plugin directory |
-| `--no-claude-plugins` | -- | -- | Disable Claude Code plugin cache |
-| `--session-id <ID>` | -- | -- | Resume an existing session |
-| `--fork-session <ID>` | -- | -- | Fork from an existing session |
-| `--session-dir <PATH>` | -- | `REMIX_SESSION_DIR` | Override session storage directory |
-| `--permission-mode <MODE>` | -- | -- | Permission mode: `default`, `accept_edits`, `bypass_permissions`, `plan` |
-| `--allow-tool <PATTERN>` | -- | -- | Regex pattern for auto-allowed tools (repeatable) |
-| `--deny-tool <PATTERN>` | -- | -- | Regex pattern for denied tools (repeatable) |
-| `--no-coordination` | -- | -- | Disable multi-agent coordination |
-| `--max-workers <N>` | -- | -- | Maximum concurrent worker agents (default: 5) |
-| `--coordination-dir <PATH>` | -- | `REMIX_COORDINATION_DIR` | Override coordination storage directory |
+
+**Browser:**
+
+| Flag | Env Var | Description |
+|------|---------|-------------|
+| `--headed` | -- | Show the browser window |
+| `--no-browser` | -- | Terminal-only mode (no browser connection) |
+| `--browser-path <PATH>` | `REMIX_BROWSER_PATH` | Path to remix-browser binary |
+
+**Agent behavior:**
+
+| Flag | Description |
+|------|-------------|
+| `--nudge-on-text-only` | Nudge the LLM when it returns text without tool calls |
+| `--nudge-max-count <N>` | Max text-only nudges before terminating (default: 3) |
+| `--goal-check-on-complete` | Verify goal completion before terminating |
+| `--action-reminder-interval <N>` | Inject progress reminders every N iterations |
+| `--tool-result-max-bytes <N>` | Max bytes per tool result (default: 32768) |
+| `--context-window <N>` | Override context window size for compaction |
+| `--disable-compaction` | Disable automatic context compaction |
+
+**Loop detection:**
+
+| Flag | Description |
+|------|-------------|
+| `--loop-detection` | Enable loop detection with default settings |
+| `--loop-detection-max-repeats <N>` | Max identical tool calls before warning (default: 3) |
+| `--loop-detection-window <N>` | Lookback window size (default: 10) |
+| `--loop-detection-max-failures <N>` | Max failing commands without a file write before semantic loop warning (default: 4) |
+
+**Reasoning stages:**
+
+| Flag | Description |
+|------|-------------|
+| `--reasoning-stages` | Enable adaptive thinking budgets across planning/execution/verification phases |
+| `--planning-budget-tokens <N>` | Thinking tokens for planning phase (default: 10000) |
+| `--execution-budget-tokens <N>` | Thinking tokens for execution phase (default: 5000) |
+| `--verification-budget-tokens <N>` | Thinking tokens for verification phase (default: 10000) |
+| `--iteration-budget-warning-threshold <F>` | Warn agent at this fraction of max iterations (e.g., 0.7) |
+
+**Discovery & plugins:**
+
+| Flag | Env Var | Description |
+|------|---------|-------------|
+| `--agents-md-dir <PATH>` | `REMIX_AGENTS_MD_DIR` | Override AGENTS.md search directory |
+| `--no-agents-md` | -- | Disable AGENTS.md discovery |
+| `--no-local-tools` | -- | Disable local filesystem tools |
+| `--sandbox-dir <PATH>` | `REMIX_SANDBOX_DIR` | Sandbox root for local tools |
+| `--skills-dir <PATH>` | `REMIX_SKILLS_DIR` | Additional skills directory |
+| `--no-skills` | -- | Disable skill discovery |
+| `--no-plugins` | -- | Disable all plugin discovery |
+| `--plugins-dir <PATH>` | `REMIX_PLUGINS_DIR` | Additional plugin directory |
+| `--no-claude-plugins` | -- | Disable Claude Code plugin cache |
+
+**Dev tools:**
+
+| Flag | Description |
+|------|-------------|
+| `--no-dev-tools` | Disable all dev tools (LSP, test harness, repo map) |
+| `--no-lsp` | Disable LSP integration |
+| `--no-test-harness` | Disable test harness tools |
+| `--no-repo-map` | Disable repo map tool |
+| `--lsp-server <LANG=CMD>` | Override LSP server for a language (e.g., `rust=rust-analyzer`) |
+
+**Sessions:**
+
+| Flag | Env Var | Description |
+|------|---------|-------------|
+| `--session-id <ID>` | -- | Resume an existing session |
+| `--fork-session <ID>` | -- | Fork from an existing session |
+| `--continue` | -- | Resume the most recent session |
+| `--session-dir <PATH>` | `REMIX_SESSION_DIR` | Override session storage directory |
+
+**Permissions:**
+
+| Flag | Description |
+|------|-------------|
+| `--permission-mode <MODE>` | `default`, `accept_edits`, `bypass_permissions`, `plan` |
+| `--allow-tool <PATTERN>` | Regex pattern for auto-allowed tools (repeatable) |
+| `--deny-tool <PATTERN>` | Regex pattern for denied tools (repeatable) |
+
+**Coordination:**
+
+| Flag | Env Var | Description |
+|------|---------|-------------|
+| `--no-coordination` | -- | Disable multi-agent coordination |
+| `--max-workers <N>` | -- | Maximum concurrent worker agents (default: 5) |
+| `--coordination-dir <PATH>` | `REMIX_COORDINATION_DIR` | Override coordination storage directory |
+
+**SSE streaming** (requires `sse` feature):
+
+| Flag | Env Var | Description |
+|------|---------|-------------|
+| `--sse-port <PORT>` | `REMIX_SSE_PORT` | Port for real-time SSE event server |
 
 ### Examples
 
 ```bash
-# Simple task
+# Browser automation
 remix-agent run "Take a screenshot of hacker news"
 
 # Watch the browser work (headed mode)
 remix-agent run --headed "Fill out the contact form on example.com"
+
+# Terminal-only coding agent (no browser)
+remix-agent run --no-browser "Fix the failing tests in src/utils.ts"
+
+# Coding with loop detection and reasoning stages
+remix-agent run --no-browser \
+  --loop-detection \
+  --reasoning-stages \
+  --max-iterations 100 \
+  "Refactor the database module to use connection pooling"
 
 # Use a specific model
 remix-agent run --model claude-opus-4-20250805 "Complex multi-step task here"
@@ -178,6 +267,9 @@ remix-agent run --output results.json "Find the price of item X on site Y"
 
 # Full config file
 remix-agent run --config task.yaml --verbose
+
+# Resume where you left off
+remix-agent run --continue "keep going"
 
 # With a local plugin
 remix-agent run --plugins-dir ./my-plugin "Run my custom workflow"
@@ -238,15 +330,36 @@ llm:
   api_key: "${ANTHROPIC_API_KEY}"
   model: "claude-sonnet-4-20250514"
   max_tokens: 8192
+  thinking_budget_tokens: 10000        # Extended thinking budget
+  enable_prompt_caching: true          # Cache system prompts (default: true)
+  custom_headers:                      # Provider-specific headers
+    HTTP-Referer: "https://your-app.com"
 
 agent:
   max_iterations: 50
   timeout_secs: 300
   system_prompt: |
-    You are an expert browser automation agent.
+    You are an expert automation agent.
     Complete the task efficiently and report what you find.
+  tool_result_max_bytes: 32768         # Truncate large tool outputs
+  nudge_on_text_only: false            # Nudge LLM when it returns only text
+  nudge_max_count: 3                   # Max nudges before terminating
+  goal_check_on_complete: false        # Verify goal before terminating
+  action_reminder_interval: 15         # Inject progress reminder every N iterations
+  iteration_budget_warning_threshold: 0.7  # Warn at 70% of max iterations
+  loop_detection:
+    max_repeats: 3                     # Identical tool calls before warning
+    window_size: 10                    # Only check last N steps
+    max_failures_without_write: 4      # Semantic loop: failing without editing
+  reasoning_stages:
+    planning_budget_tokens: 10000      # Deep thinking for planning (0-30% of iterations)
+    execution_budget_tokens: 5000      # Fast execution (30-80%)
+    verification_budget_tokens: 10000  # Careful verification (80-100%)
+    planning_threshold: 0.3
+    verification_threshold: 0.8
 
 browser:
+  enabled: true                        # Set false for terminal-only mode
   headless: true
   viewport_width: 1280
   viewport_height: 720
@@ -267,8 +380,10 @@ local_tools:
   enabled: true
   sandbox_dir: "/path/to/sandbox"
   bash_timeout_secs: 120
-  read_max_bytes: 1048576
-  write_max_bytes: 10485760
+  read_max_bytes: 1048576              # 1MB
+  write_max_bytes: 10485760            # 10MB
+  web_fetch_timeout_secs: 30
+  web_fetch_max_bytes: 102400          # 100KB
 
 skills:
   dirs:
@@ -302,7 +417,7 @@ compaction:
   preserve_recent_n: 4
 
 permissions:
-  mode: default
+  mode: default                        # default | accept_edits | bypass_permissions | plan
   allowed_tools:
     - "navigate|click|screenshot"
   denied_tools:
@@ -314,6 +429,21 @@ coordination:
   max_worker_iterations: 10
   worker_timeout_secs: 120
   storage_dir: "~/.remix/coordination"
+
+dev_tools:
+  enabled: true
+  lsp:
+    enabled: true
+    request_timeout_secs: 30
+    server_overrides:                  # Override LSP server per language
+      rust: "rust-analyzer"
+  test_harness:
+    enabled: true
+    timeout_secs: 300
+  repo_map:
+    enabled: true
+    max_files: 5000
+    max_depth: 10
 
 on_complete:
   url: "https://hooks.slack.com/your-webhook"
@@ -368,7 +498,7 @@ The agent supports the [AGENTS.md](https://github.com/anthropics/agents-md) stan
 
 ### Local tools
 
-When enabled, the agent has access to six sandboxed filesystem and shell tools:
+When enabled, the agent has access to seven sandboxed filesystem and shell tools:
 
 | Tool | Description |
 |------|-------------|
@@ -378,6 +508,7 @@ When enabled, the agent has access to six sandboxed filesystem and shell tools:
 | `bash` | Execute a shell command in the sandbox |
 | `grep` | Regex search across files with context |
 | `glob` | Find files matching a glob pattern |
+| `web_fetch` | Fetch a URL and return content as markdown |
 
 All file operations are restricted to the sandbox directory. Use `--sandbox-dir` or `REMIX_SANDBOX_DIR` to set the root. Disable with `--no-local-tools`.
 
@@ -583,6 +714,75 @@ compaction:
   preserve_recent_n: 4
 ```
 
+### Loop detection
+
+The agent includes two layers of loop detection to prevent wasted iterations:
+
+**Exact-match detection** catches the agent calling the same tool with identical arguments repeatedly. It hashes `(tool_name, canonical_json(input))` and counts repeats within a sliding window.
+
+**Semantic loop detection** catches a subtler pattern: the agent running failing commands without ever modifying its code. This detects "test-without-edit" loops where the agent varies command syntax (e.g., `python test.py` vs `python -m pytest test.py`) to avoid exact-match detection while making no progress.
+
+```yaml
+agent:
+  loop_detection:
+    max_repeats: 3                   # Exact-match threshold
+    window_size: 10                  # Lookback window
+    max_failures_without_write: 4    # Semantic loop threshold
+```
+
+When triggered, a warning is injected into the conversation telling the agent to stop re-testing and edit its code instead.
+
+### Reasoning stages
+
+Reasoning stages dynamically adjust the LLM's thinking budget based on where the agent is in its iteration lifecycle:
+
+| Phase | Iterations | Default budget | Purpose |
+|-------|-----------|---------------|---------|
+| Planning | 0-30% | 10,000 tokens | Deep analysis, read code, form strategy |
+| Execution | 30-80% | 5,000 tokens | Fast tool calls, write code |
+| Verification | 80-100% | 10,000 tokens | Careful review, run tests, fix edge cases |
+
+```yaml
+agent:
+  reasoning_stages:
+    planning_budget_tokens: 10000
+    execution_budget_tokens: 5000
+    verification_budget_tokens: 10000
+    planning_threshold: 0.3
+    verification_threshold: 0.8
+```
+
+Enable with `--reasoning-stages` on the CLI. Combine with `--iteration-budget-warning-threshold 0.7` to inject a one-time warning when the agent has used 70% of its iterations.
+
+### Dev tools
+
+The agent can integrate with language servers and test frameworks for code intelligence.
+
+| Tool | Description |
+|------|-------------|
+| **LSP** | Type checking, go-to-definition, find-references via language servers (rust-analyzer, typescript-language-server, pyright, etc.) |
+| **Test harness** | Run tests with framework auto-detection (cargo test, pytest, jest, go test, etc.) and structured result collection |
+| **Repo map** | Generate a codebase structure overview using tree-sitter parsing |
+
+```yaml
+dev_tools:
+  enabled: true
+  lsp:
+    enabled: true
+    request_timeout_secs: 30
+    server_overrides:
+      rust: "rust-analyzer"
+  test_harness:
+    enabled: true
+    timeout_secs: 300
+  repo_map:
+    enabled: true
+    max_files: 5000
+    max_depth: 10
+```
+
+Disable individually with `--no-lsp`, `--no-test-harness`, `--no-repo-map`, or all at once with `--no-dev-tools`. The repo map requires the `dev-tools` Cargo feature for tree-sitter support.
+
 ### Webhooks
 
 Get notified when tasks complete or fail:
@@ -597,6 +797,18 @@ on_error:
   format: "json"
 ```
 
+### SSE event streaming
+
+With the `sse` Cargo feature enabled, the agent can stream real-time events over Server-Sent Events for UI integration:
+
+```bash
+remix-agent run --sse-port 3000 "Your task here"
+```
+
+Endpoints:
+- `GET /events` -- SSE stream of agent events (tool calls, results, completions)
+- `GET /health` -- Liveness check
+
 ## Output
 
 The agent produces structured JSON output with a full record of every step:
@@ -607,6 +819,9 @@ The agent produces structured JSON output with a full record of every step:
   "result": "Found the login button and signed in successfully",
   "total_iterations": 3,
   "total_duration_ms": 8420,
+  "total_input_tokens": 45230,
+  "total_output_tokens": 3120,
+  "total_cost_usd": 0.0523,
   "steps": [
     {
       "iteration": 1,
@@ -642,6 +857,46 @@ The agent has access to all tools exposed by [remix-browser](https://github.com/
 
 Elements can be targeted with CSS selectors, text content, or XPath expressions.
 
+## Benchmarks
+
+remix-agent-runtime includes a [Harbor](https://github.com/laude-institute/harbor) adapter for running standardized coding benchmarks. The adapter is in `harbor-adapter/` and registers as a custom Harbor agent.
+
+```bash
+# Run against Terminal-Bench 2.0 (89 coding tasks)
+harbor run \
+  -d "terminal-bench@2.0" \
+  --agent-import-path "remix_agent_harbor:RemixAgent" \
+  -m anthropic/claude-sonnet-4-6 \
+  --ae "REMIX_LLM_API_KEY=$REMIX_LLM_API_KEY" \
+  -o benchmark-results
+
+# Run a subset of tasks
+harbor run \
+  -d "terminal-bench@2.0" \
+  -t "specific-task-name" \
+  -l 10 \
+  --agent-import-path "remix_agent_harbor:RemixAgent" \
+  -m anthropic/claude-sonnet-4-6
+```
+
+## Cargo features
+
+The runtime ships with three optional feature flags:
+
+| Feature | Dependencies | Description |
+|---------|-------------|-------------|
+| `postgres` | sqlx | PostgreSQL session storage backend |
+| `sse` | axum | Real-time SSE event streaming server |
+| `dev-tools` | tree-sitter, tree-sitter-{rust,typescript,python,javascript} | Code intelligence via tree-sitter parsing |
+
+```bash
+# Build with all features
+cargo build --release --features postgres,sse,dev-tools
+
+# Build with just SSE
+cargo build --release --features sse
+```
+
 ## Development
 
 ```bash
@@ -666,7 +921,7 @@ The runtime uses a **decorator chain** pattern where each layer intercepts tool 
 CoordinationExecutor          ← multi-agent coordination (7 tools)
   └─ PermissionAwareExecutor  ← permission checking (4 modes)
        └─ HookAwareExecutor   ← fires pre/post hooks around every tool call
-            └─ LocalToolsExecutor  ← intercepts read_file, write_file, edit_file, bash, grep, glob
+            └─ LocalToolsExecutor  ← intercepts read_file, write_file, edit_file, bash, grep, glob, web_fetch
                  └─ SkillAwareExecutor  ← intercepts load_skill, run_skill_script, read_skill_resource
                       └─ CompositeToolExecutor  ← routes to MCP backends (remix-browser, plugins)
 ```
@@ -683,7 +938,13 @@ src/
 │   ├── loop_impl.rs           # Core agent loop (AgentRunner)
 │   ├── state.rs               # Message history + step recording
 │   ├── compaction.rs          # Context compaction logic
-│   └── compaction_prompt.rs   # Compaction system prompt
+│   ├── compaction_prompt.rs   # Compaction system prompt
+│   ├── loop_detection.rs      # Exact-match + semantic loop detection
+│   ├── reasoning_stages.rs    # Adaptive thinking budget phases
+│   ├── reminders.rs           # Action reminder injection
+│   ├── lsp_tools.rs           # LSP integration (dev tools)
+│   ├── test_harness.rs        # Test framework detection + execution
+│   └── repo_map.rs            # Codebase structure via tree-sitter
 ├── agents_md/
 │   ├── mod.rs                 # Public API re-exports
 │   └── discovery.rs           # AGENTS.md walk + injection
@@ -725,10 +986,14 @@ src/
 │       ├── edit_file.rs       # edit_file tool
 │       ├── bash.rs            # bash tool
 │       ├── grep.rs            # grep tool
-│       └── glob_tool.rs       # glob tool
+│       ├── glob_tool.rs       # glob tool
+│       ├── web_fetch.rs       # web_fetch tool
+│       └── output_filter.rs   # Shared truncation + ANSI stripping
 ├── output/
 │   ├── result.rs              # AgentResult, StepRecord
-│   └── webhook.rs             # Webhook dispatcher
+│   ├── webhook.rs             # Webhook dispatcher
+│   ├── events.rs              # Event bus (broadcast channel)
+│   └── sse_server.rs          # Axum SSE server (optional)
 ├── permissions/
 │   ├── mod.rs                 # Public re-exports
 │   ├── types.rs               # PermissionMode, PermissionPolicy
