@@ -2547,26 +2547,35 @@ mod tests {
         // 5 LLM calls total (iterations 1-5)
         assert_eq!(all_calls.len(), 5);
 
-        // Helper: check if any message in the call contains "URGENT" or "Progress check"
-        let has_reminder = |call_idx: usize| -> bool {
-            all_calls[call_idx].iter().any(|msg| {
-                msg.content.iter().any(|block| match block {
-                    ContentBlock::Text { text } => {
-                        text.contains("URGENT") || text.contains("Progress check")
-                    }
-                    _ => false,
+        // Helper: count how many messages contain "URGENT" or "Progress check" in this call
+        // vs the previous call. A new reminder was injected if this call has more such messages.
+        let reminder_count = |call_idx: usize| -> usize {
+            all_calls[call_idx]
+                .iter()
+                .filter(|msg| {
+                    msg.content.iter().any(|block| match block {
+                        ContentBlock::Text { text } => {
+                            text.contains("URGENT") || text.contains("Progress check")
+                        }
+                        _ => false,
+                    })
                 })
-            })
+                .count()
         };
 
-        // Iteration 1: no reminder (1 % 2 != 0)
-        assert!(!has_reminder(0), "Should not have reminder on iteration 1");
-        // Iteration 2: reminder fires (2 % 2 == 0)
-        assert!(has_reminder(1), "Should have reminder on iteration 2");
-        // Iteration 3: no reminder
-        assert!(!has_reminder(2), "Should not have reminder on iteration 3");
-        // Iteration 4: reminder fires
-        assert!(has_reminder(3), "Should have reminder on iteration 4");
+        let count_0 = reminder_count(0); // iteration 1
+        let count_1 = reminder_count(1); // iteration 2
+        let count_2 = reminder_count(2); // iteration 3
+        let count_3 = reminder_count(3); // iteration 4
+
+        // Iteration 1: no reminder
+        assert_eq!(count_0, 0, "Should not have reminder on iteration 1");
+        // Iteration 2: first reminder fires (count increases by 1)
+        assert_eq!(count_1, count_0 + 1, "Should have new reminder on iteration 2");
+        // Iteration 3: no new reminder (count stays the same)
+        assert_eq!(count_2, count_1, "Should not have new reminder on iteration 3");
+        // Iteration 4: second reminder fires (count increases by 1)
+        assert_eq!(count_3, count_2 + 1, "Should have new reminder on iteration 4");
     }
 
     #[tokio::test]
