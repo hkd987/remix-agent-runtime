@@ -73,7 +73,8 @@ class RemixAgent(BaseInstalledAgent):
             "- Write code within your first few steps. Do NOT spend many steps reading and analyzing. "
             "- A rough working solution you can iterate on is worth more than a perfect plan you never implement. "
             "- Always create the required output files early. Check the task description for expected output paths. "
-            "- If a task is complex, start with a naive solution, verify it works, then optimize."
+            "- If a task is complex, start with a naive solution, verify it works, then optimize. "
+            "- Pay close attention to expected output FORMAT. Write just the values asked for, not key=value pairs or extra markup."
         )
 
         cmd = (

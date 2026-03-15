@@ -109,10 +109,12 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         content: Vec<ContentBlock>,
         goal_check_fired: &mut bool,
     ) -> Option<Vec<ContentBlock>> {
-        // Only fire when enabled, not yet fired, and agent did meaningful work (iteration > 1)
+        // Only fire when enabled, not yet fired, and agent did meaningful work.
+        // Require at least 5 iterations to prevent premature termination on complex tasks.
+        const MIN_ITERATIONS_FOR_GOAL_CHECK: u32 = 5;
         if !self.config.goal_check_on_complete
             || *goal_check_fired
-            || state.current_iteration() <= 1
+            || state.current_iteration() <= MIN_ITERATIONS_FOR_GOAL_CHECK
         {
             return Some(content);
         }
@@ -2340,25 +2342,36 @@ mod tests {
             ..default_config()
         };
 
-        // Response 1: tool use (meaningful work), Response 2: end_turn "Done" (goal check fires),
-        // Response 3: end_turn "Verified done" (terminates)
+        // 6 tool-use iterations (exceeds MIN_ITERATIONS_FOR_GOAL_CHECK=5),
+        // then end_turn triggers goal check, then verified end_turn terminates.
+        let make_tool_result = || {
+            Ok(ToolExecutionResult {
+                content: "Page loaded".to_string(),
+                is_error: false,
+            })
+        };
         let llm = MockLlm {
             responses: Arc::new(Mutex::new(vec![
-                make_tool_use_response(
-                    "toolu_01",
-                    "navigate",
-                    json!({"url": "https://example.com"}),
-                ),
+                make_tool_use_response("t1", "navigate", json!({"url": "a.com"})),
+                make_tool_use_response("t2", "navigate", json!({"url": "b.com"})),
+                make_tool_use_response("t3", "navigate", json!({"url": "c.com"})),
+                make_tool_use_response("t4", "navigate", json!({"url": "d.com"})),
+                make_tool_use_response("t5", "navigate", json!({"url": "e.com"})),
+                make_tool_use_response("t6", "navigate", json!({"url": "f.com"})),
                 make_end_turn_response("Done"),
                 make_end_turn_response("Verified done"),
             ])),
         };
         let tools = MockTools {
             tools: default_tools(),
-            results: Arc::new(Mutex::new(vec![Ok(ToolExecutionResult {
-                content: "Page loaded".to_string(),
-                is_error: false,
-            })])),
+            results: Arc::new(Mutex::new(vec![
+                make_tool_result(),
+                make_tool_result(),
+                make_tool_result(),
+                make_tool_result(),
+                make_tool_result(),
+                make_tool_result(),
+            ])),
         };
 
         let runner = AgentRunner::new(llm, tools, config);
@@ -2374,8 +2387,8 @@ mod tests {
 
         assert_eq!(result.status, AgentStatus::Success);
         assert_eq!(
-            result.total_iterations, 3,
-            "Expected 3 iterations (tool work, goal check fires, terminates)"
+            result.total_iterations, 8,
+            "Expected 8 iterations (6 tool work, goal check fires, terminates)"
         );
         assert_eq!(result.result, Some("Verified done".to_string()));
     }
