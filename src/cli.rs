@@ -402,6 +402,22 @@ mod tests {
             "--goal-check-on-complete",
             "--action-reminder-interval",
             "15",
+            "--loop-detection",
+            "--loop-detection-max-repeats",
+            "4",
+            "--loop-detection-window",
+            "12",
+            "--reasoning-stages",
+            "--planning-budget-tokens",
+            "12000",
+            "--execution-budget-tokens",
+            "6000",
+            "--verification-budget-tokens",
+            "15000",
+            "--iteration-budget-warning-threshold",
+            "0.7",
+            "--thinking-budget-tokens",
+            "10000",
             "do something",
         ]));
         assert_eq!(args.task, Some("do something".to_string()));
@@ -453,6 +469,15 @@ mod tests {
         assert_eq!(args.nudge_max_count, Some(5));
         assert!(args.goal_check_on_complete);
         assert_eq!(args.action_reminder_interval, Some(15));
+        assert!(args.loop_detection);
+        assert_eq!(args.loop_detection_max_repeats, Some(4));
+        assert_eq!(args.loop_detection_window, Some(12));
+        assert!(args.reasoning_stages);
+        assert_eq!(args.planning_budget_tokens, Some(12_000));
+        assert_eq!(args.execution_budget_tokens, Some(6_000));
+        assert_eq!(args.verification_budget_tokens, Some(15_000));
+        assert_eq!(args.iteration_budget_warning_threshold, Some(0.7));
+        assert_eq!(args.thinking_budget_tokens, Some(10_000));
     }
 
     #[test]
@@ -964,5 +989,110 @@ mod tests {
     fn test_parse_run_action_reminder_interval_default_none() {
         let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
         assert!(args.action_reminder_interval.is_none());
+    }
+
+    #[test]
+    fn test_parse_run_with_loop_detection() {
+        let args = extract_run_args(Cli::parse_from([
+            "remix-agent",
+            "run",
+            "--loop-detection",
+        ]));
+        assert!(args.loop_detection);
+        assert!(args.loop_detection_max_repeats.is_none());
+        assert!(args.loop_detection_window.is_none());
+    }
+
+    #[test]
+    fn test_parse_run_with_loop_detection_params() {
+        let args = extract_run_args(Cli::parse_from([
+            "remix-agent",
+            "run",
+            "--loop-detection-max-repeats",
+            "5",
+            "--loop-detection-window",
+            "20",
+        ]));
+        assert!(!args.loop_detection);
+        assert_eq!(args.loop_detection_max_repeats, Some(5));
+        assert_eq!(args.loop_detection_window, Some(20));
+    }
+
+    #[test]
+    fn test_parse_run_loop_detection_defaults() {
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
+        assert!(!args.loop_detection);
+        assert!(args.loop_detection_max_repeats.is_none());
+        assert!(args.loop_detection_window.is_none());
+    }
+
+    #[test]
+    fn test_parse_run_with_reasoning_stages() {
+        let args = extract_run_args(Cli::parse_from([
+            "remix-agent",
+            "run",
+            "--reasoning-stages",
+        ]));
+        assert!(args.reasoning_stages);
+    }
+
+    #[test]
+    fn test_parse_run_with_reasoning_stages_budgets() {
+        let args = extract_run_args(Cli::parse_from([
+            "remix-agent",
+            "run",
+            "--planning-budget-tokens",
+            "20000",
+            "--execution-budget-tokens",
+            "8000",
+            "--verification-budget-tokens",
+            "15000",
+        ]));
+        assert_eq!(args.planning_budget_tokens, Some(20_000));
+        assert_eq!(args.execution_budget_tokens, Some(8_000));
+        assert_eq!(args.verification_budget_tokens, Some(15_000));
+    }
+
+    #[test]
+    fn test_parse_run_reasoning_stages_defaults() {
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
+        assert!(!args.reasoning_stages);
+        assert!(args.planning_budget_tokens.is_none());
+        assert!(args.execution_budget_tokens.is_none());
+        assert!(args.verification_budget_tokens.is_none());
+    }
+
+    #[test]
+    fn test_parse_run_with_iteration_budget_warning() {
+        let args = extract_run_args(Cli::parse_from([
+            "remix-agent",
+            "run",
+            "--iteration-budget-warning-threshold",
+            "0.75",
+        ]));
+        assert_eq!(args.iteration_budget_warning_threshold, Some(0.75));
+    }
+
+    #[test]
+    fn test_parse_run_iteration_budget_warning_default_none() {
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
+        assert!(args.iteration_budget_warning_threshold.is_none());
+    }
+
+    #[test]
+    fn test_parse_run_with_thinking_budget_tokens() {
+        let args = extract_run_args(Cli::parse_from([
+            "remix-agent",
+            "run",
+            "--thinking-budget-tokens",
+            "10000",
+        ]));
+        assert_eq!(args.thinking_budget_tokens, Some(10_000));
+    }
+
+    #[test]
+    fn test_parse_run_thinking_budget_tokens_default_none() {
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
+        assert!(args.thinking_budget_tokens.is_none());
     }
 }

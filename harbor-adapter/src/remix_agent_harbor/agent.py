@@ -61,22 +61,25 @@ class RemixAgent(BaseInstalledAgent):
         if base_url:
             env["REMIX_LLM_BASE_URL"] = base_url
 
-        # Action-oriented system prompt for benchmarks
+        # System prompt: environment discovery + four-stage cycle + testability-first
         system_prompt = (
-            "You are a skilled software engineer solving a task in a Linux environment. "
-            "Follow this workflow: "
-            "1) READ: Quickly examine the task and key files (spend no more than 20% of your effort here). "
-            "2) IMPLEMENT: Write a working solution immediately, even if imperfect. Get something running first. "
-            "3) TEST: Run tests or verify your solution works. "
-            "4) ITERATE: If tests fail, fix and re-test. Optimize only after correctness is achieved. "
-            "CRITICAL RULES: "
-            "- Write code within your first few steps. Do NOT spend many steps reading and analyzing. "
-            "- A rough working solution you can iterate on is worth more than a perfect plan you never implement. "
-            "- Always create the required output files early. Check the task description for expected output paths. "
-            "- If a task is complex, start with a naive solution, verify it works, then optimize. "
-            "- Pay close attention to expected output FORMAT. Write just the values asked for, not key=value pairs or extra markup. "
-            "- If the task provides test or evaluation scripts, run them EARLY and OFTEN during development — not just at the end. Use test failures to guide your iteration. "
-            "- Always verify edge cases: small inputs, boundary conditions, and performance requirements on ALL input sizes, not just large ones."
+            "Before starting work, discover your environment: "
+            "1. List the working directory structure (2 levels deep) "
+            "2. Check available tools (python --version, node --version, cargo --version, etc.) "
+            "3. Read any README, Makefile, or build configuration files "
+            "4. Identify the project type and build system. "
+            "Use this context to inform your approach.\n\n"
+            "Follow this cycle for every task: "
+            "1. PLAN: Read the task fully. Scan all relevant files. Identify how you will verify your solution. "
+            "2. BUILD: Implement the solution. Write tests alongside code when possible. "
+            "3. VERIFY: Run tests, linters, and type checkers. Compare output against the original requirements — not against your own code. "
+            "4. FIX: If anything fails, analyze the error, revisit the original spec, and fix. Return to VERIFY. "
+            "Never skip from PLAN to BUILD without reading existing code first.\n\n"
+            "Your solution will be validated programmatically against tests you cannot see. "
+            "Prioritize: exact specification adherence, edge cases, boundary conditions, error handling. "
+            "Do not assume lenient validation. Build and run your own tests before finishing. "
+            "If the task provides test or evaluation scripts, run them EARLY and OFTEN during development — not just at the end. "
+            "Always verify edge cases: small inputs, boundary conditions, and performance requirements on ALL input sizes, not just large ones."
         )
 
         cmd = (
@@ -85,12 +88,24 @@ class RemixAgent(BaseInstalledAgent):
             " --no-coordination"
             " --permission-mode bypass_permissions"
             " --timeout 1800"
-            " --max-iterations 200"
+            " --max-iterations 75"
             " --tool-result-max-bytes 16384"
             " --nudge-on-text-only"
             " --goal-check-on-complete"
-            " --action-reminder-interval 15"
+            " --action-reminder-interval 5"
             " --deny-tool 'web_fetch'"
+            # Loop detection: catch doom-loops early
+            " --loop-detection"
+            " --loop-detection-max-repeats 3"
+            " --loop-detection-window 10"
+            # Reasoning stages: plan deep, execute fast, verify carefully
+            " --reasoning-stages"
+            " --thinking-budget-tokens 10000"
+            " --planning-budget-tokens 10000"
+            " --execution-budget-tokens 5000"
+            " --verification-budget-tokens 10000"
+            # Budget warning at 70% of iterations
+            " --iteration-budget-warning-threshold 0.7"
             f" --output {OUTPUT_FILE}"
             f" --session-dir {LOGS_DIR / 'sessions'}"
             " --verbose"

@@ -565,6 +565,15 @@ agent:
             no_test_harness: false,
             no_repo_map: false,
             lsp_server: Vec::new(),
+            loop_detection: false,
+            loop_detection_max_repeats: None,
+            loop_detection_window: None,
+            reasoning_stages: false,
+            planning_budget_tokens: None,
+            execution_budget_tokens: None,
+            verification_budget_tokens: None,
+            iteration_budget_warning_threshold: None,
+            thinking_budget_tokens: None,
         };
         let config = load_config(&args).unwrap();
 
@@ -1393,5 +1402,167 @@ agent:
         };
         let config = load_config(&args).unwrap();
         assert_eq!(config.agent.action_reminder_interval, Some(20));
+    }
+
+    #[test]
+    fn test_loop_detection_from_cli_flag() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = RunArgs {
+            loop_detection: true,
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert!(config.agent.loop_detection.is_some());
+        let ld = config.agent.loop_detection.unwrap();
+        assert_eq!(ld.max_repeats, 3); // default
+        assert_eq!(ld.window_size, 10); // default
+    }
+
+    #[test]
+    fn test_loop_detection_custom_params_from_cli() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = RunArgs {
+            loop_detection: false,
+            loop_detection_max_repeats: Some(5),
+            loop_detection_window: Some(20),
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert!(config.agent.loop_detection.is_some());
+        let ld = config.agent.loop_detection.unwrap();
+        assert_eq!(ld.max_repeats, 5);
+        assert_eq!(ld.window_size, 20);
+    }
+
+    #[test]
+    fn test_loop_detection_default_none() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = default_run_args();
+        let config = load_config(&args).unwrap();
+        assert!(config.agent.loop_detection.is_none());
+    }
+
+    #[test]
+    fn test_loop_detection_cli_overrides_yaml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let yaml = r#"
+agent:
+  loop_detection:
+    max_repeats: 2
+    window_size: 5
+"#;
+        let file = write_yaml_tempfile(yaml);
+        let args = RunArgs {
+            config: Some(file.path().to_path_buf()),
+            loop_detection_max_repeats: Some(8),
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        let ld = config.agent.loop_detection.unwrap();
+        assert_eq!(ld.max_repeats, 8); // CLI overrides
+        assert_eq!(ld.window_size, 5); // YAML preserved
+    }
+
+    #[test]
+    fn test_reasoning_stages_from_cli_flag() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = RunArgs {
+            reasoning_stages: true,
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert!(config.agent.reasoning_stages.is_some());
+        let rs = config.agent.reasoning_stages.unwrap();
+        assert_eq!(rs.planning_budget_tokens, 10_000);
+        assert_eq!(rs.execution_budget_tokens, 5_000);
+        assert_eq!(rs.verification_budget_tokens, 10_000);
+    }
+
+    #[test]
+    fn test_reasoning_stages_custom_budgets_from_cli() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = RunArgs {
+            planning_budget_tokens: Some(20_000),
+            execution_budget_tokens: Some(8_000),
+            verification_budget_tokens: Some(15_000),
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert!(config.agent.reasoning_stages.is_some());
+        let rs = config.agent.reasoning_stages.unwrap();
+        assert_eq!(rs.planning_budget_tokens, 20_000);
+        assert_eq!(rs.execution_budget_tokens, 8_000);
+        assert_eq!(rs.verification_budget_tokens, 15_000);
+    }
+
+    #[test]
+    fn test_reasoning_stages_default_none() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = default_run_args();
+        let config = load_config(&args).unwrap();
+        assert!(config.agent.reasoning_stages.is_none());
+    }
+
+    #[test]
+    fn test_iteration_budget_warning_from_cli() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = RunArgs {
+            iteration_budget_warning_threshold: Some(0.7),
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert_eq!(
+            config.agent.iteration_budget_warning_threshold,
+            Some(0.7)
+        );
+    }
+
+    #[test]
+    fn test_iteration_budget_warning_default_none() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = default_run_args();
+        let config = load_config(&args).unwrap();
+        assert!(config.agent.iteration_budget_warning_threshold.is_none());
+    }
+
+    #[test]
+    fn test_thinking_budget_tokens_from_cli() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = RunArgs {
+            thinking_budget_tokens: Some(10_000),
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert_eq!(config.llm.thinking_budget_tokens, Some(10_000));
+    }
+
+    #[test]
+    fn test_thinking_budget_tokens_default_none() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = default_run_args();
+        let config = load_config(&args).unwrap();
+        assert!(config.llm.thinking_budget_tokens.is_none());
     }
 }
