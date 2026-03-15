@@ -74,7 +74,9 @@ class RemixAgent(BaseInstalledAgent):
             "- A rough working solution you can iterate on is worth more than a perfect plan you never implement. "
             "- Always create the required output files early. Check the task description for expected output paths. "
             "- If a task is complex, start with a naive solution, verify it works, then optimize. "
-            "- Pay close attention to expected output FORMAT. Write just the values asked for, not key=value pairs or extra markup."
+            "- Pay close attention to expected output FORMAT. Write just the values asked for, not key=value pairs or extra markup. "
+            "- If the task provides test or evaluation scripts, run them EARLY and OFTEN during development — not just at the end. Use test failures to guide your iteration. "
+            "- Always verify edge cases: small inputs, boundary conditions, and performance requirements on ALL input sizes, not just large ones."
         )
 
         cmd = (
