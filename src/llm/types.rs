@@ -74,6 +74,7 @@ pub enum ContentBlock {
     },
     Thinking {
         thinking: String,
+        signature: String,
     },
     ToolUse {
         id: String,
@@ -704,13 +705,40 @@ mod tests {
     fn test_content_block_thinking_roundtrip() {
         let block = ContentBlock::Thinking {
             thinking: "Let me reason about this...".to_string(),
+            signature: "abc123sig".to_string(),
         };
         let json = serde_json::to_value(&block).unwrap();
         assert_eq!(json["type"], "thinking");
         assert_eq!(json["thinking"], "Let me reason about this...");
+        assert_eq!(json["signature"], "abc123sig");
 
         let deserialized: ContentBlock = serde_json::from_value(json).unwrap();
         assert_eq!(deserialized, block);
+    }
+
+    #[test]
+    fn test_content_block_thinking_signature_preserved_in_serde() {
+        // Simulate a thinking block as returned by the Anthropic API
+        let api_json = json!({
+            "type": "thinking",
+            "thinking": "Step 1: analyze the problem...",
+            "signature": "EqoBCkgIAxgCIkDX2m6FqDKrheMdHGEr"
+        });
+        let block: ContentBlock = serde_json::from_value(api_json).unwrap();
+        match &block {
+            ContentBlock::Thinking { thinking, signature } => {
+                assert_eq!(thinking, "Step 1: analyze the problem...");
+                assert_eq!(signature, "EqoBCkgIAxgCIkDX2m6FqDKrheMdHGEr");
+            }
+            _ => panic!("Expected Thinking variant"),
+        }
+
+        // Verify the signature is preserved when re-serialized (sent back to API)
+        let re_serialized = serde_json::to_value(&block).unwrap();
+        assert_eq!(
+            re_serialized["signature"],
+            "EqoBCkgIAxgCIkDX2m6FqDKrheMdHGEr"
+        );
     }
 
     #[test]

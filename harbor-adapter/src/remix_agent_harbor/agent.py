@@ -61,25 +61,33 @@ class RemixAgent(BaseInstalledAgent):
         if base_url:
             env["REMIX_LLM_BASE_URL"] = base_url
 
-        # System prompt: environment discovery + four-stage cycle + testability-first
+        # System prompt in XML format per Anthropic best practices
         system_prompt = (
-            "Before starting work, discover your environment: "
-            "1. List the working directory structure (2 levels deep) "
-            "2. Check available tools (python --version, node --version, cargo --version, etc.) "
-            "3. Read any README, Makefile, or build configuration files "
-            "4. Identify the project type and build system. "
-            "Use this context to inform your approach.\n\n"
-            "Follow this cycle for every task: "
-            "1. PLAN: Read the task fully. Scan all relevant files. Identify how you will verify your solution. "
-            "2. BUILD: Implement the solution. Write tests alongside code when possible. "
-            "3. VERIFY: Run tests, linters, and type checkers. Compare output against the original requirements — not against your own code. "
-            "4. FIX: If anything fails, analyze the error, revisit the original spec, and fix. Return to VERIFY. "
-            "Never skip from PLAN to BUILD without reading existing code first.\n\n"
-            "Your solution will be validated programmatically against tests you cannot see. "
-            "Prioritize: exact specification adherence, edge cases, boundary conditions, error handling. "
-            "Do not assume lenient validation. Build and run your own tests before finishing. "
-            "If the task provides test or evaluation scripts, run them EARLY and OFTEN during development — not just at the end. "
-            "Always verify edge cases: small inputs, boundary conditions, and performance requirements on ALL input sizes, not just large ones."
+            "<environment_discovery>\n"
+            "Before starting work, discover your environment:\n"
+            "<steps>\n"
+            "<step>List the working directory structure (2 levels deep)</step>\n"
+            "<step>Check available tools (python --version, node --version, cargo --version, etc.)</step>\n"
+            "<step>Read any README, Makefile, or build configuration files</step>\n"
+            "<step>Identify the project type and build system</step>\n"
+            "</steps>\n"
+            "Use this context to inform your approach.\n"
+            "</environment_discovery>\n\n"
+            "<workflow>\n"
+            "Follow this cycle for every task:\n"
+            "<phase name=\"PLAN\">Read the task fully. Scan all relevant files. Identify how you will verify your solution. Never skip to BUILD without reading existing code first.</phase>\n"
+            "<phase name=\"BUILD\">Implement the solution. Write tests alongside code when possible.</phase>\n"
+            "<phase name=\"VERIFY\">Run tests, linters, and type checkers. Compare output against the original requirements — not against your own code.</phase>\n"
+            "<phase name=\"FIX\">If anything fails, analyze the error, revisit the original spec, and fix. Return to VERIFY.</phase>\n"
+            "</workflow>\n\n"
+            "<validation_requirements>\n"
+            "<rule>Your solution will be validated programmatically against tests you cannot see.</rule>\n"
+            "<rule>Prioritize: exact specification adherence, edge cases, boundary conditions, error handling.</rule>\n"
+            "<rule>Do not assume lenient validation.</rule>\n"
+            "<rule>Build and run your own tests before finishing.</rule>\n"
+            "<rule>If the task provides test or evaluation scripts, run them EARLY and OFTEN during development — not just at the end.</rule>\n"
+            "<rule>Always verify edge cases: small inputs, boundary conditions, and performance requirements on ALL input sizes, not just large ones.</rule>\n"
+            "</validation_requirements>"
         )
 
         cmd = (

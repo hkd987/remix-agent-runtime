@@ -280,7 +280,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     tool_results.push(content_block);
                     step_records.push(step);
                 }
-                ContentBlock::Thinking { thinking } => {
+                ContentBlock::Thinking { thinking, .. } => {
                     debug!(
                         thinking_length = thinking.len(),
                         "Model produced thinking block"
@@ -854,7 +854,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     tool_results.push(content_block);
                     step_records.push(step);
                 }
-                ContentBlock::Thinking { thinking } => {
+                ContentBlock::Thinking { thinking, .. } => {
                     debug!(
                         thinking_length = thinking.len(),
                         "Model produced thinking block"
@@ -895,7 +895,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         AgentEvent::TextDelta { text: text.clone() },
                     );
                 }
-                ContentBlock::Thinking { thinking } => {
+                ContentBlock::Thinking { thinking, .. } => {
                     events::emit(
                         &self.event_bus,
                         AgentEvent::ThinkingComplete {
@@ -2254,6 +2254,7 @@ mod tests {
 
         let content = vec![ContentBlock::Thinking {
             thinking: "Let me think about this...".to_string(),
+            signature: "test-sig".to_string(),
         }];
 
         let runner = AgentRunner::new(

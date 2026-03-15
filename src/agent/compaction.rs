@@ -42,7 +42,7 @@ pub fn build_compaction_request(messages_to_compact: &[Message]) -> Vec<Message>
                 ContentBlock::Image { .. } => {
                     conversation_text.push_str(&format!("[{role_str} sent image]\n\n"));
                 }
-                ContentBlock::Thinking { thinking } => {
+                ContentBlock::Thinking { thinking, .. } => {
                     conversation_text.push_str(&format!(
                         "[{role_str} thinking]: {}\n\n",
                         if thinking.len() > 200 {
@@ -494,7 +494,10 @@ mod tests {
 
         let messages = vec![Message {
             role: Role::Assistant,
-            content: vec![ContentBlock::Thinking { thinking }],
+            content: vec![ContentBlock::Thinking {
+                thinking,
+                signature: String::new(),
+            }],
         }];
         // Should not panic
         let result = build_compaction_request(&messages);
