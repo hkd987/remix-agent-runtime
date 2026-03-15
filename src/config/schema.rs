@@ -213,6 +213,9 @@ pub struct AgentConfig {
     /// Maximum number of nudges before allowing the loop to terminate normally.
     #[serde(default = "default_nudge_max_count")]
     pub nudge_max_count: u32,
+    /// When true, inject a goal-check prompt before the agent terminates to verify work is complete.
+    #[serde(default)]
+    pub goal_check_on_complete: bool,
 }
 
 pub fn default_nudge_max_count() -> u32 {
@@ -238,6 +241,7 @@ impl Default for AgentConfig {
             self_critique: None,
             nudge_on_text_only: false,
             nudge_max_count: default_nudge_max_count(),
+            goal_check_on_complete: false,
         }
     }
 }

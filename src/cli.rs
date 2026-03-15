@@ -212,6 +212,10 @@ pub struct RunArgs {
     /// Maximum number of text-only nudges before terminating (default: 3)
     #[arg(long)]
     pub nudge_max_count: Option<u32>,
+
+    /// Verify goal completion before terminating (one-time check)
+    #[arg(long)]
+    pub goal_check_on_complete: bool,
 }
 
 #[cfg(test)]
@@ -335,6 +339,7 @@ mod tests {
             "--nudge-on-text-only",
             "--nudge-max-count",
             "5",
+            "--goal-check-on-complete",
             "do something",
         ]));
         assert_eq!(args.task, Some("do something".to_string()));
@@ -384,6 +389,7 @@ mod tests {
         assert_eq!(args.tool_result_max_bytes, Some(16_384));
         assert!(args.nudge_on_text_only);
         assert_eq!(args.nudge_max_count, Some(5));
+        assert!(args.goal_check_on_complete);
     }
 
     #[test]
@@ -855,6 +861,22 @@ mod tests {
         ]));
         assert_eq!(args.nudge_max_count, Some(10));
         assert!(!args.nudge_on_text_only);
+    }
+
+    #[test]
+    fn test_parse_run_with_goal_check_on_complete() {
+        let args = extract_run_args(Cli::parse_from([
+            "remix-agent",
+            "run",
+            "--goal-check-on-complete",
+        ]));
+        assert!(args.goal_check_on_complete);
+    }
+
+    #[test]
+    fn test_parse_run_goal_check_on_complete_default_false() {
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
+        assert!(!args.goal_check_on_complete);
     }
 
     #[test]

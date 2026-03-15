@@ -84,6 +84,7 @@ class TestCreateRunAgentCommands:
         assert "--no-coordination" in cmd
         assert "--deny-tool" in cmd
         assert "--nudge-on-text-only" in cmd
+        assert "--goal-check-on-complete" in cmd
         assert "--max-iterations 200" in cmd
         assert "--tool-result-max-bytes 16384" in cmd
         assert "--output" in cmd

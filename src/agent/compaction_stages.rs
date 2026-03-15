@@ -39,7 +39,7 @@ fn truncate_text(text: &mut String, max_chars: usize) -> bool {
 }
 
 /// Truncate a string slice at a safe UTF-8 char boundary, returning the truncated &str.
-fn safe_truncate(s: &str, max_chars: usize) -> &str {
+pub(crate) fn safe_truncate(s: &str, max_chars: usize) -> &str {
     if s.len() <= max_chars {
         return s;
     }

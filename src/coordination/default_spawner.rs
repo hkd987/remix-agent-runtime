@@ -212,6 +212,7 @@ impl<L: LlmProvider + 'static> SpawnHandler for DefaultSpawnHandler<L> {
             self_critique: None,
             nudge_on_text_only: false,
             nudge_max_count: crate::config::schema::default_nudge_max_count(),
+            goal_check_on_complete: false,
         };
 
         // 4. Create AgentRunner and tokio::spawn

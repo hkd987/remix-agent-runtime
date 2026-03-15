@@ -224,6 +224,11 @@ pub fn load_config(args: &RunArgs) -> Result<AppConfig, AgentError> {
         config.agent.nudge_max_count = count;
     }
 
+    // Apply goal check configuration
+    if args.goal_check_on_complete {
+        config.agent.goal_check_on_complete = true;
+    }
+
     // CLI task overrides YAML task
     if args.task.is_some() {
         config.task = args.task.clone();
@@ -287,6 +292,7 @@ mod tests {
             disable_compaction: false,
             nudge_on_text_only: false,
             nudge_max_count: None,
+            goal_check_on_complete: false,
         }
     }
 
@@ -459,6 +465,7 @@ agent:
             disable_compaction: false,
             nudge_on_text_only: false,
             nudge_max_count: None,
+            goal_check_on_complete: false,
         };
         let config = load_config(&args).unwrap();
 
@@ -1181,6 +1188,48 @@ agent:
         let args = default_run_args();
         let config = load_config(&args).unwrap();
         assert_eq!(config.agent.nudge_max_count, 3);
+    }
+
+    #[test]
+    fn test_goal_check_on_complete_from_cli() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = RunArgs {
+            goal_check_on_complete: true,
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert!(config.agent.goal_check_on_complete);
+    }
+
+    #[test]
+    fn test_goal_check_on_complete_default_false() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let args = default_run_args();
+        let config = load_config(&args).unwrap();
+        assert!(!config.agent.goal_check_on_complete);
+    }
+
+    #[test]
+    fn test_goal_check_on_complete_cli_overrides_yaml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env_vars();
+
+        let yaml = r#"
+agent:
+  goal_check_on_complete: false
+"#;
+        let file = write_yaml_tempfile(yaml);
+        let args = RunArgs {
+            config: Some(file.path().to_path_buf()),
+            goal_check_on_complete: true,
+            ..default_run_args()
+        };
+        let config = load_config(&args).unwrap();
+        assert!(config.agent.goal_check_on_complete);
     }
 
     #[test]

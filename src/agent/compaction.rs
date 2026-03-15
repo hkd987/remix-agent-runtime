@@ -46,7 +46,10 @@ pub fn build_compaction_request(messages_to_compact: &[Message]) -> Vec<Message>
                     conversation_text.push_str(&format!(
                         "[{role_str} thinking]: {}\n\n",
                         if thinking.len() > 200 {
-                            format!("{}...", &thinking[..200])
+                            format!(
+                                "{}...",
+                                super::compaction_stages::safe_truncate(thinking, 200)
+                            )
                         } else {
                             thinking.clone()
                         }
@@ -75,7 +78,10 @@ pub fn build_compaction_request(messages_to_compact: &[Message]) -> Vec<Message>
                             .join("\n"),
                     };
                     let truncated = if content_str.len() > 500 {
-                        format!("{}... [truncated]", &content_str[..500])
+                        format!(
+                            "{}... [truncated]",
+                            super::compaction_stages::safe_truncate(&content_str, 500)
+                        )
                     } else {
                         content_str
                     };
@@ -425,6 +431,77 @@ mod tests {
     }
 
     // --- CompactionResult tests ---
+
+    // --- multi-byte / UTF-8 safety tests ---
+
+    #[test]
+    fn test_tool_result_truncation_with_multibyte_utf8() {
+        // Build a string where byte 500 falls inside a multi-byte char (emoji = 4 bytes each)
+        // 498 ASCII bytes + emoji (4 bytes) = 502 bytes total; slicing at byte 500 would panic
+        let mut content = "a".repeat(498);
+        content.push_str("\u{1F389}\u{1F389}"); // two party-popper emoji (8 bytes)
+        assert!(content.len() > 500);
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "toolu_01".to_string(),
+                content: ToolResultContent::Text(content),
+                is_error: None,
+            }],
+        }];
+        // Should not panic
+        let result = build_compaction_request(&messages);
+        match &result[0].content[0] {
+            ContentBlock::Text { text } => {
+                assert!(text.contains("... [truncated]"));
+            }
+            _ => panic!("Expected Text content block"),
+        }
+    }
+
+    #[test]
+    fn test_tool_result_truncation_short_content_unchanged() {
+        let short = "hello world";
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "toolu_01".to_string(),
+                content: ToolResultContent::Text(short.to_string()),
+                is_error: None,
+            }],
+        }];
+        let result = build_compaction_request(&messages);
+        match &result[0].content[0] {
+            ContentBlock::Text { text } => {
+                assert!(text.contains(short));
+                assert!(!text.contains("[truncated]"));
+            }
+            _ => panic!("Expected Text content block"),
+        }
+    }
+
+    #[test]
+    fn test_thinking_truncation_with_multibyte_utf8() {
+        // 198 ASCII bytes + emoji (4 bytes) = 202 bytes; slicing at byte 200 would panic
+        let mut thinking = "b".repeat(198);
+        thinking.push_str("\u{1F680}\u{1F680}"); // two rocket emoji
+        assert!(thinking.len() > 200);
+
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Thinking { thinking }],
+        }];
+        // Should not panic
+        let result = build_compaction_request(&messages);
+        match &result[0].content[0] {
+            ContentBlock::Text { text } => {
+                assert!(text.contains("..."));
+                assert!(text.contains("[Assistant thinking]"));
+            }
+            _ => panic!("Expected Text content block"),
+        }
+    }
 
     #[test]
     fn test_compaction_result_clone() {

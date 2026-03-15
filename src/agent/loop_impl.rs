@@ -30,6 +30,9 @@ use super::tool_registry::ToolRegistry;
 /// Message injected when the LLM returns text-only without using any tools.
 const NUDGE_MESSAGE: &str = "You provided analysis but did not take any action. Continue with the implementation. Use tools to make progress on the task.";
 
+/// Message injected for a one-time goal check before the agent terminates.
+const GOAL_CHECK_MESSAGE: &str = "Before you finish, verify your work is complete: 1) Check that all required output files exist (review the task for expected paths) 2) Run any provided test/eval scripts to confirm correctness 3) If anything is missing or failing, fix it now. If everything checks out, respond with your final summary.";
+
 /// Tools that are always visible in lazy discovery mode (core local tools).
 const ALWAYS_AVAILABLE_TOOLS: &[&str] = &[
     "read_file",
@@ -86,10 +89,38 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             return Some(content);
         }
         *nudge_count += 1;
-        info!(nudge_count = *nudge_count, max = self.config.nudge_max_count, "Text-only response detected, nudging LLM to continue");
+        info!(
+            nudge_count = *nudge_count,
+            max = self.config.nudge_max_count,
+            "Text-only response detected, nudging LLM to continue"
+        );
         self.emit_response_content_events(&content);
         state.add_assistant_message(content);
         state.inject_system_notification(NUDGE_MESSAGE);
+        None
+    }
+
+    /// Attempt a one-time goal check before termination.
+    /// Returns `Some(content)` if the check was skipped (caller should proceed to terminate).
+    /// Returns `None` if the check was applied (caller should `continue` the loop).
+    fn try_goal_check(
+        &self,
+        state: &mut AgentState,
+        content: Vec<ContentBlock>,
+        goal_check_fired: &mut bool,
+    ) -> Option<Vec<ContentBlock>> {
+        // Only fire when enabled, not yet fired, and agent did meaningful work (iteration > 1)
+        if !self.config.goal_check_on_complete
+            || *goal_check_fired
+            || state.current_iteration() <= 1
+        {
+            return Some(content);
+        }
+        *goal_check_fired = true;
+        info!("Goal check: verifying work completion before termination");
+        self.emit_response_content_events(&content);
+        state.add_assistant_message(content);
+        state.inject_system_notification(GOAL_CHECK_MESSAGE);
         None
     }
 
@@ -337,6 +368,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
 
         let timeout_ms = self.config.timeout_secs * 1000;
         let mut nudge_count: u32 = 0;
+        let mut goal_check_fired = false;
 
         loop {
             if state.current_iteration() >= self.config.max_iterations {
@@ -426,7 +458,17 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     // Check if there are actually tool_use blocks; if not, treat as end_turn.
                     let has_tool_use = content_has_tool_use(&assistant_content);
                     if !has_tool_use {
-                        let Some(assistant_content) = self.try_nudge(&mut state, assistant_content, &mut nudge_count) else {
+                        let Some(assistant_content) =
+                            self.try_nudge(&mut state, assistant_content, &mut nudge_count)
+                        else {
+                            continue;
+                        };
+                        // Goal check: one-time verification before termination
+                        let Some(assistant_content) = self.try_goal_check(
+                            &mut state,
+                            assistant_content,
+                            &mut goal_check_fired,
+                        ) else {
                             continue;
                         };
                         warn!("LLM returned stop_reason=tool_use but no tool_use blocks; treating as end_turn");
@@ -542,12 +584,21 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 }
                 StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
                     let content = if !content_has_tool_use(&response.content) {
-                        let Some(content) = self.try_nudge(&mut state, response.content, &mut nudge_count) else {
+                        let Some(content) =
+                            self.try_nudge(&mut state, response.content, &mut nudge_count)
+                        else {
                             continue;
                         };
                         content
                     } else {
                         response.content
+                    };
+
+                    // Goal check: one-time verification before termination
+                    let Some(content) =
+                        self.try_goal_check(&mut state, content, &mut goal_check_fired)
+                    else {
+                        continue;
                     };
 
                     let final_text = content
@@ -924,6 +975,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         let timeout_ms = self.config.timeout_secs * 1000;
         let session_metadata = session_store.load_metadata(session_id).await.ok();
         let mut nudge_count: u32 = 0;
+        let mut goal_check_fired = false;
 
         loop {
             if state.current_iteration() >= self.config.max_iterations {
@@ -1003,7 +1055,17 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     let assistant_content = response.content.clone();
                     let has_tool_use = content_has_tool_use(&assistant_content);
                     if !has_tool_use {
-                        let Some(assistant_content) = self.try_nudge(&mut state, assistant_content, &mut nudge_count) else {
+                        let Some(assistant_content) =
+                            self.try_nudge(&mut state, assistant_content, &mut nudge_count)
+                        else {
+                            continue;
+                        };
+                        // Goal check: one-time verification before termination
+                        let Some(assistant_content) = self.try_goal_check(
+                            &mut state,
+                            assistant_content,
+                            &mut goal_check_fired,
+                        ) else {
                             continue;
                         };
                         let final_text = assistant_content
@@ -1054,12 +1116,21 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 }
                 StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
                     let content = if !content_has_tool_use(&response.content) {
-                        let Some(content) = self.try_nudge(&mut state, response.content, &mut nudge_count) else {
+                        let Some(content) =
+                            self.try_nudge(&mut state, response.content, &mut nudge_count)
+                        else {
                             continue;
                         };
                         content
                     } else {
                         response.content
+                    };
+
+                    // Goal check: one-time verification before termination
+                    let Some(content) =
+                        self.try_goal_check(&mut state, content, &mut goal_check_fired)
+                    else {
+                        continue;
                     };
 
                     let final_text = content
@@ -1243,6 +1314,7 @@ mod tests {
             self_critique: None,
             nudge_on_text_only: false,
             nudge_max_count: 3,
+            goal_check_on_complete: false,
         }
     }
 
@@ -1339,6 +1411,7 @@ mod tests {
             self_critique: None,
             nudge_on_text_only: false,
             nudge_max_count: 3,
+            goal_check_on_complete: false,
         };
 
         // LLM always returns tool_use, so we hit max_iterations
@@ -1482,6 +1555,7 @@ mod tests {
             self_critique: None,
             nudge_on_text_only: false,
             nudge_max_count: 3,
+            goal_check_on_complete: false,
         };
 
         let llm_responses = Arc::new(Mutex::new(vec![make_end_turn_response("Done")]));
@@ -2128,7 +2202,12 @@ mod tests {
 
         let runner = AgentRunner::new(llm, tools, config);
         let result = runner
-            .run("Do something", &CredentialSet::new(), &SkillSet::new(), &None)
+            .run(
+                "Do something",
+                &CredentialSet::new(),
+                &SkillSet::new(),
+                &None,
+            )
             .await
             .unwrap();
 
@@ -2160,7 +2239,12 @@ mod tests {
 
         let runner = AgentRunner::new(llm, tools, config);
         let result = runner
-            .run("Do something", &CredentialSet::new(), &SkillSet::new(), &None)
+            .run(
+                "Do something",
+                &CredentialSet::new(),
+                &SkillSet::new(),
+                &None,
+            )
             .await
             .unwrap();
 
@@ -2169,6 +2253,131 @@ mod tests {
             result.total_iterations, 1,
             "Expected immediate termination with nudge disabled"
         );
+    }
+
+    #[tokio::test]
+    async fn test_goal_check_fires_once_before_termination() {
+        let config = AgentConfig {
+            goal_check_on_complete: true,
+            ..default_config()
+        };
+
+        // Response 1: tool use (meaningful work), Response 2: end_turn "Done" (goal check fires),
+        // Response 3: end_turn "Verified done" (terminates)
+        let llm = MockLlm {
+            responses: Arc::new(Mutex::new(vec![
+                make_tool_use_response(
+                    "toolu_01",
+                    "navigate",
+                    json!({"url": "https://example.com"}),
+                ),
+                make_end_turn_response("Done"),
+                make_end_turn_response("Verified done"),
+            ])),
+        };
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![Ok(ToolExecutionResult {
+                content: "Page loaded".to_string(),
+                is_error: false,
+            })])),
+        };
+
+        let runner = AgentRunner::new(llm, tools, config);
+        let result = runner
+            .run(
+                "Do something",
+                &CredentialSet::new(),
+                &SkillSet::new(),
+                &None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(
+            result.total_iterations, 3,
+            "Expected 3 iterations (tool work, goal check fires, terminates)"
+        );
+        assert_eq!(result.result, Some("Verified done".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_goal_check_disabled_terminates_immediately() {
+        let config = AgentConfig {
+            goal_check_on_complete: false,
+            ..default_config()
+        };
+
+        let llm = MockLlm {
+            responses: Arc::new(Mutex::new(vec![
+                make_tool_use_response(
+                    "toolu_01",
+                    "navigate",
+                    json!({"url": "https://example.com"}),
+                ),
+                make_end_turn_response("Done"),
+            ])),
+        };
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![Ok(ToolExecutionResult {
+                content: "Page loaded".to_string(),
+                is_error: false,
+            })])),
+        };
+
+        let runner = AgentRunner::new(llm, tools, config);
+        let result = runner
+            .run(
+                "Do something",
+                &CredentialSet::new(),
+                &SkillSet::new(),
+                &None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(
+            result.total_iterations, 2,
+            "Expected 2 iterations (backward compatible, no goal check)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_goal_check_skips_when_no_tool_work() {
+        let config = AgentConfig {
+            goal_check_on_complete: true,
+            ..default_config()
+        };
+
+        // Only one response, no tool work done (iteration 1)
+        let llm = MockLlm {
+            responses: Arc::new(Mutex::new(vec![make_end_turn_response("Nothing to do")])),
+        };
+        let tools = MockTools {
+            tools: default_tools(),
+            results: Arc::new(Mutex::new(vec![])),
+        };
+
+        let runner = AgentRunner::new(llm, tools, config);
+        let result = runner
+            .run(
+                "Do something",
+                &CredentialSet::new(),
+                &SkillSet::new(),
+                &None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(
+            result.total_iterations, 1,
+            "Expected 1 iteration (no tool work, skip goal check)"
+        );
+        assert_eq!(result.result, Some("Nothing to do".to_string()));
     }
 
     #[tokio::test]
@@ -2193,7 +2402,12 @@ mod tests {
 
         let runner = AgentRunner::new(llm, tools, config);
         let result = runner
-            .run("Do something", &CredentialSet::new(), &SkillSet::new(), &None)
+            .run(
+                "Do something",
+                &CredentialSet::new(),
+                &SkillSet::new(),
+                &None,
+            )
             .await
             .unwrap();
 
