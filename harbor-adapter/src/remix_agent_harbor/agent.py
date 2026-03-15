@@ -88,11 +88,11 @@ class RemixAgent(BaseInstalledAgent):
             " --no-coordination"
             " --permission-mode bypass_permissions"
             " --timeout 1800"
-            " --max-iterations 75"
+            " --max-iterations 200"
             " --tool-result-max-bytes 16384"
             " --nudge-on-text-only"
             " --goal-check-on-complete"
-            " --action-reminder-interval 5"
+            " --action-reminder-interval 8"
             " --deny-tool 'web_fetch'"
             # Loop detection: catch doom-loops early
             " --loop-detection"
