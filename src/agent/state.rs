@@ -178,7 +178,16 @@ impl AgentState {
         if self.messages.len() <= preserve_n {
             return;
         }
-        let preserve_start = self.messages.len() - preserve_n;
+        let mut preserve_start = self.messages.len() - preserve_n;
+
+        // Ensure we don't split in the middle of a tool_use/tool_result pair.
+        // If the first preserved message contains ToolResult blocks, the matching
+        // ToolUse assistant message was compacted away, which causes an API error.
+        // Walk backwards until the first preserved message has no orphaned ToolResults.
+        while preserve_start > 0 && Self::has_tool_result(&self.messages[preserve_start]) {
+            preserve_start -= 1;
+        }
+
         let preserved: Vec<Message> = self.messages.drain(preserve_start..).collect();
         self.messages.clear();
         // Insert summary as the first message
@@ -191,6 +200,14 @@ impl AgentState {
         self.messages.extend(preserved);
         // Reset effective tokens; caller will set the estimated value
         self.effective_input_tokens = 0;
+    }
+
+    /// Check if a message contains any ToolResult content blocks.
+    fn has_tool_result(message: &Message) -> bool {
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
     }
 
     pub fn into_result(self, status: AgentStatus, final_text: Option<String>) -> AgentResult {
@@ -932,5 +949,91 @@ mod tests {
         }]);
         state.inject_system_notification("Reminder: keep going");
         assert_eq!(state.original_task(), Some("Solve the puzzle"));
+    }
+
+    #[test]
+    fn test_compact_preserves_tool_use_result_pairing() {
+        let mut state = AgentState::new("task");
+        // msg 0: user task
+        // msg 1: assistant with tool_use
+        state.add_assistant_message(vec![ContentBlock::ToolUse {
+            id: "toolu_01".to_string(),
+            name: "bash".to_string(),
+            input: json!({"command": "ls"}),
+        }]);
+        // msg 2: user with tool_result
+        state.add_tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: "toolu_01".to_string(),
+            content: ToolResultContent::Text("file1.txt".to_string()),
+            is_error: None,
+        }]);
+        // msg 3: assistant with tool_use
+        state.add_assistant_message(vec![ContentBlock::ToolUse {
+            id: "toolu_02".to_string(),
+            name: "bash".to_string(),
+            input: json!({"command": "cat file1.txt"}),
+        }]);
+        // msg 4: user with tool_result
+        state.add_tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: "toolu_02".to_string(),
+            content: ToolResultContent::Text("contents".to_string()),
+            is_error: None,
+        }]);
+        // msg 5: assistant text
+        state.add_assistant_message(vec![ContentBlock::Text {
+            text: "Done reading.".to_string(),
+        }]);
+        // msg 6: user text
+        state.inject_system_notification("keep going");
+        assert_eq!(state.messages().len(), 7);
+
+        // preserve_n=4 would normally start at index 3 (assistant tool_use).
+        // But index 4 is a tool_result, so we'd have the tool_use at index 3
+        // which is fine. Let's test preserve_n=3 which starts at index 4 (tool_result).
+        state.compact("Summary of early work", 3);
+
+        // Should have backed up to include index 3 (the matching assistant tool_use)
+        // Result: summary + messages[3..7] = 5 messages
+        assert_eq!(state.messages().len(), 5);
+
+        // First message must be the summary
+        match &state.messages()[0].content[0] {
+            ContentBlock::Text { text } => {
+                assert!(text.contains("<summary>"));
+                assert!(text.contains("Summary of early work"));
+            }
+            _ => panic!("Expected summary text"),
+        }
+
+        // Second message should be the assistant with tool_use (not orphaned tool_result)
+        assert!(matches!(state.messages()[1].role, Role::Assistant));
+        assert!(matches!(
+            &state.messages()[1].content[0],
+            ContentBlock::ToolUse { .. }
+        ));
+    }
+
+    #[test]
+    fn test_compact_no_adjustment_when_no_tool_results_at_boundary() {
+        let mut state = AgentState::new("task");
+        // msg 0: user task
+        // msg 1: assistant text
+        state.add_assistant_message(vec![ContentBlock::Text {
+            text: "response 1".to_string(),
+        }]);
+        // msg 2: user text
+        state.inject_system_notification("nudge");
+        // msg 3: assistant text
+        state.add_assistant_message(vec![ContentBlock::Text {
+            text: "response 2".to_string(),
+        }]);
+        // msg 4: user text
+        state.inject_system_notification("another nudge");
+        assert_eq!(state.messages().len(), 5);
+
+        // preserve_n=2 starts at index 3, which is a text assistant message — no adjustment needed
+        state.compact("Summary", 2);
+        // summary + 2 preserved = 3
+        assert_eq!(state.messages().len(), 3);
     }
 }
