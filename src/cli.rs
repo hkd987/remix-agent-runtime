@@ -993,11 +993,7 @@ mod tests {
 
     #[test]
     fn test_parse_run_with_loop_detection() {
-        let args = extract_run_args(Cli::parse_from([
-            "remix-agent",
-            "run",
-            "--loop-detection",
-        ]));
+        let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--loop-detection"]));
         assert!(args.loop_detection);
         assert!(args.loop_detection_max_repeats.is_none());
         assert!(args.loop_detection_window.is_none());

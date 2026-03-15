@@ -726,7 +726,10 @@ mod tests {
         });
         let block: ContentBlock = serde_json::from_value(api_json).unwrap();
         match &block {
-            ContentBlock::Thinking { thinking, signature } => {
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
                 assert_eq!(thinking, "Step 1: analyze the problem...");
                 assert_eq!(signature, "EqoBCkgIAxgCIkDX2m6FqDKrheMdHGEr");
             }

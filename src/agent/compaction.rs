@@ -56,8 +56,7 @@ pub fn build_compaction_request(messages_to_compact: &[Message]) -> Vec<Message>
                     ));
                 }
                 ContentBlock::RedactedThinking { .. } => {
-                    conversation_text
-                        .push_str(&format!("[{role_str} thinking (redacted)]\n\n"));
+                    conversation_text.push_str(&format!("[{role_str} thinking (redacted)]\n\n"));
                 }
                 ContentBlock::ToolResult {
                     content, is_error, ..

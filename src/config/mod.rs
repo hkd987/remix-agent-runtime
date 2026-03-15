@@ -1527,10 +1527,7 @@ agent:
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
-        assert_eq!(
-            config.agent.iteration_budget_warning_threshold,
-            Some(0.7)
-        );
+        assert_eq!(config.agent.iteration_budget_warning_threshold, Some(0.7));
     }
 
     #[test]
