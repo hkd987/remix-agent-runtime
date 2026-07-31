@@ -9,8 +9,8 @@ use crate::local_tools::sandbox::{create_sandbox, BashSandbox, PathValidator};
 
 /// Decorator that wraps a ToolExecutor and adds local file/shell tools.
 ///
-/// When `config.enabled` is true, seven virtual tools are added:
-/// - `read_file`, `write_file`, `edit_file` for file operations
+/// When `config.enabled` is true, eight virtual tools are added:
+/// - `read_file`, `write_file`, `edit_file`, `multi_edit` for file operations
 /// - `bash` for sandboxed shell execution
 /// - `grep` for regex search across files
 /// - `glob` for file pattern matching
@@ -26,15 +26,23 @@ pub struct LocalToolsExecutor<T: ToolExecutor> {
     tool_result_max_bytes: usize,
 }
 
+/// The directory every sandboxed tool is confined to.
+///
+/// Shared so the bash sandbox, the path validator, and the dev-tools subprocess
+/// sandbox all agree on the boundary instead of each deriving it.
+pub fn sandbox_root(config: &LocalToolsConfig) -> std::path::PathBuf {
+    config.sandbox_dir.clone().unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+    })
+}
+
 impl<T: ToolExecutor> LocalToolsExecutor<T> {
     pub fn new(
         inner: T,
         config: LocalToolsConfig,
         tool_result_max_bytes: usize,
     ) -> Result<Self, AgentError> {
-        let sandbox_root = config.sandbox_dir.clone().unwrap_or_else(|| {
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-        });
+        let sandbox_root = sandbox_root(&config);
 
         let path_validator =
             PathValidator::new_with_bypass(sandbox_root.clone(), config.bypass_sandbox)?;
@@ -98,6 +106,13 @@ impl<T: ToolExecutor> ToolExecutor for LocalToolsExecutor<T> {
                     )
                     .await;
                 }
+                "multi_edit" => {
+                    return super::tools::multi_edit::execute_multi_edit(
+                        arguments,
+                        &self.path_validator,
+                    )
+                    .await;
+                }
                 "bash" => {
                     return super::tools::bash::execute_bash(
                         arguments,
@@ -129,7 +144,7 @@ impl<T: ToolExecutor> ToolExecutor for LocalToolsExecutor<T> {
     }
 }
 
-fn local_tool_definitions() -> Vec<ToolDefinition> {
+pub fn local_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "read_file".to_string(),
@@ -144,7 +159,7 @@ fn local_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["path"]
             }),
             cache_control: None,
-            read_only: false,
+            read_only: true,
         },
         ToolDefinition {
             name: "write_file".to_string(),
@@ -171,6 +186,32 @@ fn local_tool_definitions() -> Vec<ToolDefinition> {
                     "new_string": { "type": "string", "description": "The replacement string" }
                 },
                 "required": ["path", "old_string", "new_string"]
+            }),
+            cache_control: None,
+            read_only: false,
+        },
+        ToolDefinition {
+            name: "multi_edit".to_string(),
+            description: "Apply several edits to one file in a single call. Edits apply in order, each against the result of the previous one. If any edit fails to match, no edits are applied.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Path to the file to edit" },
+                    "edits": {
+                        "type": "array",
+                        "description": "Edits to apply, in order",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_string": { "type": "string", "description": "Exact text to replace" },
+                                "new_string": { "type": "string", "description": "Replacement text" },
+                                "replace_all": { "type": "boolean", "description": "Replace every occurrence instead of requiring a unique match (default false)" }
+                            },
+                            "required": ["old_string", "new_string"]
+                        }
+                    }
+                },
+                "required": ["path", "edits"]
             }),
             cache_control: None,
             read_only: false,
@@ -203,7 +244,7 @@ fn local_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["pattern"]
             }),
             cache_control: None,
-            read_only: false,
+            read_only: true,
         },
         ToolDefinition {
             name: "glob".to_string(),
@@ -217,7 +258,7 @@ fn local_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["pattern"]
             }),
             cache_control: None,
-            read_only: false,
+            read_only: true,
         },
         ToolDefinition {
             name: "web_fetch".to_string(),
@@ -238,7 +279,7 @@ fn local_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["url"]
             }),
             cache_control: None,
-            read_only: true,
+            read_only: false,
         },
     ]
 }
@@ -305,8 +346,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let inner = mock_inner();
         let executor = LocalToolsExecutor::new(inner, test_config(&dir), 32_768).unwrap();
-        // 1 inner + 7 local tools = 8
-        assert_eq!(executor.tool_definitions().len(), 8);
+        // 1 inner + 8 local tools = 9
+        assert_eq!(executor.tool_definitions().len(), 9);
         let names: Vec<&str> = executor
             .tool_definitions()
             .iter()
@@ -458,7 +499,7 @@ mod tests {
     #[test]
     fn test_tool_definitions_count() {
         let defs = local_tool_definitions();
-        assert_eq!(defs.len(), 7);
+        assert_eq!(defs.len(), 8);
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(
             names,
@@ -466,6 +507,7 @@ mod tests {
                 "read_file",
                 "write_file",
                 "edit_file",
+                "multi_edit",
                 "bash",
                 "grep",
                 "glob",

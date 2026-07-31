@@ -38,39 +38,136 @@ pub enum PermissionDecision {
     Ask,
 }
 
-/// Read-only tools that are always allowed in Plan mode.
-const PLAN_MODE_ALLOWED: &[&str] = &[
-    "read_file",
-    "grep",
-    "glob",
-    "load_skill",
-    "read_skill_resource",
-];
+/// Concatenate every string value in a tool's arguments, so an argument-scoped rule
+/// can match regardless of which parameter carries the dangerous value.
+fn flatten_argument_values(value: &serde_json::Value) -> String {
+    let mut out = String::new();
+    fn walk(v: &serde_json::Value, out: &mut String) {
+        match v {
+            serde_json::Value::String(s) => {
+                out.push_str(s);
+                out.push('\n');
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|i| walk(i, out)),
+            serde_json::Value::Object(map) => map.values().for_each(|i| walk(i, out)),
+            other => {
+                out.push_str(&other.to_string());
+                out.push('\n');
+            }
+        }
+    }
+    walk(value, &mut out);
+    out
+}
 
 /// Write/edit tools that are auto-allowed in AcceptEdits mode.
 const ACCEPT_EDITS_AUTO_ALLOW: &[&str] = &["write_file", "edit_file", "bash", "multi_edit"];
 
 impl PermissionPolicy {
+    /// Compile every configured pattern, returning a description of the first that is
+    /// invalid.
+    ///
+    /// Call this at startup. An unparseable pattern is silently ignored during
+    /// matching, which for a *deny* pattern means it fails open — a typo would quietly
+    /// grant access the operator believed they had revoked. Surfacing it as a hard
+    /// config error is the only safe handling.
+    pub fn validate(&self) -> Result<(), String> {
+        for (label, patterns) in [
+            ("denied_tools", &self.denied_tools),
+            ("allowed_tools", &self.allowed_tools),
+        ] {
+            for pattern in patterns {
+                if let Err(e) = regex::Regex::new(pattern) {
+                    return Err(format!("invalid regex in {label}: `{pattern}`: {e}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Log a warning when the effective policy is broader than it may appear.
+    ///
+    /// `Default` mode falls through to `Ask`, and a non-interactive run has no one to
+    /// ask, so `Ask` executes the tool. That makes headless `Default` mode
+    /// "allow everything not explicitly denied" — worth stating out loud rather than
+    /// leaving implicit.
+    pub fn warn_if_permissive(&self, interactive: bool) {
+        match self.mode {
+            PermissionMode::BypassPermissions => {
+                tracing::warn!(
+                    "Permission mode is `bypass_permissions`: every tool is allowed and \
+                     denied_tools is ignored."
+                );
+            }
+            PermissionMode::Default if !interactive => {
+                tracing::warn!(
+                    denied_tools = ?self.denied_tools,
+                    "Permission mode is `default` in a non-interactive run: tools that would \
+                     prompt are executed instead. Effectively every tool is allowed except \
+                     the denied patterns. Use `--permission-mode dont_ask` to deny instead."
+                );
+            }
+            PermissionMode::AcceptEdits => {
+                tracing::warn!(
+                    auto_allowed = ?ACCEPT_EDITS_AUTO_ALLOW,
+                    "Permission mode is `accept_edits`: these tools run without prompting."
+                );
+            }
+            _ => {}
+        }
+    }
+
     /// Returns the first denied pattern that matches `tool_name`, if any.
+    ///
+    /// Deny patterns are matched **unanchored** so a broad pattern catches variants.
     fn matches_denied(&self, tool_name: &str) -> Option<&str> {
         self.denied_tools.iter().find_map(|pattern| {
-            regex::Regex::new(pattern)
-                .ok()
-                .filter(|re| re.is_match(tool_name))
-                .map(|_| pattern.as_str())
+            match regex::Regex::new(pattern) {
+                Ok(re) if re.is_match(tool_name) => Some(pattern.as_str()),
+                Ok(_) => None,
+                Err(e) => {
+                    // Cannot evaluate the rule, so treat it as matching rather than
+                    // letting a malformed deny rule fail open. `validate()` should have
+                    // rejected this at startup.
+                    tracing::error!(
+                        pattern = %pattern,
+                        error = %e,
+                        "Invalid deny pattern; denying the tool rather than failing open"
+                    );
+                    Some(pattern.as_str())
+                }
+            }
         })
     }
 
     /// Returns `true` if `tool_name` matches any pattern in `allowed_tools`.
+    ///
+    /// Allow patterns are **anchored** to the whole tool name, so `read` grants
+    /// `read_file` only if written as such and never accidentally matches
+    /// `spread_files`. Alternations still work: `navigate|click` becomes
+    /// `^(?:navigate|click)$`.
     fn matches_allowed(&self, tool_name: &str) -> bool {
         self.allowed_tools.iter().any(|pattern| {
-            regex::Regex::new(pattern)
+            let anchored = format!("^(?:{pattern})$");
+            regex::Regex::new(&anchored)
                 .map(|re| re.is_match(tool_name))
-                .unwrap_or(false)
+                .unwrap_or_else(|e| {
+                    tracing::error!(
+                        pattern = %pattern,
+                        error = %e,
+                        "Invalid allow pattern; not granting access"
+                    );
+                    false
+                })
         })
     }
 
     /// Check whether a tool is allowed, denied, or requires user confirmation.
+    ///
+    /// `read_only` comes from the tool's own [`ToolDefinition`], which is the single
+    /// source of truth for what "read-only" means. It used to be decided by hardcoded
+    /// name lists kept in three places that had already drifted apart, so plan mode
+    /// advertised tools it then refused to run and refused tools it never advertised.
     ///
     /// Evaluation order:
     /// 1. `BypassPermissions` mode always allows.
@@ -80,10 +177,72 @@ impl PermissionPolicy {
     /// 4. `Default` / `DontAsk` mode: denied patterns first, then allowed patterns.
     ///    `Default` falls through to `Ask`; `DontAsk` falls through to `Deny`.
     pub fn check(&self, tool_name: &str) -> PermissionDecision {
+        // Callers that do not have the definition to hand assume the tool mutates,
+        // which is the safe default in Plan mode.
+        self.check_tool(tool_name, false)
+    }
+
+    /// Check a tool, given whether its definition declares it read-only.
+    pub fn check_tool(&self, tool_name: &str, read_only: bool) -> PermissionDecision {
+        self.check_call(tool_name, read_only, None)
+    }
+
+    /// Check a specific tool *call*, so rules can match on arguments as well as name.
+    ///
+    /// A name-only rule can express "deny bash" but not "deny `rm -rf`", which is the
+    /// distinction operators actually want. A pattern may target arguments by writing
+    /// `tool_name:pattern`; the part after the colon is matched against the call's
+    /// argument values.
+    pub fn check_call(
+        &self,
+        tool_name: &str,
+        read_only: bool,
+        arguments: Option<&serde_json::Value>,
+    ) -> PermissionDecision {
+        // Argument-scoped denials are checked first and in every mode except bypass,
+        // since they exist to stop specific dangerous calls.
+        if self.mode != PermissionMode::BypassPermissions {
+            if let Some(args) = arguments {
+                if let Some(pattern) = self.matches_denied_call(tool_name, args) {
+                    return PermissionDecision::Deny {
+                        reason: format!(
+                            "Tool call '{tool_name}' matches denied pattern '{pattern}'"
+                        ),
+                    };
+                }
+            }
+        }
+        self.check_by_name(tool_name, read_only)
+    }
+
+    /// Match `tool:arg-pattern` rules against a call's argument values.
+    fn matches_denied_call(&self, tool_name: &str, arguments: &serde_json::Value) -> Option<&str> {
+        let arg_text = flatten_argument_values(arguments);
+        self.denied_tools.iter().find_map(|pattern| {
+            let (tool_part, arg_part) = pattern.split_once(':')?;
+            if tool_part != tool_name {
+                return None;
+            }
+            match regex::Regex::new(arg_part) {
+                Ok(re) if re.is_match(&arg_text) => Some(pattern.as_str()),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::error!(
+                        pattern = %pattern,
+                        error = %e,
+                        "Invalid argument deny pattern; denying the call rather than failing open"
+                    );
+                    Some(pattern.as_str())
+                }
+            }
+        })
+    }
+
+    fn check_by_name(&self, tool_name: &str, read_only: bool) -> PermissionDecision {
         match self.mode {
             PermissionMode::BypassPermissions => PermissionDecision::Allow,
             PermissionMode::Plan => {
-                if PLAN_MODE_ALLOWED.contains(&tool_name) {
+                if read_only {
                     PermissionDecision::Allow
                 } else {
                     PermissionDecision::Deny {
@@ -218,7 +377,10 @@ mod tests {
             mode: PermissionMode::Plan,
             ..Default::default()
         };
-        assert_eq!(policy.check("read_file"), PermissionDecision::Allow);
+        assert_eq!(
+            policy.check_tool("read_file", true),
+            PermissionDecision::Allow
+        );
     }
 
     #[test]
@@ -227,7 +389,7 @@ mod tests {
             mode: PermissionMode::Plan,
             ..Default::default()
         };
-        assert_eq!(policy.check("grep"), PermissionDecision::Allow);
+        assert_eq!(policy.check_tool("grep", true), PermissionDecision::Allow);
     }
 
     #[test]
@@ -236,7 +398,7 @@ mod tests {
             mode: PermissionMode::Plan,
             ..Default::default()
         };
-        assert_eq!(policy.check("glob"), PermissionDecision::Allow);
+        assert_eq!(policy.check_tool("glob", true), PermissionDecision::Allow);
     }
 
     #[test]
@@ -245,9 +407,12 @@ mod tests {
             mode: PermissionMode::Plan,
             ..Default::default()
         };
-        assert_eq!(policy.check("load_skill"), PermissionDecision::Allow);
         assert_eq!(
-            policy.check("read_skill_resource"),
+            policy.check_tool("load_skill", true),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            policy.check_tool("read_skill_resource", true),
             PermissionDecision::Allow
         );
     }
@@ -287,9 +452,12 @@ mod tests {
             allowed_tools: vec!["read_.*".to_string()],
             denied_tools: vec![],
         };
-        assert_eq!(policy.check("read_file"), PermissionDecision::Allow);
         assert_eq!(
-            policy.check("read_skill_resource"),
+            policy.check_tool("read_file", true),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            policy.check_tool("read_skill_resource", true),
             PermissionDecision::Allow
         );
         assert_eq!(policy.check("write_file"), PermissionDecision::Ask);
@@ -304,7 +472,10 @@ mod tests {
         };
         let decision = policy.check("write_file");
         assert!(matches!(decision, PermissionDecision::Deny { .. }));
-        assert_eq!(policy.check("read_file"), PermissionDecision::Ask);
+        assert_eq!(
+            policy.check_tool("read_file", true),
+            PermissionDecision::Ask
+        );
     }
 
     #[test]
@@ -318,7 +489,10 @@ mod tests {
             policy.check("bash"),
             PermissionDecision::Deny { .. }
         ));
-        assert_eq!(policy.check("read_file"), PermissionDecision::Allow);
+        assert_eq!(
+            policy.check_tool("read_file", true),
+            PermissionDecision::Allow
+        );
     }
 
     // --- Default returns Ask ---
@@ -458,7 +632,10 @@ mod tests {
             allowed_tools: vec!["read_.*".to_string()],
             denied_tools: vec![],
         };
-        assert_eq!(policy.check("read_file"), PermissionDecision::Allow);
+        assert_eq!(
+            policy.check_tool("read_file", true),
+            PermissionDecision::Allow
+        );
         assert!(matches!(
             policy.check("write_file"),
             PermissionDecision::Deny { .. }
@@ -493,14 +670,76 @@ mod tests {
     // --- Invalid regex is gracefully handled ---
 
     #[test]
-    fn test_invalid_regex_in_denied_is_skipped() {
+    fn test_invalid_regex_in_denied_fails_closed() {
         let policy = PermissionPolicy {
             mode: PermissionMode::Default,
             allowed_tools: vec![],
             denied_tools: vec!["[invalid".to_string()],
         };
-        // Invalid regex should be skipped, falling through to Ask
-        assert_eq!(policy.check("bash"), PermissionDecision::Ask);
+        // An unevaluatable deny rule must not grant access. A typo in a deny pattern
+        // silently permitting the tool is the worst possible failure mode, so the
+        // rule is treated as matching.
+        assert!(matches!(
+            policy.check("bash"),
+            PermissionDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_denied_pattern() {
+        let policy = PermissionPolicy {
+            mode: PermissionMode::Default,
+            allowed_tools: vec![],
+            denied_tools: vec!["[invalid".to_string()],
+        };
+        let err = policy.validate().unwrap_err();
+        assert!(err.contains("denied_tools"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_allowed_pattern() {
+        let policy = PermissionPolicy {
+            mode: PermissionMode::Default,
+            allowed_tools: vec!["(unclosed".to_string()],
+            denied_tools: vec![],
+        };
+        let err = policy.validate().unwrap_err();
+        assert!(err.contains("allowed_tools"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_accepts_valid_patterns() {
+        let policy = PermissionPolicy {
+            mode: PermissionMode::Default,
+            allowed_tools: vec!["navigate|click".to_string()],
+            denied_tools: vec!["bash".to_string()],
+        };
+        assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn test_allow_pattern_is_anchored() {
+        let policy = PermissionPolicy {
+            mode: PermissionMode::Default,
+            allowed_tools: vec!["read".to_string()],
+            denied_tools: vec![],
+        };
+        // `read` must not grant `spread_files` by substring match.
+        assert_eq!(policy.check("spread_files"), PermissionDecision::Ask);
+        assert_eq!(policy.check("read"), PermissionDecision::Allow);
+    }
+
+    #[test]
+    fn test_allow_pattern_alternation_still_works_when_anchored() {
+        let policy = PermissionPolicy {
+            mode: PermissionMode::Default,
+            allowed_tools: vec!["navigate|click|screenshot".to_string()],
+            denied_tools: vec![],
+        };
+        assert_eq!(policy.check("navigate"), PermissionDecision::Allow);
+        assert_eq!(policy.check("click"), PermissionDecision::Allow);
+        assert_eq!(policy.check("screenshot"), PermissionDecision::Allow);
+        assert_eq!(policy.check("navigate_away"), PermissionDecision::Ask);
     }
 
     #[test]
@@ -527,5 +766,91 @@ mod tests {
         assert_eq!(back.mode, PermissionMode::Plan);
         assert_eq!(back.allowed_tools, vec!["read_.*"]);
         assert_eq!(back.denied_tools, vec!["bash"]);
+    }
+
+    // --- Argument-scoped rules ---
+    //
+    // A name-only rule can only express "deny bash", never "deny `rm -rf`", which is
+    // the distinction an operator actually wants.
+
+    fn deny_call_policy(patterns: &[&str]) -> PermissionPolicy {
+        PermissionPolicy {
+            mode: PermissionMode::Default,
+            allowed_tools: vec![],
+            denied_tools: patterns.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_argument_scoped_rule_denies_matching_call() {
+        let policy = deny_call_policy(&[r"bash:rm\s+-rf"]);
+        let args = serde_json::json!({"command": "rm -rf /tmp/x"});
+        assert!(matches!(
+            policy.check_call("bash", false, Some(&args)),
+            PermissionDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn test_argument_scoped_rule_allows_other_calls_to_same_tool() {
+        let policy = deny_call_policy(&[r"bash:rm\s+-rf"]);
+        let args = serde_json::json!({"command": "cargo test"});
+        // The whole tool is not banned — only the dangerous invocation.
+        assert_eq!(
+            policy.check_call("bash", false, Some(&args)),
+            PermissionDecision::Ask
+        );
+    }
+
+    #[test]
+    fn test_argument_scoped_rule_does_not_affect_other_tools() {
+        let policy = deny_call_policy(&[r"bash:rm\s+-rf"]);
+        let args = serde_json::json!({"content": "rm -rf /"});
+        assert_eq!(
+            policy.check_call("write_file", false, Some(&args)),
+            PermissionDecision::Ask
+        );
+    }
+
+    #[test]
+    fn test_argument_scoped_rule_searches_all_argument_values() {
+        // The dangerous value may not be in the parameter the operator expected.
+        let policy = deny_call_policy(&["bash:secret"]);
+        let args = serde_json::json!({"command": "echo hi", "env": {"TOKEN": "secret"}});
+        assert!(matches!(
+            policy.check_call("bash", false, Some(&args)),
+            PermissionDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn test_name_only_rules_still_deny_the_whole_tool() {
+        let policy = deny_call_policy(&["bash"]);
+        let args = serde_json::json!({"command": "cargo test"});
+        assert!(matches!(
+            policy.check_call("bash", false, Some(&args)),
+            PermissionDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn test_argument_rules_are_ignored_under_bypass() {
+        let mut policy = deny_call_policy(&[r"bash:rm\s+-rf"]);
+        policy.mode = PermissionMode::BypassPermissions;
+        let args = serde_json::json!({"command": "rm -rf /"});
+        assert_eq!(
+            policy.check_call("bash", false, Some(&args)),
+            PermissionDecision::Allow
+        );
+    }
+
+    #[test]
+    fn test_invalid_argument_pattern_fails_closed() {
+        let policy = deny_call_policy(&["bash:[unclosed"]);
+        let args = serde_json::json!({"command": "ls"});
+        assert!(matches!(
+            policy.check_call("bash", false, Some(&args)),
+            PermissionDecision::Deny { .. }
+        ));
     }
 }

@@ -1,14 +1,18 @@
+use std::sync::Arc;
+
 use crate::browser::mcp::ToolExecutionResult;
 use crate::config::schema::TestHarnessConfig;
 use crate::error::AgentError;
-use crate::local_tools::tools::output_filter::{strip_ansi, truncate_output};
+use crate::local_tools::sandbox::BashSandbox;
+use crate::local_tools::tools::output_filter::truncate_output;
 
-use super::detect::detect_frameworks;
+use super::exec::{resolve_framework, run_under_sandbox};
 use super::types::TestFramework;
 
 pub async fn execute_run_tests(
     arguments: serde_json::Value,
     config: &TestHarnessConfig,
+    sandbox: Arc<dyn BashSandbox>,
 ) -> Result<ToolExecutionResult, AgentError> {
     let framework_str = arguments.get("framework").and_then(|v| v.as_str());
     let file = arguments.get("file").and_then(|v| v.as_str());
@@ -18,22 +22,7 @@ pub async fn execute_run_tests(
         .and_then(|v| v.as_u64())
         .unwrap_or(config.timeout_secs);
 
-    let framework = if let Some(fw_str) = framework_str {
-        TestFramework::from_str_id(fw_str).ok_or_else(|| {
-            AgentError::ToolExecution(format!(
-                "Unknown test framework: '{}'. Supported: cargo, pytest, jest, vitest, go, mocha",
-                fw_str
-            ))
-        })?
-    } else {
-        let cwd = std::env::current_dir().unwrap_or_default();
-        let detected = detect_frameworks(&cwd);
-        detected.into_iter().next().ok_or_else(|| {
-            AgentError::ToolExecution(
-                "No test framework detected. Specify framework explicitly with the 'framework' parameter.".to_string(),
-            )
-        })?
-    };
+    let framework = resolve_framework(framework_str)?;
 
     let (cmd, base_args) = framework.test_command();
     let mut all_args: Vec<String> = base_args.iter().map(|s| s.to_string()).collect();
@@ -46,23 +35,16 @@ pub async fn execute_run_tests(
         "Running tests"
     );
 
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        tokio::process::Command::new(cmd).args(&all_args).output(),
+    let output = run_under_sandbox(
+        sandbox.as_ref(),
+        cmd,
+        &all_args,
+        timeout_secs,
+        "Test execution",
     )
-    .await
-    .map_err(|_| {
-        AgentError::ToolExecution(format!("Test execution timed out after {}s", timeout_secs))
-    })?
-    .map_err(|e| AgentError::ToolExecution(format!("Failed to execute {}: {}", cmd, e)))?;
-
-    let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
-    let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
-    let combined = if stderr.is_empty() {
-        stdout.clone()
-    } else {
-        format!("{}\n{}", stdout, stderr)
-    };
+    .await?;
+    let stdout = output.stdout.clone();
+    let combined = output.combined.clone();
 
     // Parse the output
     let summary = match framework {
@@ -78,7 +60,7 @@ pub async fn execute_run_tests(
                     framework.display_name(),
                     truncate_output(&combined, 32_768)
                 ),
-                is_error: !output.status.success(),
+                is_error: !output.success(),
             });
         }
     };

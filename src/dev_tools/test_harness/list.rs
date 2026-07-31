@@ -1,34 +1,22 @@
+use std::sync::Arc;
+
 use crate::browser::mcp::ToolExecutionResult;
 use crate::config::schema::TestHarnessConfig;
 use crate::error::AgentError;
-use crate::local_tools::tools::output_filter::{strip_ansi, truncate_output};
+use crate::local_tools::sandbox::BashSandbox;
+use crate::local_tools::tools::output_filter::truncate_output;
 
-use super::detect::detect_frameworks;
-use super::types::TestFramework;
+use super::exec::{resolve_framework, run_under_sandbox};
 
 pub async fn execute_list_tests(
     arguments: serde_json::Value,
     config: &TestHarnessConfig,
+    sandbox: Arc<dyn BashSandbox>,
 ) -> Result<ToolExecutionResult, AgentError> {
     let framework_str = arguments.get("framework").and_then(|v| v.as_str());
     let file = arguments.get("file").and_then(|v| v.as_str());
 
-    let framework = if let Some(fw_str) = framework_str {
-        TestFramework::from_str_id(fw_str).ok_or_else(|| {
-            AgentError::ToolExecution(format!(
-                "Unknown test framework: '{}'. Supported: cargo, pytest, jest, vitest, go",
-                fw_str
-            ))
-        })?
-    } else {
-        let cwd = std::env::current_dir().unwrap_or_default();
-        let detected = detect_frameworks(&cwd);
-        detected.into_iter().next().ok_or_else(|| {
-            AgentError::ToolExecution(
-                "No test framework detected. Specify framework explicitly.".to_string(),
-            )
-        })?
-    };
+    let framework = resolve_framework(framework_str)?;
 
     let (cmd, base_args) = match framework.list_command() {
         Some(c) => c,
@@ -46,22 +34,16 @@ pub async fn execute_list_tests(
     let mut args: Vec<String> = base_args.iter().map(|s| s.to_string()).collect();
     framework.apply_filters(&mut args, file, None);
 
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(config.timeout_secs),
-        tokio::process::Command::new(cmd).args(&args).output(),
+    let output = run_under_sandbox(
+        sandbox.as_ref(),
+        cmd,
+        &args,
+        config.timeout_secs,
+        "Test list",
     )
-    .await
-    .map_err(|_| AgentError::ToolExecution("Test list timed out".to_string()))?
-    .map_err(|e| AgentError::ToolExecution(format!("Failed to execute {}: {}", cmd, e)))?;
-
-    let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
-    let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
-
-    let combined = if stderr.is_empty() {
-        stdout
-    } else {
-        format!("{}\n{}", stdout, stderr)
-    };
+    .await?;
+    let succeeded = output.success();
+    let combined = output.combined;
 
     let content = truncate_output(&combined, 32_768);
 
@@ -72,13 +54,13 @@ pub async fn execute_list_tests(
             file.map(|f| format!(" in {}", f)).unwrap_or_default(),
             content
         ),
-        is_error: !output.status.success(),
+        is_error: !succeeded,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::dev_tools::test_harness::types::TestFramework;
 
     #[test]
     fn test_framework_list_commands_exist() {

@@ -13,7 +13,7 @@ use super::types::{compute_iteration, SessionId, SessionMetadata, SessionSnapsho
 ///
 /// Stores sessions, messages, and steps in three tables:
 /// - `sessions` -- one row per session (metadata).
-/// - `session_messages` -- append-only message log per session.
+/// - `session_messages` -- the session's message log, replaced wholesale on each save.
 /// - `session_steps` -- JSONB array of step records per session.
 pub struct PostgresSessionStore {
     pool: PgPool,
@@ -215,11 +215,26 @@ impl SessionStorage for PostgresSessionStore {
         Ok(())
     }
 
-    async fn append_messages(
+    async fn save_messages(
         &self,
         session_id: &SessionId,
         messages: &[Message],
     ) -> Result<(), AgentError> {
+        // Replace the whole log rather than appending. The caller hands over the entire
+        // conversation on every iteration, so appending inserted all N messages again
+        // each time — O(n²) rows, and `load_messages` returned the conversation
+        // duplicated many times over. Compaction also rewrites history, so stale
+        // messages had to be cleared regardless.
+        //
+        // Delete and insert run in one transaction so a failure mid-write cannot leave
+        // the session with a partial or empty history.
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("DELETE FROM session_messages WHERE session_id = $1")
+            .bind(&session_id.0)
+            .execute(&mut *tx)
+            .await?;
+
         for msg in messages {
             let json_value =
                 serde_json::to_value(msg).map_err(|e| AgentError::Session(e.to_string()))?;
@@ -232,10 +247,11 @@ impl SessionStorage for PostgresSessionStore {
             )
             .bind(&session_id.0)
             .bind(json_value)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         }
 
+        tx.commit().await?;
         Ok(())
     }
 
@@ -498,10 +514,7 @@ mod tests {
             },
         ];
 
-        store
-            .append_messages(&metadata.id, &messages)
-            .await
-            .unwrap();
+        store.save_messages(&metadata.id, &messages).await.unwrap();
 
         let loaded = store.load_messages(&metadata.id).await.unwrap();
         assert_eq!(loaded.len(), 2);
@@ -563,7 +576,7 @@ mod tests {
         let metadata = store.create("Full snapshot test").await.unwrap();
 
         store
-            .append_messages(
+            .save_messages(
                 &metadata.id,
                 &[Message {
                     role: Role::User,
@@ -629,7 +642,7 @@ mod tests {
         let original = store.create("Fork source").await.unwrap();
 
         store
-            .append_messages(
+            .save_messages(
                 &original.id,
                 &[Message {
                     role: Role::User,
@@ -761,5 +774,41 @@ mod tests {
             SessionStatus::Paused
         );
         assert!(PostgresSessionStore::str_to_status("unknown").is_err());
+    }
+
+    // --- Shared backend contract ---
+    //
+    // The same assertions the file backend runs. Before the save_messages fix these
+    // failed outright: appending the whole conversation each iteration left O(n^2)
+    // rows and `load` returned the history duplicated many times over.
+
+    async fn conformance_store() -> PostgresSessionStore {
+        let pool = PgPool::connect("postgres://localhost/remix_test")
+            .await
+            .unwrap();
+        let store = PostgresSessionStore::new(pool, 100);
+        store.migrate().await.unwrap();
+        store
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires running PostgreSQL
+    async fn test_conformance_save_messages_is_idempotent() {
+        let store = conformance_store().await;
+        crate::session::conformance::assert_save_messages_is_idempotent(&store).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires running PostgreSQL
+    async fn test_conformance_save_messages_replaces_history() {
+        let store = conformance_store().await;
+        crate::session::conformance::assert_save_messages_replaces_history(&store).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires running PostgreSQL
+    async fn test_conformance_save_steps_is_idempotent() {
+        let store = conformance_store().await;
+        crate::session::conformance::assert_save_steps_is_idempotent(&store).await;
     }
 }

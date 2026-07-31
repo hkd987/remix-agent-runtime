@@ -1,5 +1,8 @@
 use std::collections::HashSet;
 
+/// Name of the meta-tool that searches the registry.
+pub const SEARCH_TOOLS_NAME: &str = "search_tools";
+
 use serde_json::json;
 
 use crate::llm::types::ToolDefinition;
@@ -109,7 +112,7 @@ impl ToolRegistry {
     /// Return the ToolDefinition for the search_tools meta-tool.
     pub fn search_tool_definition() -> ToolDefinition {
         ToolDefinition {
-            name: "search_tools".to_string(),
+            name: SEARCH_TOOLS_NAME.to_string(),
             description: "Search for available tools by keyword. Use this when you need a \
                           capability that isn't currently available. Returns matching tool names \
                           and descriptions."
@@ -136,7 +139,7 @@ impl ToolRegistry {
 
     /// Check if a tool name is the search_tools meta-tool.
     pub fn is_search_tool(name: &str) -> bool {
-        name == "search_tools"
+        name == SEARCH_TOOLS_NAME
     }
 
     /// Format search results as a human-readable string for the tool result.

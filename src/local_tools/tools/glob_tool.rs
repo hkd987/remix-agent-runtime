@@ -8,15 +8,12 @@ pub async fn execute_glob(
     args: Value,
     path_validator: &PathValidator,
 ) -> Result<ToolExecutionResult, AgentError> {
-    let pattern = args
-        .get("pattern")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AgentError::LocalTool("glob requires 'pattern' parameter".to_string()))?;
+    let args: super::params::GlobArgs = super::params::parse("glob", args)?;
+    let pattern = args.pattern.as_str();
 
-    let base_path = if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
-        path_validator.resolve_path(p)?
-    } else {
-        path_validator.root().to_path_buf()
+    let base_path = match args.path.as_deref() {
+        Some(p) => path_validator.resolve_path(p)?,
+        None => path_validator.root().to_path_buf(),
     };
 
     // Build full glob pattern
@@ -142,7 +139,7 @@ mod tests {
         let result = execute_glob(json!({}), &validator).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("requires 'pattern' parameter"));
+        assert!(err.contains("missing field `pattern`"));
     }
 
     #[tokio::test]

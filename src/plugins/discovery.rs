@@ -265,29 +265,37 @@ mod tests {
 
     #[test]
     fn test_has_any_components_skills() {
-        let mut c = PluginComponents::default();
-        c.has_skills = true;
+        let c = PluginComponents {
+            has_skills: true,
+            ..Default::default()
+        };
         assert!(has_any_components(&c));
     }
 
     #[test]
     fn test_has_any_components_mcp() {
-        let mut c = PluginComponents::default();
-        c.has_mcp_config = true;
+        let c = PluginComponents {
+            has_mcp_config: true,
+            ..Default::default()
+        };
         assert!(has_any_components(&c));
     }
 
     #[test]
     fn test_has_any_components_hooks() {
-        let mut c = PluginComponents::default();
-        c.has_hooks = true;
+        let c = PluginComponents {
+            has_hooks: true,
+            ..Default::default()
+        };
         assert!(has_any_components(&c));
     }
 
     #[test]
     fn test_has_any_components_agents() {
-        let mut c = PluginComponents::default();
-        c.has_agents = true;
+        let c = PluginComponents {
+            has_agents: true,
+            ..Default::default()
+        };
         assert!(has_any_components(&c));
     }
 
@@ -548,8 +556,10 @@ mod tests {
 
     #[test]
     fn test_discover_disabled_returns_empty() {
-        let mut config = PluginsConfig::default();
-        config.enabled = false;
+        let config = PluginsConfig {
+            enabled: false,
+            ..Default::default()
+        };
 
         let result = discover_all_plugins(&config).unwrap();
         assert!(result.is_empty());
@@ -557,9 +567,11 @@ mod tests {
 
     #[test]
     fn test_discover_no_sources_no_cache() {
-        let mut config = PluginsConfig::default();
-        config.claude_code_cache = false;
-        config.sources = Vec::new();
+        let config = PluginsConfig {
+            claude_code_cache: false,
+            sources: Vec::new(),
+            ..Default::default()
+        };
 
         let result = discover_all_plugins(&config).unwrap();
         assert!(result.is_empty());
@@ -572,13 +584,15 @@ mod tests {
         fs::create_dir_all(&plugin_dir).unwrap();
         fs::write(plugin_dir.join(".mcp.json"), "{}").unwrap();
 
-        let mut config = PluginsConfig::default();
-        config.claude_code_cache = false;
-        config.sources = vec![crate::config::schema::PluginSourceConfig {
-            path: Some(plugin_dir),
-            github: None,
-            git_ref: None,
-        }];
+        let config = PluginsConfig {
+            claude_code_cache: false,
+            sources: vec![crate::config::schema::PluginSourceConfig {
+                path: Some(plugin_dir),
+                github: None,
+                git_ref: None,
+            }],
+            ..Default::default()
+        };
 
         let result = discover_all_plugins(&config).unwrap();
         assert_eq!(result.len(), 1);
@@ -587,13 +601,15 @@ mod tests {
 
     #[test]
     fn test_discover_skips_nonexistent_local() {
-        let mut config = PluginsConfig::default();
-        config.claude_code_cache = false;
-        config.sources = vec![crate::config::schema::PluginSourceConfig {
-            path: Some(PathBuf::from("/nonexistent/plugin/path")),
-            github: None,
-            git_ref: None,
-        }];
+        let config = PluginsConfig {
+            claude_code_cache: false,
+            sources: vec![crate::config::schema::PluginSourceConfig {
+                path: Some(PathBuf::from("/nonexistent/plugin/path")),
+                github: None,
+                git_ref: None,
+            }],
+            ..Default::default()
+        };
 
         let result = discover_all_plugins(&config).unwrap();
         assert!(result.is_empty());
@@ -608,20 +624,22 @@ mod tests {
         fs::create_dir_all(&dir_a).unwrap();
         fs::create_dir_all(&dir_b).unwrap();
 
-        let mut config = PluginsConfig::default();
-        config.claude_code_cache = false;
-        config.sources = vec![
-            crate::config::schema::PluginSourceConfig {
-                path: Some(dir_a),
-                github: None,
-                git_ref: None,
-            },
-            crate::config::schema::PluginSourceConfig {
-                path: Some(dir_b),
-                github: None,
-                git_ref: None,
-            },
-        ];
+        let config = PluginsConfig {
+            claude_code_cache: false,
+            sources: vec![
+                crate::config::schema::PluginSourceConfig {
+                    path: Some(dir_a),
+                    github: None,
+                    git_ref: None,
+                },
+                crate::config::schema::PluginSourceConfig {
+                    path: Some(dir_b),
+                    github: None,
+                    git_ref: None,
+                },
+            ],
+            ..Default::default()
+        };
 
         let result = discover_all_plugins(&config).unwrap();
         assert_eq!(result.len(), 2);

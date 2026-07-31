@@ -9,19 +9,8 @@ pub async fn execute_read_file(
     path_validator: &PathValidator,
     max_bytes: usize,
 ) -> Result<ToolExecutionResult, AgentError> {
-    let path = args
-        .get("path")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AgentError::LocalTool("read_file requires 'path' parameter".to_string()))?;
-
-    let offset = args
-        .get("offset")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize);
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize);
+    let args: super::params::ReadFileArgs = super::params::parse("read_file", args)?;
+    let (path, offset, limit) = (args.path.as_str(), args.offset, args.limit);
 
     let resolved = path_validator.resolve_path(path)?;
 
@@ -195,7 +184,7 @@ mod tests {
         let result = execute_read_file(json!({}), &validator, 1_048_576).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("requires 'path' parameter"));
+        assert!(err.contains("missing field `path`"));
     }
 
     #[tokio::test]

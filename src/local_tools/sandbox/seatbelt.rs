@@ -62,35 +62,10 @@ fn regex_escape(s: &str) -> String {
 #[async_trait]
 impl BashSandbox for SeatbeltSandbox {
     async fn execute(&self, command: &str, timeout_secs: u64) -> Result<CommandOutput, AgentError> {
-        use std::time::Duration;
+        let mut cmd = tokio::process::Command::new("sandbox-exec");
+        cmd.args(["-p", &self.profile_content, "sh", "-c", command]);
 
-        let child = tokio::process::Command::new("sandbox-exec")
-            .args(["-p", &self.profile_content, "sh", "-c", command])
-            .current_dir(&self.root)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| {
-                AgentError::LocalTool(format!("Failed to spawn sandboxed command: {e}"))
-            })?;
-
-        let timeout = Duration::from_secs(timeout_secs);
-        let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
-
-        match result {
-            Ok(Ok(output)) => Ok(CommandOutput {
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                exit_code: output.status.code().unwrap_or(-1),
-            }),
-            Ok(Err(e)) => Err(AgentError::LocalTool(format!(
-                "Command execution failed: {e}"
-            ))),
-            Err(_) => Err(AgentError::LocalTool(format!(
-                "Command timed out after {timeout_secs}s"
-            ))),
-        }
+        super::run_with_timeout(cmd, &self.root, timeout_secs).await
     }
 
     fn root(&self) -> &Path {

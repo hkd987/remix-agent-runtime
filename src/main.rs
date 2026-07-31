@@ -36,7 +36,7 @@ async fn main() -> ExitCode {
     match cli.command {
         Commands::Run(args) => {
             // Set up logging
-            let filter = if args.verbose {
+            let filter = if args.common.verbose {
                 EnvFilter::new("remix_agent_runtime=debug")
             } else {
                 EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"))
@@ -70,6 +70,18 @@ async fn main() -> ExitCode {
                 && !config.llm.base_url.contains("127.0.0.1")
             {
                 eprintln!("Error: No API key provided. Use --api-key, REMIX_LLM_API_KEY env var, or config file.");
+                return ExitStatus::ConfigError.into();
+            }
+
+            // Apply a tenant profile, if the config carries one, before anything reads
+            // the limits it constrains.
+            remix_agent_runtime::tenant::isolation::apply_tenant_profile(&mut config);
+
+            // Reject config whose values are individually valid but collectively wrong.
+            // These used to warn and continue, producing a run that quietly behaved
+            // differently from what the config described.
+            if let Err(e) = config.validate() {
+                eprintln!("Error: invalid configuration: {e}");
                 return ExitStatus::ConfigError.into();
             }
 
@@ -307,10 +319,21 @@ async fn main() -> ExitCode {
                 }
             };
 
-            // Wrap with dev tools executor
+            // Wrap with dev tools executor. It shares the local tools' sandbox root so
+            // `run_tests` cannot reach outside the boundary the bash tool respects.
+            let dev_sandbox = match remix_agent_runtime::local_tools::sandbox::create_sandbox(
+                remix_agent_runtime::local_tools::executor::sandbox_root(&config.local_tools),
+            ) {
+                Ok(s) => std::sync::Arc::from(s),
+                Err(e) => {
+                    eprintln!("Error: Failed to initialize dev-tools sandbox: {e}");
+                    return ExitStatus::AgentError.into();
+                }
+            };
             let executor = remix_agent_runtime::dev_tools::DevToolsExecutor::new(
                 executor,
                 config.dev_tools.clone(),
+                dev_sandbox,
             );
             if config.dev_tools.enabled {
                 tracing::info!(
@@ -320,8 +343,11 @@ async fn main() -> ExitCode {
             }
 
             // Wrap with hook-aware executor
-            let executor =
-                HookAwareExecutor::new(executor, hook_registry, config.plugins.hook_timeout_secs);
+            let executor = HookAwareExecutor::new(
+                executor,
+                hook_registry.clone(),
+                config.plugins.hook_timeout_secs,
+            );
 
             // Wrap with permission-aware executor
             let permission_mode = match config.permissions.mode {
@@ -346,9 +372,19 @@ async fn main() -> ExitCode {
                 allowed_tools: config.permissions.allowed_tools.clone(),
                 denied_tools: config.permissions.denied_tools.clone(),
             };
-            let executor = PermissionAwareExecutor::new(executor, permission_policy);
+            if let Err(e) = permission_policy.validate() {
+                eprintln!("Error: invalid permission configuration: {e}");
+                return ExitStatus::ConfigError.into();
+            }
+            permission_policy.warn_if_permissive(false);
 
-            // Wrap with coordination executor (supersedes SubagentExecutor)
+            // Wrap with coordination executor (supersedes SubagentExecutor).
+            //
+            // This must sit *inside* PermissionAwareExecutor. CoordinationExecutor
+            // intercepts its virtual tools (spawn_agent, task_*, team_create,
+            // send_message) before delegating inward, so wrapping it on the outside
+            // would let those tools skip the policy entirely — including in Plan mode
+            // and including explicit denied_tools.
             let coordination_context =
                 std::sync::Arc::new(CoordinationContext::from_config(&config.coordination));
             let spawn_handler = std::sync::Arc::new(DefaultSpawnHandler::new(
@@ -360,6 +396,9 @@ async fn main() -> ExitCode {
                 config.coordination.clone(),
                 coordination_context.clone(),
                 config.agent.tool_result_max_bytes,
+                permission_policy.clone(),
+                hook_registry.clone(),
+                config.plugins.hook_timeout_secs,
             ));
             let executor = CoordinationExecutor::new(
                 executor,
@@ -368,6 +407,8 @@ async fn main() -> ExitCode {
                 "lead".to_string(),
             )
             .with_spawn_handler(spawn_handler);
+
+            let executor = PermissionAwareExecutor::new(executor, permission_policy);
 
             // Set up session store
             let session_store = if config.session.enabled {
@@ -411,10 +452,86 @@ async fn main() -> ExitCode {
             let thinking_control: std::sync::Arc<
                 dyn remix_agent_runtime::llm::client::ThinkingControl,
             > = llm_client.clone();
-            let runner = AgentRunner::new(llm_client, executor, agent_config)
+            // A dedicated (cheaper) compaction model, when configured. Previously every
+            // call site passed None, so `compaction_model` had no effect.
+            let compaction_llm = remix_agent_runtime::llm::client::build_compaction_client(
+                &config.llm,
+                &config.compaction,
+            );
+            if let Some(ref m) = config.compaction.compaction_model {
+                tracing::info!(model = %m, "Using dedicated compaction model");
+            }
+
+            // Dedicated client for the self-critique pass, when `self_critique.model`
+            // is configured. Previously model/max_tokens were declared and never read.
+            let critique_llm: Option<
+                std::sync::Arc<dyn remix_agent_runtime::llm::client::LlmProvider>,
+            > = config.agent.self_critique.as_ref().and_then(|sc| {
+                sc.model.as_ref().map(|model| {
+                    tracing::info!(model = %model, "Using dedicated self-critique model");
+                    let client: std::sync::Arc<dyn remix_agent_runtime::llm::client::LlmProvider> =
+                        std::sync::Arc::new(AnthropicClient::new(
+                            config.llm.base_url.clone(),
+                            config.llm.api_key.clone(),
+                            model.clone(),
+                            sc.max_tokens,
+                            config.llm.custom_headers.clone(),
+                            None,
+                            false,
+                        ));
+                    client
+                })
+            });
+
+            let mut runner = AgentRunner::new(llm_client, executor, agent_config)
                 .with_event_bus(event_bus)
-                .with_thinking_control(thinking_control);
-            let result = if let Some(ref session_id) = args.session_id {
+                .with_thinking_control(thinking_control)
+                .with_hooks(
+                    std::sync::Arc::new(hook_registry.clone()),
+                    config.plugins.hook_timeout_secs,
+                );
+            if let Some(c) = critique_llm {
+                runner = runner.with_critique_llm(c);
+            }
+            let runner = runner;
+            // `--continue` resumes the most recently updated session. The flag was
+            // parsed and stored but never read, so it silently did nothing.
+            let continue_session_id =
+                if args.common.continue_session && args.common.session_id.is_none() {
+                    match session_store.as_ref() {
+                        Some(store) => match store.list().await {
+                            Ok(sessions) => {
+                                match remix_agent_runtime::session::most_recent_session(&sessions) {
+                                    Some(latest) => {
+                                        tracing::info!(
+                                            session_id = %latest.id,
+                                            "Continuing most recent session"
+                                        );
+                                        Some(latest.id.0.clone())
+                                    }
+                                    None => {
+                                        eprintln!("Error: --continue found no previous session.");
+                                        return ExitStatus::ConfigError.into();
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Error: --continue could not list sessions: {e}");
+                                return ExitStatus::AgentError.into();
+                            }
+                        },
+                        None => {
+                            eprintln!("Error: --continue requires sessions to be enabled.");
+                            return ExitStatus::ConfigError.into();
+                        }
+                    }
+                } else {
+                    None
+                };
+
+            let resume_id = args.common.session_id.clone().or(continue_session_id);
+
+            let result = if let Some(ref session_id) = resume_id {
                 // Resume existing session
                 let store = session_store.as_ref().unwrap_or_else(|| {
                     eprintln!("Error: --session-id requires sessions to be enabled");
@@ -429,7 +546,9 @@ async fn main() -> ExitCode {
                         &skill_set,
                         &agents_md,
                         compaction_config.as_ref(),
-                        None,
+                        compaction_llm
+                            .as_ref()
+                            .map(|c| c as &dyn remix_agent_runtime::llm::client::LlmProvider),
                     )
                     .await
             } else if let Some(ref fork_id) = args.fork_session {
@@ -454,7 +573,9 @@ async fn main() -> ExitCode {
                                 &skill_set,
                                 &agents_md,
                                 compaction_config.as_ref(),
-                                None,
+                                compaction_llm.as_ref().map(|c| {
+                                    c as &dyn remix_agent_runtime::llm::client::LlmProvider
+                                }),
                             )
                             .await
                     }
@@ -474,7 +595,9 @@ async fn main() -> ExitCode {
                             .as_ref()
                             .map(|s| s as &dyn remix_agent_runtime::session::SessionStorage),
                         compaction_config.as_ref(),
-                        None,
+                        compaction_llm
+                            .as_ref()
+                            .map(|c| c as &dyn remix_agent_runtime::llm::client::LlmProvider),
                     )
                     .await
             };
@@ -482,6 +605,7 @@ async fn main() -> ExitCode {
             // Wait for any spawned child agents to complete
             let child_results = runner
                 .tools_ref()
+                .inner()
                 .wait_for_children(std::time::Duration::from_secs(
                     config.coordination.worker_timeout_secs,
                 ))
@@ -496,7 +620,7 @@ async fn main() -> ExitCode {
             }
 
             // Gracefully shut down all MCP connections
-            // Chain: CoordinationExecutor -> PermissionAwareExecutor -> HookAwareExecutor -> DevToolsExecutor -> LocalToolsExecutor -> SkillAwareExecutor -> CompositeToolExecutor
+            // Chain: PermissionAwareExecutor -> CoordinationExecutor -> HookAwareExecutor -> DevToolsExecutor -> LocalToolsExecutor -> SkillAwareExecutor -> CompositeToolExecutor
             runner
                 .into_tools()
                 .into_inner()
@@ -605,7 +729,7 @@ async fn run_chat(chat_args: ChatArgs) -> ExitCode {
     let run_args = chat_args.to_run_args();
 
     // Set up logging: suppress all output when not verbose to avoid bleeding into TUI
-    if chat_args.verbose {
+    if chat_args.common.verbose {
         let filter = EnvFilter::new("remix_agent_runtime=debug");
         tracing_subscriber::fmt()
             .with_env_filter(filter)
@@ -629,6 +753,14 @@ async fn run_chat(chat_args: ChatArgs) -> ExitCode {
         }
     };
 
+    // Same startup checks as `run`. Chat previously skipped both, so a tenant profile
+    // was ignored and an invalid config combination ran anyway.
+    remix_agent_runtime::tenant::isolation::apply_tenant_profile(&mut config);
+    if let Err(e) = config.validate() {
+        eprintln!("Error: invalid configuration: {e}");
+        return ExitStatus::ConfigError.into();
+    }
+
     // Validate API key (skip for localhost)
     if config.llm.api_key.is_empty()
         && !config.llm.base_url.contains("localhost")
@@ -641,7 +773,7 @@ async fn run_chat(chat_args: ChatArgs) -> ExitCode {
     }
 
     // Apply interactive defaults that differ from batch mode
-    if chat_args.system_prompt.is_none() && config.agent.system_prompt.is_none() {
+    if chat_args.common.system_prompt.is_none() && config.agent.system_prompt.is_none() {
         config.agent.system_prompt =
             Some(remix_agent_runtime::tui::prompt::INTERACTIVE_SYSTEM_PROMPT.to_string());
     }
@@ -796,11 +928,27 @@ async fn run_chat(chat_args: ChatArgs) -> ExitCode {
         }
     };
 
-    let executor =
-        remix_agent_runtime::dev_tools::DevToolsExecutor::new(executor, config.dev_tools.clone());
+    let dev_sandbox: std::sync::Arc<dyn remix_agent_runtime::local_tools::sandbox::BashSandbox> =
+        match remix_agent_runtime::local_tools::sandbox::create_sandbox(
+            remix_agent_runtime::local_tools::executor::sandbox_root(&config.local_tools),
+        ) {
+            Ok(s) => std::sync::Arc::from(s),
+            Err(e) => {
+                eprintln!("Error: Failed to initialize dev-tools sandbox: {e}");
+                return ExitStatus::AgentError.into();
+            }
+        };
+    let executor = remix_agent_runtime::dev_tools::DevToolsExecutor::new(
+        executor,
+        config.dev_tools.clone(),
+        dev_sandbox,
+    );
 
-    let executor =
-        HookAwareExecutor::new(executor, hook_registry, config.plugins.hook_timeout_secs);
+    let executor = HookAwareExecutor::new(
+        executor,
+        hook_registry.clone(),
+        config.plugins.hook_timeout_secs,
+    );
 
     let permission_mode = match config.permissions.mode {
         remix_agent_runtime::config::schema::PermissionModeConfig::Default => {
@@ -822,8 +970,14 @@ async fn run_chat(chat_args: ChatArgs) -> ExitCode {
         allowed_tools: config.permissions.allowed_tools.clone(),
         denied_tools: config.permissions.denied_tools.clone(),
     };
-    let executor = PermissionAwareExecutor::new(executor, permission_policy);
+    if let Err(e) = permission_policy.validate() {
+        eprintln!("Error: invalid permission configuration: {e}");
+        return ExitStatus::ConfigError.into();
+    }
+    permission_policy.warn_if_permissive(true);
 
+    // CoordinationExecutor must sit inside PermissionAwareExecutor — see the comment
+    // on the equivalent chain in `run_agent`.
     let coordination_context =
         std::sync::Arc::new(CoordinationContext::from_config(&config.coordination));
     let spawn_handler = std::sync::Arc::new(DefaultSpawnHandler::new(
@@ -835,6 +989,9 @@ async fn run_chat(chat_args: ChatArgs) -> ExitCode {
         config.coordination.clone(),
         coordination_context.clone(),
         config.agent.tool_result_max_bytes,
+        permission_policy.clone(),
+        hook_registry.clone(),
+        config.plugins.hook_timeout_secs,
     ));
     let executor = CoordinationExecutor::new(
         executor,
@@ -843,6 +1000,8 @@ async fn run_chat(chat_args: ChatArgs) -> ExitCode {
         "lead".to_string(),
     )
     .with_spawn_handler(spawn_handler);
+
+    let executor = PermissionAwareExecutor::new(executor, permission_policy);
 
     // Session store
     let session_store = if config.session.enabled {
@@ -867,11 +1026,47 @@ async fn run_chat(chat_args: ChatArgs) -> ExitCode {
     // Build AgentRunner
     let thinking_control: std::sync::Arc<dyn remix_agent_runtime::llm::client::ThinkingControl> =
         llm_client.clone();
-    let runner = AgentRunner::new(llm_client, executor, agent_config)
+    // The interactive loop runs self-critique too, so it needs the same dedicated
+    // client the run path gets when `self_critique.model` is configured.
+    let critique_llm: Option<std::sync::Arc<dyn remix_agent_runtime::llm::client::LlmProvider>> =
+        config.agent.self_critique.as_ref().and_then(|sc| {
+            sc.model.as_ref().map(|model| {
+                tracing::info!(model = %model, "Using dedicated self-critique model");
+                let client: std::sync::Arc<dyn remix_agent_runtime::llm::client::LlmProvider> =
+                    std::sync::Arc::new(AnthropicClient::new(
+                        config.llm.base_url.clone(),
+                        config.llm.api_key.clone(),
+                        model.clone(),
+                        sc.max_tokens,
+                        config.llm.custom_headers.clone(),
+                        None,
+                        false,
+                    ));
+                client
+            })
+        });
+
+    let mut runner = AgentRunner::new(llm_client, executor, agent_config)
+        .with_hooks(
+            std::sync::Arc::new(hook_registry.clone()),
+            config.plugins.hook_timeout_secs,
+        )
         .with_event_bus(event_bus.clone())
         .with_thinking_control(thinking_control);
+    if let Some(c) = critique_llm {
+        runner = runner.with_critique_llm(c);
+    }
+    let runner = runner;
 
     // Launch TUI
+    // Same dedicated compaction client the run path builds.
+    let compaction_llm: Option<std::sync::Arc<dyn remix_agent_runtime::llm::client::LlmProvider>> =
+        remix_agent_runtime::llm::client::build_compaction_client(&config.llm, &config.compaction)
+            .map(|c| std::sync::Arc::new(c) as std::sync::Arc<_>);
+    if let Some(ref m) = config.compaction.compaction_model {
+        tracing::info!(model = %m, "Using dedicated compaction model");
+    }
+
     remix_agent_runtime::tui::run_tui(
         runner,
         event_bus,
@@ -880,6 +1075,7 @@ async fn run_chat(chat_args: ChatArgs) -> ExitCode {
         agents_md,
         session_store,
         compaction_config,
+        compaction_llm,
         config.llm.model.clone(),
     )
     .await

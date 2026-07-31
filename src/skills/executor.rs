@@ -6,6 +6,7 @@ use std::time::Duration;
 use crate::browser::mcp::{ToolExecutionResult, ToolExecutor};
 use crate::error::AgentError;
 use crate::llm::types::ToolDefinition;
+use crate::local_tools::tools::output_filter::strip_ansi;
 
 use super::types::SkillSet;
 
@@ -135,25 +136,50 @@ impl<T: ToolExecutor> SkillAwareExecutor<T> {
 
         let timeout = Duration::from_secs(self.script_timeout_secs);
 
+        // Skill scripts deliberately do not run under `BashSandbox`. A skill is
+        // user-installed content that lives outside the agent's sandbox root and is
+        // executed by absolute path with its own directory as the working directory, so
+        // confining it to the sandbox root would break any skill that reads its own
+        // bundled resources. The trust boundary is skill installation, not this call.
         let mut cmd = tokio::process::Command::new(&script_path);
         cmd.args(&args)
             .current_dir(&entry.dir_path)
+            // `spawn` + `wait_with_output` does not pipe stdio the way `output` does;
+            // without these the child inherits the agent's streams and captures nothing.
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
 
-        let output = tokio::time::timeout(timeout, cmd.output())
-            .await
-            .map_err(|_| {
-                AgentError::Skill(format!(
+        // Own process group, so a timeout kills anything the script forked rather than
+        // just the script itself.
+        #[cfg(unix)]
+        cmd.process_group(0);
+
+        let child = cmd.spawn().map_err(|e| {
+            AgentError::Skill(format!("Failed to execute script '{}': {e}", script))
+        })?;
+
+        #[cfg(unix)]
+        let child_pid = child.id();
+
+        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+            Ok(res) => res.map_err(|e| {
+                AgentError::Skill(format!("Failed to execute script '{}': {e}", script))
+            })?,
+            Err(_) => {
+                #[cfg(unix)]
+                crate::local_tools::sandbox::kill_process_group(child_pid);
+                return Err(AgentError::Skill(format!(
                     "Script '{}' timed out after {}s",
                     script, self.script_timeout_secs
-                ))
-            })?
-            .map_err(|e| {
-                AgentError::Skill(format!("Failed to execute script '{}': {e}", script))
-            })?;
+                )));
+            }
+        };
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Strip terminal escape codes before the output reaches the model — raw ANSI
+        // sequences are pure context-window waste.
+        let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
+        let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
 
         let mut result_text = String::new();
         if !stdout.is_empty() {
@@ -327,7 +353,7 @@ fn virtual_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["name"]
             }),
             cache_control: None,
-            read_only: false,
+            read_only: true,
         },
         ToolDefinition {
             name: "run_skill_script".to_string(),
@@ -372,7 +398,7 @@ fn virtual_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["skill_name", "path"]
             }),
             cache_control: None,
-            read_only: false,
+            read_only: true,
         },
     ]
 }

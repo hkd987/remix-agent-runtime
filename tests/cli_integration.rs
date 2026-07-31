@@ -3,7 +3,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 
 fn cmd() -> Command {
-    cargo_bin_cmd!("remix-agent").into()
+    cargo_bin_cmd!("remix-agent")
 }
 
 #[test]
@@ -67,4 +67,49 @@ fn test_run_missing_config_file_fails() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("Failed to read config"));
+}
+
+/// The shipped example config must actually deserialize into `AppConfig`.
+///
+/// Nothing validated it, so it could rot silently — and with `deny_unknown_fields` now
+/// in place, a stale key in the example would be an error rather than a no-op.
+#[test]
+fn example_benchmark_config_parses() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/harness/coding-benchmark.yaml"
+    );
+    let yaml = std::fs::read_to_string(path).expect("example config should exist");
+    let config: remix_agent_runtime::config::schema::AppConfig =
+        serde_yaml::from_str(&yaml).expect("example config should deserialize");
+    config
+        .validate()
+        .expect("example config should pass validation");
+    assert!(config.task.is_some(), "example should define a task");
+}
+
+/// `--continue` must fail loudly when there is nothing to continue.
+///
+/// The flag parsed into a field that was only ever written, never read, so it silently
+/// did nothing at all. This asserts it now reaches the resume path.
+#[test]
+fn continue_without_a_prior_session_reports_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = cargo_bin_cmd!("remix-agent")
+        .arg("run")
+        .arg("--continue")
+        .arg("--session-dir")
+        .arg(dir.path())
+        .arg("--api-key")
+        .arg("test-key")
+        .arg("--no-browser")
+        .arg("some task")
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--continue found no previous session"),
+        "expected --continue to report an empty session store, got: {stderr}"
+    );
 }

@@ -140,7 +140,7 @@ impl SessionStorage for FileSessionStore {
         .await
     }
 
-    async fn append_messages(
+    async fn save_messages(
         &self,
         session_id: &SessionId,
         messages: &[Message],
@@ -450,16 +450,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_messages_creates_jsonl() {
+    async fn test_save_messages_creates_jsonl() {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp);
         let metadata = store.create("Test task").await.unwrap();
 
         let messages = vec![sample_message("Hello"), sample_message("How are you?")];
-        store
-            .append_messages(&metadata.id, &messages)
-            .await
-            .unwrap();
+        store.save_messages(&metadata.id, &messages).await.unwrap();
 
         // Verify file contents
         let path = tmp.path().join(&metadata.id.0).join("messages.jsonl");
@@ -476,18 +473,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_messages_truncates_on_full_write() {
+    async fn test_save_messages_truncates_on_full_write() {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp);
         let metadata = store.create("Test task").await.unwrap();
 
         store
-            .append_messages(&metadata.id, &[sample_message("First")])
+            .save_messages(&metadata.id, &[sample_message("First")])
             .await
             .unwrap();
         // Second call with only one message should truncate the file, not append
         store
-            .append_messages(&metadata.id, &[sample_message("Second")])
+            .save_messages(&metadata.id, &[sample_message("Second")])
             .await
             .unwrap();
 
@@ -526,7 +523,7 @@ mod tests {
         let metadata = store.create("Navigate to example.com").await.unwrap();
 
         store
-            .append_messages(&metadata.id, &[sample_message("Go to example.com")])
+            .save_messages(&metadata.id, &[sample_message("Go to example.com")])
             .await
             .unwrap();
         store
@@ -590,7 +587,7 @@ mod tests {
         let original = store.create("Original task").await.unwrap();
 
         store
-            .append_messages(&original.id, &[sample_message("Hello")])
+            .save_messages(&original.id, &[sample_message("Hello")])
             .await
             .unwrap();
         store
@@ -612,7 +609,7 @@ mod tests {
         let original = store.create("Original task").await.unwrap();
 
         store
-            .append_messages(
+            .save_messages(
                 &original.id,
                 &[sample_message("Hello"), sample_message("World")],
             )
@@ -664,13 +661,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_messages_nonexistent_session() {
+    async fn test_save_messages_nonexistent_session() {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp);
         let fake_id = SessionId("nonexistent".to_string());
 
         let result = store
-            .append_messages(&fake_id, &[sample_message("Hello")])
+            .save_messages(&fake_id, &[sample_message("Hello")])
             .await;
         assert!(result.is_err());
     }
@@ -721,10 +718,7 @@ mod tests {
         let metadata = store.create("Test task").await.unwrap();
 
         let messages = vec![sample_message("Hello"), sample_message("World")];
-        store
-            .append_messages(&metadata.id, &messages)
-            .await
-            .unwrap();
+        store.save_messages(&metadata.id, &messages).await.unwrap();
 
         let loaded = store.load_messages(&metadata.id).await.unwrap();
         assert_eq!(loaded.len(), 2);
@@ -752,5 +746,32 @@ mod tests {
 
         let loaded = dyn_store.load_metadata(&metadata.id).await.unwrap();
         assert_eq!(loaded.task, "Test via trait object");
+    }
+
+    // --- Shared backend contract ---
+    //
+    // These run the same assertions the Postgres backend must satisfy. The Postgres
+    // store duplicated the entire conversation on every iteration for want of exactly
+    // this check.
+
+    #[tokio::test]
+    async fn test_conformance_save_messages_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        crate::session::conformance::assert_save_messages_is_idempotent(&store).await;
+    }
+
+    #[tokio::test]
+    async fn test_conformance_save_messages_replaces_history() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        crate::session::conformance::assert_save_messages_replaces_history(&store).await;
+    }
+
+    #[tokio::test]
+    async fn test_conformance_save_steps_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        crate::session::conformance::assert_save_steps_is_idempotent(&store).await;
     }
 }

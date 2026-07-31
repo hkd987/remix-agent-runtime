@@ -2,7 +2,7 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::browser::mcp::ToolExecutor;
 use crate::config::credentials::{inject_credentials_into_system_prompt, CredentialSet};
@@ -25,10 +25,29 @@ use super::compaction_stages;
 use super::reminders::ReminderScheduler;
 use super::self_critique;
 use super::state::AgentState;
-use super::tool_registry::ToolRegistry;
+use super::tool_registry::{ToolRegistry, SEARCH_TOOLS_NAME};
 
 /// Message injected when the LLM returns text-only without using any tools.
 const NUDGE_MESSAGE: &str = "You provided analysis but did not take any action. Continue with the implementation. Use tools to make progress on the task.";
+
+/// Place a cache breakpoint on the tool definitions.
+///
+/// The tool block is large, identical on every request, and sits immediately after the
+/// system prompt, so it is the single best cache candidate after the system blocks —
+/// and it was being re-sent uncached on every iteration. Anthropic allows up to four
+/// breakpoints and caches everything *before* each one, so marking the last definition
+/// covers the whole block.
+fn mark_tools_cacheable(tools: &mut [ToolDefinition]) {
+    if let Some(last) = tools.last_mut() {
+        last.cache_control = Some(CacheControl::ephemeral());
+    }
+}
+
+// The conversation prefix is cached too — see `conversation_cache_breakpoint` in
+// `llm::types`, which the client applies at the serialization boundary.
+
+/// Message injected when a response is cut off by the output token limit.
+const TRUNCATION_MESSAGE: &str = "Your previous response was cut off because it reached the output token limit. Continue from exactly where you stopped. Do not repeat what you already produced.";
 
 /// Message injected for a one-time goal check before the agent terminates.
 const GOAL_CHECK_BASE: &str = "STOP. Before you finish, re-read the ORIGINAL TASK below and verify ALL requirements and constraints are met:\n\n\
@@ -56,6 +75,15 @@ pub struct AgentRunner<L: LlmProvider, T: ToolExecutor> {
     config: AgentConfig,
     event_bus: Option<Arc<EventBus>>,
     thinking_control: Option<Arc<dyn crate::llm::client::ThinkingControl>>,
+    /// Registry for lifecycle hooks (SessionStart, SessionEnd, Stop, PreCompact).
+    ///
+    /// These are not tool calls, so they never reach `HookAwareExecutor`, which is a
+    /// `ToolExecutor` decorator. The runner is the only layer that knows when a session
+    /// starts, stops, or compacts, so it fires them.
+    hooks: Option<(Arc<crate::plugins::components::hooks::HookRegistry>, u64)>,
+    /// Dedicated client for self-critique, honouring `self_critique.model` and
+    /// `self_critique.max_tokens`. Falls back to the primary client when unset.
+    critique_llm: Option<Arc<dyn LlmProvider>>,
 }
 
 impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
@@ -66,6 +94,41 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             config,
             event_bus: None,
             thinking_control: None,
+            hooks: None,
+            critique_llm: None,
+        }
+    }
+
+    /// Attach a dedicated client for the self-critique pass.
+    pub fn with_critique_llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
+        self.critique_llm = Some(llm);
+        self
+    }
+
+    /// Attach a hook registry so the runner can fire lifecycle hooks.
+    pub fn with_hooks(
+        mut self,
+        registry: Arc<crate::plugins::components::hooks::HookRegistry>,
+        timeout_secs: u64,
+    ) -> Self {
+        self.hooks = Some((registry, timeout_secs));
+        self
+    }
+
+    /// Fire lifecycle hooks for `timing`, if a registry is attached.
+    async fn fire_lifecycle(
+        &self,
+        timing: crate::plugins::components::hooks::HookTiming,
+        context: Value,
+    ) {
+        if let Some((registry, timeout_secs)) = &self.hooks {
+            crate::plugins::hook_executor::fire_lifecycle_hooks(
+                registry,
+                *timeout_secs,
+                &timing,
+                context,
+            )
+            .await;
         }
     }
 
@@ -115,6 +178,177 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         self.emit_response_content_events(&content);
         state.add_assistant_message(content);
         state.inject_system_notification(NUDGE_MESSAGE);
+        None
+    }
+
+    /// Run everything that must happen before the LLM call each iteration.
+    ///
+    /// This exists because the same pre-flight was written out three times — once per
+    /// loop — and had already drifted: `resume` was missing loop detection, reasoning
+    /// stages and the budget warning entirely, and the batch loop ran the reminder
+    /// scheduler twice per iteration while `resume` ran it once. Every loop now calls
+    /// this, so a new pre-flight step is added in one place.
+    fn prepare_iteration(&self, state: &mut AgentState, reminder_scheduler: &ReminderScheduler) {
+        // Action progress reminder
+        if let Some(reminder) = self.build_action_reminder(state) {
+            state.inject_system_notification(&reminder);
+        }
+
+        // Iteration budget warning (one-time)
+        if let Some(warning) = self.build_budget_warning(state) {
+            state.inject_system_notification(&warning);
+        }
+
+        // Loop detection. Warnings are latched: the detectors re-scan the same window
+        // each iteration, so an un-latched warning repeats until the window rolls over.
+        if let Some(ref loop_config) = self.config.loop_detection {
+            if let Some(warning) = super::loop_detection::detect_loop(state.steps(), loop_config) {
+                state.inject_warning_once(&warning);
+            }
+
+            // Semantic loop detection (test-without-modify)
+            if let Some(warning) =
+                super::loop_detection::detect_semantic_loop(state.steps(), loop_config)
+            {
+                state.inject_warning_once(&warning);
+            }
+        }
+
+        // System reminders. Called once per iteration, before the LLM call — the
+        // `EveryNIterations` arm ignores pending tools, so calling it again after the
+        // response simply fired the same reminder twice.
+        if !reminder_scheduler.is_empty() {
+            for reminder in reminder_scheduler.check(state.current_iteration(), &[]) {
+                state.inject_system_notification(&reminder);
+            }
+        }
+
+        // Reasoning budget stages: adjust thinking budget based on phase
+        if let (Some(ref stages_config), Some(ref thinking_ctl)) =
+            (&self.config.reasoning_stages, &self.thinking_control)
+        {
+            let budget = super::reasoning_stages::compute_thinking_budget(
+                stages_config,
+                state.current_iteration(),
+                self.config.max_iterations,
+            );
+            thinking_ctl
+                .set_thinking_config(Some(crate::llm::types::ThinkingConfig::enabled(budget)));
+        }
+    }
+
+    /// Run the self-critique pass on planned actions.
+    ///
+    /// Returns `Some(content)` when the actions were approved (or critique is disabled)
+    /// and the caller should execute them, `None` when they were rejected and the
+    /// caller should `continue` the loop.
+    ///
+    /// Extracted so the interactive loop gets it too — it was implemented only in the
+    /// batch loop, so a chat session silently ran without the critic its config asked
+    /// for.
+    async fn run_self_critique(
+        &self,
+        state: &mut AgentState,
+        assistant_content: Vec<ContentBlock>,
+        task: &str,
+        critique_rounds: &mut u32,
+    ) -> Option<Vec<ContentBlock>> {
+        let Some(ref critique_config) = self.config.self_critique else {
+            return Some(assistant_content);
+        };
+        if *critique_rounds >= critique_config.max_rounds
+            || !self_critique::should_critique(critique_config, &assistant_content)
+        {
+            return Some(assistant_content);
+        }
+
+        debug!("Running self-critique on planned actions");
+        let critique_prompt = self_critique::build_critique_prompt(&assistant_content, task);
+        let critique_system = [SystemContent::text(self_critique::CRITIQUE_SYSTEM_PROMPT)];
+        let critique_messages = vec![crate::llm::types::Message {
+            role: crate::llm::types::Role::User,
+            content: vec![ContentBlock::Text {
+                text: critique_prompt,
+            }],
+        }];
+
+        // Use the configured critique model when one was wired in, falling back to the
+        // primary client. The client is injected rather than built here so the runner
+        // stays generic over the provider.
+        let critique_provider: &dyn LlmProvider = match self.critique_llm.as_deref() {
+            Some(c) => c,
+            None => &self.llm,
+        };
+
+        let Ok(critique_response) = critique_provider
+            .send_messages(Some(&critique_system), &critique_messages, None)
+            .await
+        else {
+            warn!("Self-critique request failed; proceeding with the planned actions");
+            return Some(assistant_content);
+        };
+
+        let critique_text = critique_response
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let result = self_critique::parse_critique_response(&critique_text);
+        if result.approved {
+            return Some(assistant_content);
+        }
+
+        *critique_rounds += 1;
+        info!(
+            round = *critique_rounds,
+            max_rounds = critique_config.max_rounds,
+            "Self-critique rejected actions: {}",
+            result.reasoning
+        );
+        let feedback = format!(
+            "[SELF_CRITIQUE] Your planned actions were rejected.\nReason: {}\n{}Please revise your approach.",
+            result.reasoning,
+            result
+                .suggestions
+                .map(|s| format!("Suggestions: {s}\n"))
+                .unwrap_or_default(),
+        );
+        // The rejected content carries tool_use blocks by construction, so each one
+        // needs a tool_result.
+        state.add_assistant_message_refusing_tools(assistant_content, &feedback);
+        None
+    }
+
+    /// Ask the model to continue a response that was cut off by the output token cap.
+    ///
+    /// Returns `None` if a continuation was requested (caller should `continue` the
+    /// loop), `Some(content)` if the attempt budget is exhausted and the caller should
+    /// terminate with whatever text arrived.
+    fn try_continue_truncated(
+        &self,
+        state: &mut AgentState,
+        content: Vec<ContentBlock>,
+        continuation_count: &mut u32,
+    ) -> Option<Vec<ContentBlock>> {
+        if *continuation_count >= self.config.nudge_max_count {
+            warn!(
+                attempts = *continuation_count,
+                "Response repeatedly truncated at max_tokens; returning partial output"
+            );
+            return Some(content);
+        }
+        *continuation_count += 1;
+        info!(
+            attempt = *continuation_count,
+            "Response truncated at max_tokens, requesting continuation"
+        );
+        self.emit_response_content_events(&content);
+        state.add_assistant_message_refusing_tools(content, TRUNCATION_MESSAGE);
         None
     }
 
@@ -208,95 +442,28 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
 
     /// Returns `true` for tools that only read state.
     /// Used for plan mode filtering and potential future parallel execution.
-    pub fn is_read_only_tool(name: &str) -> bool {
-        matches!(
-            name,
-            "read_file"
-                | "grep"
-                | "glob"
-                | "list_files"
-                | "screenshot"
-                | "get_page_info"
-                | "get_console_logs"
-                | "get_page_content"
-                | "search_tools"
-        )
+    /// Whether a tool is read-only, according to the definitions currently in scope.
+    ///
+    /// Reads the declaration rather than a hardcoded name list. There used to be three
+    /// such lists — here and twice in `permissions` — and they had already drifted, so
+    /// plan mode advertised tools that were then refused at execution and refused tools
+    /// it never advertised.
+    fn is_read_only_tool(tools: &[ToolDefinition], name: &str) -> bool {
+        // `search_tools` is a meta-tool synthesized by the registry rather than a
+        // registered definition, and it only queries the registry.
+        if name == SEARCH_TOOLS_NAME {
+            return true;
+        }
+        tools
+            .iter()
+            .find(|t| t.name == name)
+            .map(|t| t.read_only)
+            .unwrap_or(false)
     }
 
     /// Filter tool definitions to only include read-only tools (for plan mode).
     fn filter_read_only_tools(tools: &[ToolDefinition]) -> Vec<ToolDefinition> {
-        tools
-            .iter()
-            .filter(|t| t.read_only || Self::is_read_only_tool(&t.name))
-            .cloned()
-            .collect()
-    }
-
-    /// Execute tool_use blocks from an assistant response sequentially.
-    ///
-    /// Returns `(tool_results, step_records)` preserving the original block order.
-    #[cfg(test)]
-    async fn execute_tools(
-        &self,
-        assistant_content: &[ContentBlock],
-        iteration: u32,
-    ) -> (Vec<ContentBlock>, Vec<StepRecord>) {
-        let mut tool_results = Vec::new();
-        let mut step_records = Vec::new();
-
-        for block in assistant_content {
-            match block {
-                ContentBlock::ToolUse { id, name, input } => {
-                    debug!(tool = %name, "Executing tool");
-                    events::emit(
-                        &self.event_bus,
-                        AgentEvent::ToolUseStart {
-                            id: id.clone(),
-                            name: name.clone(),
-                            input: input.clone(),
-                        },
-                    );
-                    let step_start = Instant::now();
-                    let exec_result = self.tools.execute_tool(name, input.clone()).await;
-                    let step_duration = step_start.elapsed().as_millis() as u64;
-                    let (content_block, step) = Self::process_tool_result(
-                        id,
-                        name,
-                        input,
-                        exec_result,
-                        step_duration,
-                        iteration,
-                    );
-                    events::emit(
-                        &self.event_bus,
-                        AgentEvent::ToolUseResult {
-                            id: id.clone(),
-                            name: name.clone(),
-                            output: step.output.clone(),
-                            duration_ms: step.duration_ms,
-                            is_error: step.is_error.unwrap_or(false),
-                        },
-                    );
-                    tool_results.push(content_block);
-                    step_records.push(step);
-                }
-                ContentBlock::Thinking { thinking, .. } => {
-                    debug!(
-                        thinking_length = thinking.len(),
-                        "Model produced thinking block"
-                    );
-                    events::emit(
-                        &self.event_bus,
-                        AgentEvent::ThinkingComplete {
-                            thinking: thinking.clone(),
-                        },
-                    );
-                }
-                _ => {}
-            }
-        }
-
-        (tool_results, step_records)
+        tools.iter().filter(|t| t.read_only).cloned().collect()
     }
 
     /// Process a single tool execution result into a ContentBlock and StepRecord.
@@ -371,7 +538,9 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         compaction_config: Option<&CompactionConfig>,
         compaction_llm: Option<&dyn LlmProvider>,
     ) -> Result<AgentResult, AgentError> {
-        // Validate reasoning stages config if present
+        // Reasoning-stage thresholds are validated at startup by `AppConfig::validate`,
+        // which errors rather than warning. This is a defensive check for callers that
+        // construct an AgentConfig directly (tests, embedders).
         if let Some(ref stages_config) = self.config.reasoning_stages {
             if let Err(e) = super::reasoning_stages::validate_config(stages_config) {
                 warn!("{}", e);
@@ -387,6 +556,12 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 timestamp_ms: chrono::Utc::now().timestamp_millis() as u64,
             },
         );
+
+        self.fire_lifecycle(
+            crate::plugins::components::hooks::HookTiming::SessionStart,
+            serde_json::json!({ "task": task }),
+        )
+        .await;
 
         // Create session if store is provided
         let session_metadata = if let Some(store) = session_store {
@@ -441,7 +616,9 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         };
 
         // Feature 1: Lazy tool discovery — build registry only when needed
-        let all_tool_defs = self.tools.tool_definitions().to_vec();
+
+        let mut all_tool_defs = self.tools.tool_definitions().to_vec();
+        mark_tools_cacheable(&mut all_tool_defs);
         let mut tool_registry = if self.config.lazy_tool_discovery {
             let always_avail = ALWAYS_AVAILABLE_TOOLS
                 .iter()
@@ -458,6 +635,10 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         let timeout_ms = self.config.timeout_secs * 1000;
         let mut nudge_count: u32 = 0;
         let mut goal_check_fired = false;
+        // Self-critique rejections were unbounded: `max_rounds` was declared in config
+        // and never read, so a critic that kept rejecting could loop until the
+        // iteration cap.
+        let mut critique_rounds: u32 = 0;
 
         loop {
             if state.current_iteration() >= self.config.max_iterations {
@@ -472,8 +653,32 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     SessionStatus::Completed,
                 )
                 .await;
-                self.emit_completed(AgentStatus::MaxIterations, None, &state);
+                self.emit_completed(AgentStatus::MaxIterations, None, &state)
+                    .await;
                 return Ok(state.into_result(AgentStatus::MaxIterations, None));
+            }
+
+            // Budget check. `max_budget_usd` was declared in config and documented but
+            // never compared against anything, so a runaway agent could spend without
+            // limit while the knob appeared to be doing something.
+            if let Some(max_budget) = self.config.max_budget_usd {
+                if state.total_cost() >= max_budget {
+                    info!(
+                        spent_usd = state.total_cost(),
+                        budget_usd = max_budget,
+                        "Budget exhausted"
+                    );
+                    self.finalize_session(
+                        session_store,
+                        &session_metadata,
+                        &state,
+                        SessionStatus::Completed,
+                    )
+                    .await;
+                    self.emit_completed(AgentStatus::BudgetExceeded, None, &state)
+                        .await;
+                    return Ok(state.into_result(AgentStatus::BudgetExceeded, None));
+                }
             }
 
             if state.elapsed_ms() >= timeout_ms {
@@ -485,7 +690,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     SessionStatus::Completed,
                 )
                 .await;
-                self.emit_completed(AgentStatus::Timeout, None, &state);
+                self.emit_completed(AgentStatus::Timeout, None, &state)
+                    .await;
                 return Ok(state.into_result(AgentStatus::Timeout, None));
             }
 
@@ -505,53 +711,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 },
             );
 
-            // Action progress reminder
-            if let Some(reminder) = self.build_action_reminder(&state) {
-                state.inject_system_notification(&reminder);
-            }
-
-            // Iteration budget warning (one-time)
-            if let Some(warning) = self.build_budget_warning(&state) {
-                state.inject_system_notification(&warning);
-            }
-
-            // Loop detection
-            if let Some(ref loop_config) = self.config.loop_detection {
-                if let Some(warning) =
-                    super::loop_detection::detect_loop(state.steps(), loop_config)
-                {
-                    state.inject_system_notification(&warning);
-                }
-
-                // Semantic loop detection (test-without-modify)
-                if let Some(warning) =
-                    super::loop_detection::detect_semantic_loop(state.steps(), loop_config)
-                {
-                    state.inject_system_notification(&warning);
-                }
-            }
-
-            // Feature 5: Check system reminders before LLM call
-            if !reminder_scheduler.is_empty() {
-                let pending_tools: Vec<String> = Vec::new(); // pre-execution, no pending tools yet
-                let reminders = reminder_scheduler.check(state.current_iteration(), &pending_tools);
-                for reminder in reminders {
-                    state.inject_system_notification(&reminder);
-                }
-            }
-
-            // Reasoning budget stages: adjust thinking budget based on phase
-            if let (Some(ref stages_config), Some(ref thinking_ctl)) =
-                (&self.config.reasoning_stages, &self.thinking_control)
-            {
-                let budget = super::reasoning_stages::compute_thinking_budget(
-                    stages_config,
-                    state.current_iteration(),
-                    self.config.max_iterations,
-                );
-                thinking_ctl
-                    .set_thinking_config(Some(crate::llm::types::ThinkingConfig::enabled(budget)));
-            }
+            self.prepare_iteration(&mut state, &reminder_scheduler);
 
             // Feature 1 + 4: Resolve tool definitions based on mode
             let effective_tool_defs: Cow<'_, [ToolDefinition]> =
@@ -575,11 +735,69 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     state.messages(),
                     Some(&effective_tool_defs),
                 )
-                .await?;
+                .await;
+
+            // Do not let the `?` shortcut skip teardown: without this the persisted
+            // session stays stuck in its pre-existing status and no terminal event ever
+            // reaches the event bus, so a subscriber sees the run simply stop.
+            // A context-overflow 400 is recoverable: compact and retry once rather than
+            // ending the run. The proactive threshold can be overshot by a single large
+            // tool result, and before this that was fatal.
+            let response = match response {
+                Ok(r) => Ok(r),
+                Err(AgentError::LlmContextOverflow(body)) if compaction_config.is_some() => {
+                    warn!(
+                        detail = %body,
+                        "Context window exceeded; compacting and retrying"
+                    );
+                    let compact_config = compaction_config.expect("checked above");
+                    self.force_compaction(compact_config, &mut state, compaction_llm)
+                        .await;
+                    self.llm
+                        .send_messages(
+                            system_prompt.as_deref(),
+                            state.messages(),
+                            Some(&effective_tool_defs),
+                        )
+                        .await
+                }
+                other => other,
+            };
+
+            let response = match response {
+                Ok(r) => r,
+                Err(e) => {
+                    error!(error = %e, "LLM request failed, ending run");
+                    self.finalize_session(
+                        session_store,
+                        &session_metadata,
+                        &state,
+                        SessionStatus::Error,
+                    )
+                    .await;
+                    events::emit(
+                        &self.event_bus,
+                        AgentEvent::AgentError {
+                            error: e.to_string(),
+                        },
+                    );
+                    return Err(e);
+                }
+            };
 
             state.accumulate_usage(response.usage.as_ref(), &response.model);
 
-            match response.stop_reason {
+            // A response carrying tool_use blocks must have them executed regardless of
+            // the reported stop_reason. Terminating on `end_turn` while tool calls are
+            // pending both drops the work the model asked for and leaves the tool_use
+            // unanswered, which the API rejects on the next request.
+            let effective_stop_reason = if content_has_tool_use(&response.content) {
+                StopReason::ToolUse
+            } else {
+                response.stop_reason
+            };
+
+            match effective_stop_reason {
                 StopReason::ToolUse => {
                     let assistant_content = response.content.clone();
 
@@ -616,7 +834,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                             SessionStatus::Completed,
                         )
                         .await;
-                        self.emit_completed(AgentStatus::Success, Some(final_text.clone()), &state);
+                        self.emit_completed(AgentStatus::Success, Some(final_text.clone()), &state)
+                            .await;
                         return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                     }
 
@@ -629,56 +848,23 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                                 _ => None,
                             })
                             .collect();
-                        let tool_reminders = reminder_scheduler
-                            .check(state.current_iteration(), &pending_tool_names);
+                        let tool_reminders = reminder_scheduler.check_tools(&pending_tool_names);
                         for reminder in tool_reminders {
                             state.inject_system_notification(&reminder);
                         }
                     }
 
-                    // Feature 6: Self-critique phase
-                    if let Some(ref critique_config) = self.config.self_critique {
-                        if self_critique::should_critique(critique_config, &assistant_content) {
-                            debug!("Running self-critique on planned actions");
-                            let critique_prompt =
-                                self_critique::build_critique_prompt(&assistant_content, task);
-                            let critique_system =
-                                [SystemContent::text(self_critique::CRITIQUE_SYSTEM_PROMPT)];
-                            let critique_messages = vec![crate::llm::types::Message {
-                                role: crate::llm::types::Role::User,
-                                content: vec![ContentBlock::Text {
-                                    text: critique_prompt,
-                                }],
-                            }];
-                            if let Ok(critique_response) = self
-                                .llm
-                                .send_messages(Some(&critique_system), &critique_messages, None)
-                                .await
-                            {
-                                let critique_text = critique_response
-                                    .content
-                                    .iter()
-                                    .filter_map(|b| match b {
-                                        ContentBlock::Text { text } => Some(text.clone()),
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                let result = self_critique::parse_critique_response(&critique_text);
-                                if !result.approved {
-                                    info!("Self-critique rejected actions: {}", result.reasoning);
-                                    state.add_assistant_message(assistant_content);
-                                    let feedback = format!(
-                                        "[SELF_CRITIQUE] Your planned actions were rejected.\nReason: {}\n{}Please revise your approach.",
-                                        result.reasoning,
-                                        result.suggestions.map(|s| format!("Suggestions: {s}\n")).unwrap_or_default(),
-                                    );
-                                    state.inject_system_notification(&feedback);
-                                    continue;
-                                }
-                            }
-                        }
-                    }
+                    let Some(assistant_content) = self
+                        .run_self_critique(
+                            &mut state,
+                            assistant_content,
+                            task,
+                            &mut critique_rounds,
+                        )
+                        .await
+                    else {
+                        continue;
+                    };
 
                     state.add_assistant_message(assistant_content.clone());
 
@@ -710,16 +896,41 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         }
                     }
                 }
-                StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
-                    let content = if !content_has_tool_use(&response.content) {
-                        let Some(content) =
-                            self.try_nudge(&mut state, response.content, &mut nudge_count)
-                        else {
+                StopReason::EndTurn
+                | StopReason::MaxTokens
+                | StopReason::StopSequence
+                | StopReason::Unknown => {
+                    if effective_stop_reason == StopReason::Unknown {
+                        warn!(
+                            stop_reason = ?response.stop_reason,
+                            "Unrecognized stop_reason from the API; treating as end_turn"
+                        );
+                    }
+
+                    // Normalization above guarantees this arm is only reached when the
+                    // response carries no tool_use blocks, so both the nudge and the
+                    // goal check can safely append the content and inject a follow-up
+                    // user message without orphaning a tool call.
+
+                    // `max_tokens` means the output was cut off mid-sentence. Reporting
+                    // that as a successful completion hands back a truncated answer, so
+                    // ask for a continuation first.
+                    let content = if effective_stop_reason == StopReason::MaxTokens {
+                        let Some(c) = self.try_continue_truncated(
+                            &mut state,
+                            response.content,
+                            &mut nudge_count,
+                        ) else {
                             continue;
                         };
-                        content
+                        c
                     } else {
                         response.content
+                    };
+
+                    let Some(content) = self.try_nudge(&mut state, content, &mut nudge_count)
+                    else {
+                        continue;
                     };
 
                     // Goal check: one-time verification before termination
@@ -749,7 +960,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         SessionStatus::Completed,
                     )
                     .await;
-                    self.emit_completed(AgentStatus::Success, Some(final_text.clone()), &state);
+                    self.emit_completed(AgentStatus::Success, Some(final_text.clone()), &state)
+                        .await;
                     return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                 }
             }
@@ -804,7 +1016,9 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     }
 
                     // Feature 4: Block non-read-only tools in plan mode
-                    if self.config.plan_mode && !Self::is_read_only_tool(name) {
+                    if self.config.plan_mode
+                        && !Self::is_read_only_tool(self.tools.tool_definitions(), name)
+                    {
                         let error_msg = format!(
                             "Tool '{}' is blocked in plan mode. Only read-only tools are allowed.",
                             name
@@ -881,7 +1095,18 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
     }
 
     /// Emit an AgentCompleted event via the event bus.
-    fn emit_completed(&self, status: AgentStatus, result: Option<String>, state: &AgentState) {
+    /// Emit the terminal event and fire the end-of-run lifecycle hooks.
+    ///
+    /// Every terminal path in every loop goes through here, which is why the hooks live
+    /// here rather than in `finalize_session` — the interactive loop never calls that,
+    /// so it would have fired SessionStart with no matching end.
+    async fn emit_completed(
+        &self,
+        status: AgentStatus,
+        result: Option<String>,
+        state: &AgentState,
+    ) {
+        let status_label = format!("{status:?}");
         events::emit(
             &self.event_bus,
             AgentEvent::AgentCompleted {
@@ -890,6 +1115,24 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 total_duration_ms: state.elapsed_ms(),
             },
         );
+
+        let end_context = serde_json::json!({
+            "status": status_label,
+            "iterations": state.current_iteration(),
+            "total_input_tokens": state.total_input_tokens(),
+            "total_output_tokens": state.total_output_tokens(),
+            "total_cost_usd": state.total_cost(),
+        });
+        self.fire_lifecycle(
+            crate::plugins::components::hooks::HookTiming::Stop,
+            end_context.clone(),
+        )
+        .await;
+        self.fire_lifecycle(
+            crate::plugins::components::hooks::HookTiming::SessionEnd,
+            end_context,
+        )
+        .await;
     }
 
     /// Emit TextDelta and ThinkingComplete events for content blocks in a response.
@@ -915,6 +1158,30 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         }
     }
 
+    /// Compact unconditionally, ignoring thresholds and the stage latch.
+    ///
+    /// Used when the API has already rejected the prompt as too long: the thresholds
+    /// have demonstrably been overshot, so the usual "is it time yet" logic has nothing
+    /// useful to say. Runs the LLM summarization directly, which is the stage that
+    /// actually shrinks the conversation.
+    async fn force_compaction(
+        &self,
+        compact_config: &CompactionConfig,
+        state: &mut AgentState,
+        compaction_llm: Option<&dyn LlmProvider>,
+    ) {
+        self.fire_lifecycle(
+            crate::plugins::components::hooks::HookTiming::PreCompact,
+            serde_json::json!({
+                "iteration": state.current_iteration(),
+                "reason": "context_overflow",
+            }),
+        )
+        .await;
+        self.run_llm_compaction(compact_config, state, compaction_llm)
+            .await;
+    }
+
     /// Run compaction with progressive staging support and dedicated compaction LLM.
     async fn run_compaction(
         &self,
@@ -922,6 +1189,22 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         state: &mut AgentState,
         compaction_llm: Option<&dyn LlmProvider>,
     ) {
+        // Honour `enabled` on both paths. Only the legacy branch used to check it, via
+        // `should_compact`, so a config with `enabled: false` plus stage thresholds
+        // still compacted.
+        if !compact_config.enabled {
+            return;
+        }
+
+        self.fire_lifecycle(
+            crate::plugins::components::hooks::HookTiming::PreCompact,
+            serde_json::json!({
+                "iteration": state.current_iteration(),
+                "input_tokens": state.effective_input_tokens(),
+            }),
+        )
+        .await;
+
         // Feature 3: Progressive compaction stages
         if let Some(ref thresholds) = compact_config.stage_thresholds {
             if let Some(stage) = compaction_stages::determine_stage(
@@ -929,15 +1212,28 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 compact_config.context_window_tokens,
                 state.effective_input_tokens(),
             ) {
+                // Latch: a stage that already ran and did not bring the context below
+                // its threshold has nothing left to give, and re-running it every
+                // iteration just rewrites the message list for no benefit.
+                if !state.should_run_compaction_stage(stage) {
+                    debug!(
+                        stage = ?stage,
+                        "Skipping compaction stage; already applied at this context size"
+                    );
+                    return;
+                }
                 info!(
                     stage = ?stage,
                     input_tokens = state.effective_input_tokens(),
                     "Triggering progressive compaction"
                 );
+                state.record_compaction_stage(stage);
                 match stage {
                     compaction_stages::CompactionStage::ToolOutputCompression => {
                         let messages = state.messages_mut();
-                        let count = compaction_stages::compress_tool_outputs(messages, 500);
+                        let preserve = compact_config.preserve_recent_n;
+                        let count =
+                            compaction_stages::compress_tool_outputs(messages, 500, preserve);
                         if count > 0 {
                             info!(compressed = count, "Compressed tool outputs");
                         }
@@ -1089,7 +1385,19 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             Some(system_blocks)
         };
 
-        let all_tool_defs = self.tools.tool_definitions().to_vec();
+        // The resumed conversation carries the original task as its first message.
+        let resumed_task = state.original_task().unwrap_or_default().to_string();
+
+        // Pairs with the Stop/SessionEnd that `finalize_session` fires on every exit.
+        // Without it a resumed run emitted an end hook with no matching start.
+        self.fire_lifecycle(
+            crate::plugins::components::hooks::HookTiming::SessionStart,
+            serde_json::json!({ "task": resumed_task, "resumed": true }),
+        )
+        .await;
+
+        let mut all_tool_defs = self.tools.tool_definitions().to_vec();
+        mark_tools_cacheable(&mut all_tool_defs);
         let mut tool_registry = if self.config.lazy_tool_discovery {
             let always_avail = ALWAYS_AVAILABLE_TOOLS
                 .iter()
@@ -1103,6 +1411,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         let timeout_ms = self.config.timeout_secs * 1000;
         let session_metadata = session_store.load_metadata(session_id).await.ok();
         let mut nudge_count: u32 = 0;
+        let mut critique_rounds: u32 = 0;
         let mut goal_check_fired = false;
 
         loop {
@@ -1114,8 +1423,32 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     SessionStatus::Completed,
                 )
                 .await;
-                self.emit_completed(AgentStatus::MaxIterations, None, &state);
+                self.emit_completed(AgentStatus::MaxIterations, None, &state)
+                    .await;
                 return Ok(state.into_result(AgentStatus::MaxIterations, None));
+            }
+
+            // Budget check. `max_budget_usd` was declared in config and documented but
+            // never compared against anything, so a runaway agent could spend without
+            // limit while the knob appeared to be doing something.
+            if let Some(max_budget) = self.config.max_budget_usd {
+                if state.total_cost() >= max_budget {
+                    info!(
+                        spent_usd = state.total_cost(),
+                        budget_usd = max_budget,
+                        "Budget exhausted"
+                    );
+                    self.finalize_session(
+                        Some(session_store),
+                        &session_metadata,
+                        &state,
+                        SessionStatus::Completed,
+                    )
+                    .await;
+                    self.emit_completed(AgentStatus::BudgetExceeded, None, &state)
+                        .await;
+                    return Ok(state.into_result(AgentStatus::BudgetExceeded, None));
+                }
             }
 
             if state.elapsed_ms() >= timeout_ms {
@@ -1126,7 +1459,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     SessionStatus::Completed,
                 )
                 .await;
-                self.emit_completed(AgentStatus::Timeout, None, &state);
+                self.emit_completed(AgentStatus::Timeout, None, &state)
+                    .await;
                 return Ok(state.into_result(AgentStatus::Timeout, None));
             }
 
@@ -1144,18 +1478,9 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 },
             );
 
-            // Action progress reminder
-            if let Some(reminder) = self.build_action_reminder(&state) {
-                state.inject_system_notification(&reminder);
-            }
-
-            // System reminders
-            if !reminder_scheduler.is_empty() {
-                let reminders = reminder_scheduler.check(state.current_iteration(), &[]);
-                for reminder in reminders {
-                    state.inject_system_notification(&reminder);
-                }
-            }
+            // Resuming previously skipped loop detection, reasoning stages and the
+            // budget warning; going through the shared pre-flight restores them.
+            self.prepare_iteration(&mut state, &reminder_scheduler);
 
             // Resolve tool definitions
             let effective_tool_defs: Cow<'_, [ToolDefinition]> =
@@ -1179,11 +1504,69 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     state.messages(),
                     Some(&effective_tool_defs),
                 )
-                .await?;
+                .await;
+
+            // Do not let the `?` shortcut skip teardown: without this the persisted
+            // session stays stuck in its pre-existing status and no terminal event ever
+            // reaches the event bus, so a subscriber sees the run simply stop.
+            // A context-overflow 400 is recoverable: compact and retry once rather than
+            // ending the run. The proactive threshold can be overshot by a single large
+            // tool result, and before this that was fatal.
+            let response = match response {
+                Ok(r) => Ok(r),
+                Err(AgentError::LlmContextOverflow(body)) if compaction_config.is_some() => {
+                    warn!(
+                        detail = %body,
+                        "Context window exceeded; compacting and retrying"
+                    );
+                    let compact_config = compaction_config.expect("checked above");
+                    self.force_compaction(compact_config, &mut state, compaction_llm)
+                        .await;
+                    self.llm
+                        .send_messages(
+                            system_prompt.as_deref(),
+                            state.messages(),
+                            Some(&effective_tool_defs),
+                        )
+                        .await
+                }
+                other => other,
+            };
+
+            let response = match response {
+                Ok(r) => r,
+                Err(e) => {
+                    error!(error = %e, "LLM request failed, ending run");
+                    self.finalize_session(
+                        Some(session_store),
+                        &session_metadata,
+                        &state,
+                        SessionStatus::Error,
+                    )
+                    .await;
+                    events::emit(
+                        &self.event_bus,
+                        AgentEvent::AgentError {
+                            error: e.to_string(),
+                        },
+                    );
+                    return Err(e);
+                }
+            };
 
             state.accumulate_usage(response.usage.as_ref(), &response.model);
 
-            match response.stop_reason {
+            // A response carrying tool_use blocks must have them executed regardless of
+            // the reported stop_reason. Terminating on `end_turn` while tool calls are
+            // pending both drops the work the model asked for and leaves the tool_use
+            // unanswered, which the API rejects on the next request.
+            let effective_stop_reason = if content_has_tool_use(&response.content) {
+                StopReason::ToolUse
+            } else {
+                response.stop_reason
+            };
+
+            match effective_stop_reason {
                 StopReason::ToolUse => {
                     let assistant_content = response.content.clone();
                     let has_tool_use = content_has_tool_use(&assistant_content);
@@ -1217,9 +1600,22 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                             SessionStatus::Completed,
                         )
                         .await;
-                        self.emit_completed(AgentStatus::Success, Some(final_text.clone()), &state);
+                        self.emit_completed(AgentStatus::Success, Some(final_text.clone()), &state)
+                            .await;
                         return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                     }
+
+                    let Some(assistant_content) = self
+                        .run_self_critique(
+                            &mut state,
+                            assistant_content,
+                            &resumed_task,
+                            &mut critique_rounds,
+                        )
+                        .await
+                    else {
+                        continue;
+                    };
 
                     state.add_assistant_message(assistant_content.clone());
                     let (tool_results, step_records) = self
@@ -1247,16 +1643,41 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         }
                     }
                 }
-                StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
-                    let content = if !content_has_tool_use(&response.content) {
-                        let Some(content) =
-                            self.try_nudge(&mut state, response.content, &mut nudge_count)
-                        else {
+                StopReason::EndTurn
+                | StopReason::MaxTokens
+                | StopReason::StopSequence
+                | StopReason::Unknown => {
+                    if effective_stop_reason == StopReason::Unknown {
+                        warn!(
+                            stop_reason = ?response.stop_reason,
+                            "Unrecognized stop_reason from the API; treating as end_turn"
+                        );
+                    }
+
+                    // Normalization above guarantees this arm is only reached when the
+                    // response carries no tool_use blocks, so both the nudge and the
+                    // goal check can safely append the content and inject a follow-up
+                    // user message without orphaning a tool call.
+
+                    // `max_tokens` means the output was cut off mid-sentence. Reporting
+                    // that as a successful completion hands back a truncated answer, so
+                    // ask for a continuation first.
+                    let content = if effective_stop_reason == StopReason::MaxTokens {
+                        let Some(c) = self.try_continue_truncated(
+                            &mut state,
+                            response.content,
+                            &mut nudge_count,
+                        ) else {
                             continue;
                         };
-                        content
+                        c
                     } else {
                         response.content
+                    };
+
+                    let Some(content) = self.try_nudge(&mut state, content, &mut nudge_count)
+                    else {
+                        continue;
                     };
 
                     // Goal check: one-time verification before termination
@@ -1285,7 +1706,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         SessionStatus::Completed,
                     )
                     .await;
-                    self.emit_completed(AgentStatus::Success, Some(final_text.clone()), &state);
+                    self.emit_completed(AgentStatus::Success, Some(final_text.clone()), &state)
+                        .await;
                     return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                 }
             }
@@ -1301,7 +1723,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
     ) {
         if let (Some(store), Some(metadata)) = (session_store, session_metadata) {
             let (r1, r2) = tokio::join!(
-                store.append_messages(&metadata.id, state.messages()),
+                store.save_messages(&metadata.id, state.messages()),
                 store.save_steps(&metadata.id, state.steps())
             );
             if let Err(e) = r1 {
@@ -1410,12 +1832,15 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
         agents_md: &Option<crate::agents_md::AgentsMdContent>,
         session_store: Option<&dyn SessionStorage>,
         compaction_config: Option<&CompactionConfig>,
+        compaction_llm: Option<&dyn LlmProvider>,
     ) -> Result<AgentResult, AgentError> {
         use super::interactive::{InteractiveSignal, StreamAssembler, UserMessage};
         use crate::llm::types::compute_cost;
         use tokio_stream::StreamExt as _;
 
-        // Validate reasoning stages config if present
+        // Reasoning-stage thresholds are validated at startup by `AppConfig::validate`,
+        // which errors rather than warning. This is a defensive check for callers that
+        // construct an AgentConfig directly (tests, embedders).
         if let Some(ref stages_config) = self.config.reasoning_stages {
             if let Err(e) = super::reasoning_stages::validate_config(stages_config) {
                 warn!("{}", e);
@@ -1449,11 +1874,18 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
             },
         );
 
+        self.fire_lifecycle(
+            crate::plugins::components::hooks::HookTiming::SessionStart,
+            serde_json::json!({ "task": first_task, "interactive": true }),
+        )
+        .await;
+
         // Build system prompt (same logic as run_with_options)
         let system_prompt = self.build_system_blocks(credential_set, skill_set, agents_md);
 
         // Tool definitions
-        let all_tool_defs = self.tools.tool_definitions().to_vec();
+        let mut all_tool_defs = self.tools.tool_definitions().to_vec();
+        mark_tools_cacheable(&mut all_tool_defs);
         let mut tool_registry = if self.config.lazy_tool_discovery {
             let always_avail = ALWAYS_AVAILABLE_TOOLS
                 .iter()
@@ -1467,6 +1899,7 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
         let reminder_scheduler = ReminderScheduler::from_configs(&self.config.reminders);
         let timeout_ms = self.config.timeout_secs * 1000;
         let mut nudge_count: u32 = 0;
+        let mut critique_rounds: u32 = 0;
         let mut goal_check_fired = false;
 
         loop {
@@ -1476,20 +1909,40 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
                     iterations = state.current_iteration(),
                     "Max iterations reached"
                 );
-                self.emit_completed(AgentStatus::MaxIterations, None, &state);
+                self.emit_completed(AgentStatus::MaxIterations, None, &state)
+                    .await;
                 return Ok(state.into_result(AgentStatus::MaxIterations, None));
             }
 
+            // Budget check. `max_budget_usd` was declared in config and documented but
+            // never compared against anything, so a runaway agent could spend without
+            // limit while the knob appeared to be doing something.
+            if let Some(max_budget) = self.config.max_budget_usd {
+                if state.total_cost() >= max_budget {
+                    info!(
+                        spent_usd = state.total_cost(),
+                        budget_usd = max_budget,
+                        "Budget exhausted"
+                    );
+                    self.emit_completed(AgentStatus::BudgetExceeded, None, &state)
+                        .await;
+                    return Ok(state.into_result(AgentStatus::BudgetExceeded, None));
+                }
+            }
+
             // Check timeout
+
             if state.elapsed_ms() >= timeout_ms {
                 info!(elapsed_ms = state.elapsed_ms(), "Timeout reached");
-                self.emit_completed(AgentStatus::Timeout, None, &state);
+                self.emit_completed(AgentStatus::Timeout, None, &state)
+                    .await;
                 return Ok(state.into_result(AgentStatus::Timeout, None));
             }
 
             // Progressive context compaction (no dedicated compaction LLM in interactive mode)
             if let Some(compact_config) = compaction_config {
-                self.run_compaction(compact_config, &mut state, None).await;
+                self.run_compaction(compact_config, &mut state, compaction_llm)
+                    .await;
             }
 
             state.increment_iteration();
@@ -1502,51 +1955,7 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
                 },
             );
 
-            // Action progress reminder
-            if let Some(reminder) = self.build_action_reminder(&state) {
-                state.inject_system_notification(&reminder);
-            }
-
-            // Iteration budget warning (one-time)
-            if let Some(warning) = self.build_budget_warning(&state) {
-                state.inject_system_notification(&warning);
-            }
-
-            // Loop detection
-            if let Some(ref loop_config) = self.config.loop_detection {
-                if let Some(warning) =
-                    super::loop_detection::detect_loop(state.steps(), loop_config)
-                {
-                    state.inject_system_notification(&warning);
-                }
-                if let Some(warning) =
-                    super::loop_detection::detect_semantic_loop(state.steps(), loop_config)
-                {
-                    state.inject_system_notification(&warning);
-                }
-            }
-
-            // System reminders
-            if !reminder_scheduler.is_empty() {
-                let reminders =
-                    reminder_scheduler.check(state.current_iteration(), &Vec::<String>::new());
-                for reminder in reminders {
-                    state.inject_system_notification(&reminder);
-                }
-            }
-
-            // Reasoning budget stages
-            if let (Some(ref stages_config), Some(ref thinking_ctl)) =
-                (&self.config.reasoning_stages, &self.thinking_control)
-            {
-                let budget = super::reasoning_stages::compute_thinking_budget(
-                    stages_config,
-                    state.current_iteration(),
-                    self.config.max_iterations,
-                );
-                thinking_ctl
-                    .set_thinking_config(Some(crate::llm::types::ThinkingConfig::enabled(budget)));
-            }
+            self.prepare_iteration(&mut state, &reminder_scheduler);
 
             // Resolve effective tool definitions
             let effective_tool_defs: std::borrow::Cow<'_, [ToolDefinition]> =
@@ -1659,7 +2068,8 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
                     if !response.content.is_empty() {
                         state.add_assistant_message(response.content);
                     }
-                    self.emit_completed(AgentStatus::Success, None, &state);
+                    self.emit_completed(AgentStatus::Success, None, &state)
+                        .await;
                     return Ok(state.into_result(AgentStatus::Success, None));
                 }
                 StreamOutcome::Interrupted(response) => (response, true),
@@ -1700,7 +2110,8 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
                         continue;
                     }
                     Some(UserMessage::Quit) => {
-                        self.emit_completed(AgentStatus::Success, None, &state);
+                        self.emit_completed(AgentStatus::Success, None, &state)
+                            .await;
                         return Ok(state.into_result(AgentStatus::Success, None));
                     }
                     Some(UserMessage::Interrupt) => continue,
@@ -1710,8 +2121,16 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
                 }
             }
 
-            // Process the assembled response (same logic as batch loop)
-            match response.stop_reason {
+            // Process the assembled response (same logic as batch loop). As there, a
+            // response carrying tool_use blocks is executed regardless of the reported
+            // stop_reason.
+            let effective_stop_reason = if content_has_tool_use(&response.content) {
+                StopReason::ToolUse
+            } else {
+                response.stop_reason
+            };
+
+            match effective_stop_reason {
                 StopReason::ToolUse => {
                     let assistant_content = response.content;
                     let has_tool_use = content_has_tool_use(&assistant_content);
@@ -1750,7 +2169,8 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
                                     AgentStatus::Success,
                                     Some(final_text.clone()),
                                     &state,
-                                );
+                                )
+                                .await;
                                 return Ok(
                                     state.into_result(AgentStatus::Success, Some(final_text))
                                 );
@@ -1761,6 +2181,20 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
                             }
                         }
                     }
+
+                    // Self-critique. Previously implemented only in the batch loop, so
+                    // a chat session silently ran without the critic its config asked for.
+                    let Some(assistant_content) = self
+                        .run_self_critique(
+                            &mut state,
+                            assistant_content,
+                            &first_task,
+                            &mut critique_rounds,
+                        )
+                        .await
+                    else {
+                        continue;
+                    };
 
                     // Execute tools
                     state.add_assistant_message(assistant_content.clone());
@@ -1791,16 +2225,35 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
                         }
                     }
                 }
-                StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
-                    let content = if !content_has_tool_use(&response.content) {
-                        let Some(content) =
-                            self.try_nudge(&mut state, response.content, &mut nudge_count)
-                        else {
+                StopReason::EndTurn
+                | StopReason::MaxTokens
+                | StopReason::StopSequence
+                | StopReason::Unknown => {
+                    if effective_stop_reason == StopReason::Unknown {
+                        warn!(
+                            stop_reason = ?response.stop_reason,
+                            "Unrecognized stop_reason from the API; treating as end_turn"
+                        );
+                    }
+                    // Normalization above guarantees no tool_use is pending here.
+                    // `max_tokens` means the output was cut off mid-sentence, so ask for
+                    // a continuation rather than reporting the fragment as the answer.
+                    let content = if effective_stop_reason == StopReason::MaxTokens {
+                        let Some(c) = self.try_continue_truncated(
+                            &mut state,
+                            response.content,
+                            &mut nudge_count,
+                        ) else {
                             continue;
                         };
-                        content
+                        c
                     } else {
                         response.content
+                    };
+
+                    let Some(content) = self.try_nudge(&mut state, content, &mut nudge_count)
+                    else {
+                        continue;
                     };
 
                     let Some(content) =
@@ -1829,7 +2282,8 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
                                 AgentStatus::Success,
                                 Some(final_text.clone()),
                                 &state,
-                            );
+                            )
+                            .await;
                             return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                         }
                         Some(UserMessage::Interrupt) => continue,
@@ -2640,39 +3094,95 @@ mod tests {
     }
 
     #[test]
-    fn test_is_read_only_tool() {
-        // Read-only tools
+    fn test_is_read_only_tool_reads_the_declaration() {
+        // Read-only status now comes from each tool's own definition rather than a
+        // hardcoded name list, so the same name can be read-only or not depending on
+        // what the executor in scope declares.
+        let defs = vec![
+            ToolDefinition {
+                name: "read_file".to_string(),
+                description: String::new(),
+                input_schema: json!({}),
+                cache_control: None,
+                read_only: true,
+            },
+            ToolDefinition {
+                name: "write_file".to_string(),
+                description: String::new(),
+                input_schema: json!({}),
+                cache_control: None,
+                read_only: false,
+            },
+        ];
+
         assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
+            &defs,
             "read_file"
         ));
-        assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool("grep"));
-        assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool("glob"));
-        assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
-            "list_files"
-        ));
-        assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
-            "screenshot"
-        ));
-
-        // Write / side-effecting tools
         assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
+            &defs,
             "write_file"
         ));
-        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
-            "edit_file"
+
+        // The registry meta-tool has no definition but only queries the registry.
+        assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
+            &defs,
+            "search_tools"
         ));
+
+        // An unknown tool is assumed to mutate — the safe default for plan mode.
         assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
-            "bash"
+            &defs,
+            "something_unknown"
         ));
-        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
-            "navigate"
-        ));
-        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
-            "click"
-        ));
-        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
-            "unknown_tool"
-        ));
+    }
+
+    #[test]
+    fn test_plan_mode_advertised_set_matches_permitted_set() {
+        // The bug this guards against: the loop advertised tools that the permission
+        // layer then denied, and hid tools the permission layer would have allowed.
+        use crate::permissions::types::{PermissionDecision, PermissionMode, PermissionPolicy};
+
+        let defs = vec![
+            ToolDefinition {
+                name: "read_file".to_string(),
+                description: String::new(),
+                input_schema: json!({}),
+                cache_control: None,
+                read_only: true,
+            },
+            ToolDefinition {
+                name: "web_fetch".to_string(),
+                description: String::new(),
+                input_schema: json!({}),
+                cache_control: None,
+                read_only: false,
+            },
+            ToolDefinition {
+                name: "bash".to_string(),
+                description: String::new(),
+                input_schema: json!({}),
+                cache_control: None,
+                read_only: false,
+            },
+        ];
+
+        let advertised = AgentRunner::<MockLlm, MockTools>::filter_read_only_tools(&defs);
+        let policy = PermissionPolicy {
+            mode: PermissionMode::Plan,
+            ..Default::default()
+        };
+
+        for tool in &defs {
+            let permitted =
+                policy.check_tool(&tool.name, tool.read_only) == PermissionDecision::Allow;
+            let shown = advertised.iter().any(|t| t.name == tool.name);
+            assert_eq!(
+                shown, permitted,
+                "`{}` is advertised={shown} but permitted={permitted}",
+                tool.name
+            );
+        }
     }
 
     #[tokio::test]
@@ -2689,7 +3199,8 @@ mod tests {
         let content = vec![ContentBlock::Text {
             text: "No tools here".to_string(),
         }];
-        let (tool_results, step_records) = runner.execute_tools(&content, 1).await;
+        let (tool_results, step_records) =
+            runner.execute_tools_with_registry(&content, 1, None).await;
         assert!(tool_results.is_empty());
         assert!(step_records.is_empty());
     }
@@ -2713,7 +3224,8 @@ mod tests {
             name: "navigate".to_string(),
             input: json!({"url": "https://example.com"}),
         }];
-        let (tool_results, step_records) = runner.execute_tools(&content, 1).await;
+        let (tool_results, step_records) =
+            runner.execute_tools_with_registry(&content, 1, None).await;
         assert_eq!(tool_results.len(), 1);
         assert_eq!(step_records.len(), 1);
         assert!(matches!(
@@ -2770,7 +3282,8 @@ mod tests {
                 input: json!({"pattern": "foo"}),
             },
         ];
-        let (tool_results, step_records) = runner.execute_tools(&content, 1).await;
+        let (tool_results, step_records) =
+            runner.execute_tools_with_registry(&content, 1, None).await;
         assert_eq!(tool_results.len(), 3);
 
         // Results should be in original order regardless of execution order
@@ -2814,7 +3327,8 @@ mod tests {
             name: "bash".to_string(),
             input: json!({"command": "false"}),
         }];
-        let (tool_results, step_records) = runner.execute_tools(&content, 1).await;
+        let (tool_results, step_records) =
+            runner.execute_tools_with_registry(&content, 1, None).await;
         assert_eq!(tool_results.len(), 1);
         assert!(matches!(
             &tool_results[0],
@@ -2851,7 +3365,7 @@ mod tests {
         )
         .with_event_bus(bus);
 
-        runner.execute_tools(&content, 1).await;
+        runner.execute_tools_with_registry(&content, 1, None).await;
 
         // Should receive ToolUseStart then ToolUseResult
         let ev1 = rx.recv().await.unwrap();
@@ -2885,7 +3399,7 @@ mod tests {
         )
         .with_event_bus(bus);
 
-        runner.execute_tools(&content, 1).await;
+        runner.execute_tools_with_registry(&content, 1, None).await;
 
         let ev = rx.recv().await.unwrap();
         assert_eq!(ev.event_type(), "thinking_complete");

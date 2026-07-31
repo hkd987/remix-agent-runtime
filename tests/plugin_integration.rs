@@ -243,11 +243,11 @@ async fn test_full_chain_tool_definitions_merge() {
     let defs = chain.tool_definitions();
     let names: Vec<&str> = defs.iter().map(|t| t.name.as_str()).collect();
 
-    // 3 backend + 3 skill virtual + 7 local = 13
+    // 3 backend + 3 skill virtual + 8 local = 14
     assert_eq!(
         defs.len(),
-        13,
-        "Expected 13 tools (3 backend + 3 skill + 7 local), got {}: {:?}",
+        14,
+        "Expected 14 tools (3 backend + 3 skill + 8 local), got {}: {:?}",
         defs.len(),
         names
     );

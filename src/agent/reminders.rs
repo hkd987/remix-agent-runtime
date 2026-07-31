@@ -71,6 +71,26 @@ impl ReminderScheduler {
         triggered
     }
 
+    /// Check only the tool-triggered reminders.
+    ///
+    /// The loop calls `check` once per iteration before the LLM call, and needs a
+    /// second pass once the pending tool names are known. Using `check` for that second
+    /// pass re-fired every `EveryNIterations` reminder as well, because that arm
+    /// ignores `pending_tools` — so each interval reminder was injected twice per
+    /// iteration in the batch loop but once in `resume`.
+    pub fn check_tools(&self, pending_tools: &[String]) -> Vec<String> {
+        self.reminders
+            .iter()
+            .filter_map(|reminder| match &reminder.trigger {
+                ReminderTrigger::BeforeTools(tools) => pending_tools
+                    .iter()
+                    .any(|pt| tools.contains(pt))
+                    .then(|| format!("[SYSTEM_REMINDER] {}", reminder.content)),
+                ReminderTrigger::EveryNIterations(_) => None,
+            })
+            .collect()
+    }
+
     /// Returns true if the scheduler has no reminders configured.
     pub fn is_empty(&self) -> bool {
         self.reminders.is_empty()
@@ -285,5 +305,44 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let from_json: ReminderConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(from_json, config);
+    }
+
+    #[test]
+    fn test_check_tools_ignores_interval_reminders() {
+        // The bug: using `check` for the pre-tool pass re-fired every interval
+        // reminder, so each one was injected twice per iteration.
+        let scheduler = ReminderScheduler {
+            reminders: vec![
+                SystemReminder {
+                    content: "every two".to_string(),
+                    trigger: ReminderTrigger::EveryNIterations(2),
+                },
+                SystemReminder {
+                    content: "before bash".to_string(),
+                    trigger: ReminderTrigger::BeforeTools(vec!["bash".to_string()]),
+                },
+            ],
+        };
+
+        let tools = vec!["bash".to_string()];
+        let fired = scheduler.check_tools(&tools);
+        assert_eq!(fired.len(), 1, "{fired:?}");
+        assert!(fired[0].contains("before bash"), "{fired:?}");
+
+        // `check` on an even iteration still fires the interval reminder, once.
+        let fired = scheduler.check(2, &[]);
+        assert_eq!(fired.len(), 1, "{fired:?}");
+        assert!(fired[0].contains("every two"), "{fired:?}");
+    }
+
+    #[test]
+    fn test_check_tools_returns_nothing_for_unmatched_tools() {
+        let scheduler = ReminderScheduler {
+            reminders: vec![SystemReminder {
+                content: "before bash".to_string(),
+                trigger: ReminderTrigger::BeforeTools(vec!["bash".to_string()]),
+            }],
+        };
+        assert!(scheduler.check_tools(&["read_file".to_string()]).is_empty());
     }
 }

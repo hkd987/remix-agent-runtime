@@ -7,6 +7,7 @@ use crate::browser::mcp::{ToolExecutionResult, ToolExecutor};
 use crate::config::schema::DevToolsConfig;
 use crate::error::AgentError;
 use crate::llm::types::ToolDefinition;
+use crate::local_tools::sandbox::BashSandbox;
 
 use super::lsp::manager::LspServerManager;
 
@@ -19,10 +20,16 @@ pub struct DevToolsExecutor<T: ToolExecutor> {
     config: DevToolsConfig,
     all_tools: Vec<ToolDefinition>,
     lsp_manager: Arc<Mutex<LspServerManager>>,
+    /// Sandbox used to run test-harness subprocesses.
+    ///
+    /// `run_tests` and `list_tests` spawn real build tooling. Without this they used
+    /// `tokio::process::Command` directly, escaping both the OS-level sandbox and the
+    /// configured root — a hole as wide as the `bash` tool but with none of its gating.
+    sandbox: Arc<dyn BashSandbox>,
 }
 
 impl<T: ToolExecutor> DevToolsExecutor<T> {
-    pub fn new(inner: T, config: DevToolsConfig) -> Self {
+    pub fn new(inner: T, config: DevToolsConfig, sandbox: Arc<dyn BashSandbox>) -> Self {
         let mut all_tools: Vec<ToolDefinition> = inner.tool_definitions().to_vec();
 
         if config.enabled {
@@ -43,6 +50,7 @@ impl<T: ToolExecutor> DevToolsExecutor<T> {
             inner,
             config,
             all_tools,
+            sandbox,
             lsp_manager,
         }
     }
@@ -109,6 +117,7 @@ impl<T: ToolExecutor> ToolExecutor for DevToolsExecutor<T> {
                         return super::test_harness::run::execute_run_tests(
                             arguments,
                             &self.config.test_harness,
+                            self.sandbox.clone(),
                         )
                         .await;
                     }
@@ -116,6 +125,7 @@ impl<T: ToolExecutor> ToolExecutor for DevToolsExecutor<T> {
                         return super::test_harness::list::execute_list_tests(
                             arguments,
                             &self.config.test_harness,
+                            self.sandbox.clone(),
                         )
                         .await;
                     }
@@ -266,6 +276,14 @@ fn repo_map_tool_definitions() -> Vec<ToolDefinition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sandbox rooted at the temp dir, for tests that only inspect tool wiring.
+    fn test_sandbox() -> Arc<dyn BashSandbox> {
+        Arc::from(
+            crate::local_tools::sandbox::create_sandbox(std::env::temp_dir())
+                .expect("temp dir sandbox"),
+        )
+    }
     use async_trait::async_trait;
 
     struct MockInnerExecutor {
@@ -305,7 +323,7 @@ mod tests {
     #[test]
     fn test_enabled_adds_all_tools() {
         let config = DevToolsConfig::default();
-        let executor = DevToolsExecutor::new(mock_inner(), config);
+        let executor = DevToolsExecutor::new(mock_inner(), config, test_sandbox());
         // 1 inner + 3 LSP + 3 test harness + 1 repo map = 8
         assert_eq!(executor.tool_definitions().len(), 8);
         let names: Vec<&str> = executor
@@ -329,7 +347,7 @@ mod tests {
             enabled: false,
             ..Default::default()
         };
-        let executor = DevToolsExecutor::new(mock_inner(), config);
+        let executor = DevToolsExecutor::new(mock_inner(), config, test_sandbox());
         assert_eq!(executor.tool_definitions().len(), 1);
         assert_eq!(executor.tool_definitions()[0].name, "navigate");
     }
@@ -344,7 +362,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let executor = DevToolsExecutor::new(mock_inner(), config);
+        let executor = DevToolsExecutor::new(mock_inner(), config, test_sandbox());
         // 1 inner + 3 test harness + 1 repo map = 5
         assert_eq!(executor.tool_definitions().len(), 5);
         let names: Vec<&str> = executor
@@ -367,7 +385,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let executor = DevToolsExecutor::new(mock_inner(), config);
+        let executor = DevToolsExecutor::new(mock_inner(), config, test_sandbox());
         // 1 inner + 3 LSP + 1 repo map = 5
         assert_eq!(executor.tool_definitions().len(), 5);
         let names: Vec<&str> = executor
@@ -390,7 +408,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let executor = DevToolsExecutor::new(mock_inner(), config);
+        let executor = DevToolsExecutor::new(mock_inner(), config, test_sandbox());
         // 1 inner + 3 LSP + 3 test harness = 7
         assert_eq!(executor.tool_definitions().len(), 7);
         let names: Vec<&str> = executor
@@ -406,7 +424,7 @@ mod tests {
     #[tokio::test]
     async fn test_unknown_tool_delegates_to_inner() {
         let config = DevToolsConfig::default();
-        let executor = DevToolsExecutor::new(mock_inner(), config);
+        let executor = DevToolsExecutor::new(mock_inner(), config, test_sandbox());
         let result = executor
             .execute_tool("navigate", json!({"url": "test"}))
             .await
@@ -420,7 +438,7 @@ mod tests {
             enabled: false,
             ..Default::default()
         };
-        let executor = DevToolsExecutor::new(mock_inner(), config);
+        let executor = DevToolsExecutor::new(mock_inner(), config, test_sandbox());
         let result = executor
             .execute_tool("lsp_goto_definition", json!({}))
             .await
@@ -431,7 +449,7 @@ mod tests {
     #[test]
     fn test_into_inner() {
         let config = DevToolsConfig::default();
-        let executor = DevToolsExecutor::new(mock_inner(), config);
+        let executor = DevToolsExecutor::new(mock_inner(), config, test_sandbox());
         let recovered = executor.into_inner();
         assert_eq!(recovered.tool_definitions().len(), 1);
     }

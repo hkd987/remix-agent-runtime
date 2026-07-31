@@ -142,7 +142,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
         };
 
-        let result = convert_mcp_tools(&[mcp_tool.clone()]);
+        let result = convert_mcp_tools(std::slice::from_ref(&mcp_tool));
         assert_eq!(result[0].name, mcp_tool.name);
         assert_eq!(result[0].description, mcp_tool.description);
         assert_eq!(result[0].input_schema, mcp_tool.input_schema);

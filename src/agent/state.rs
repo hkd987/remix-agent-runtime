@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use crate::llm::types::{compute_cost, ContentBlock, Message, Role};
+use crate::llm::types::{compute_cost_with_cache, ContentBlock, Message, Role, ToolResultContent};
 use crate::output::result::{AgentResult, AgentStatus, StepRecord};
 use crate::session::types::SessionSnapshot;
 
@@ -18,6 +18,12 @@ pub struct AgentState {
     effective_input_tokens: u32,
     /// Cached flag: true once a `write_file` or `edit_file` step has been recorded.
     has_written_files: bool,
+    /// The compaction stage most recently applied, and the context size at the time.
+    /// Used to stop a stage from re-running when it cannot reduce the context further.
+    last_compaction: Option<(crate::agent::compaction_stages::CompactionStage, u32)>,
+    /// Loop-detection warnings already delivered, so a tripped detector nags once
+    /// rather than on every iteration until its window rolls over.
+    delivered_warnings: std::collections::HashSet<String>,
 }
 
 impl AgentState {
@@ -37,6 +43,8 @@ impl AgentState {
             total_cost: 0.0,
             effective_input_tokens: 0,
             has_written_files: false,
+            last_compaction: None,
+            delivered_warnings: std::collections::HashSet::new(),
         }
     }
 
@@ -56,6 +64,8 @@ impl AgentState {
             total_cost: 0.0,
             effective_input_tokens: 0,
             has_written_files,
+            last_compaction: None,
+            delivered_warnings: std::collections::HashSet::new(),
         }
     }
 
@@ -71,6 +81,41 @@ impl AgentState {
             role: Role::User,
             content: results,
         });
+    }
+
+    /// Append an assistant message whose tool calls are being refused, answering every
+    /// `tool_use` block it contains with a synthetic error `tool_result` carrying
+    /// `feedback`.
+    ///
+    /// Any path that appends an assistant message without executing its tools must go
+    /// through this. Appending the message and then pushing a plain user text message
+    /// leaves the `tool_use` unanswered, and the API rejects the next request with a
+    /// 400. If the content carries no tool calls this is equivalent to
+    /// [`Self::add_assistant_message`].
+    pub fn add_assistant_message_refusing_tools(
+        &mut self,
+        content: Vec<ContentBlock>,
+        feedback: &str,
+    ) {
+        let synthetic: Vec<ContentBlock> = content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: ToolResultContent::Text(feedback.to_string()),
+                    is_error: Some(true),
+                }),
+                _ => None,
+            })
+            .collect();
+
+        self.add_assistant_message(content);
+
+        if synthetic.is_empty() {
+            self.inject_system_notification(feedback);
+        } else {
+            self.add_tool_results(synthetic);
+        }
     }
 
     pub fn record_step(&mut self, step: StepRecord) {
@@ -128,8 +173,21 @@ impl AgentState {
         if let Some(u) = usage {
             self.total_input_tokens += u.input_tokens;
             self.total_output_tokens += u.output_tokens;
-            self.effective_input_tokens += u.input_tokens;
-            self.total_cost += compute_cost(model, u.input_tokens, u.output_tokens);
+
+            // `effective_input_tokens` tracks the *current* context size, so it is
+            // assigned, not accumulated. Each response's `input_tokens` already counts
+            // the whole prompt; summing them across iterations measures cumulative
+            // spend and makes compaction fire on iteration count rather than on real
+            // context pressure.
+            //
+            // Cached prefix tokens are counted separately by the API but still occupy
+            // the context window, so they belong in the total.
+            self.effective_input_tokens = u.input_tokens
+                + u.cache_read_input_tokens.unwrap_or(0)
+                + u.cache_creation_input_tokens.unwrap_or(0);
+
+            // Cache reads and writes are billed separately from `input_tokens`.
+            self.total_cost += compute_cost_with_cache(model, u);
         }
     }
 
@@ -156,6 +214,42 @@ impl AgentState {
     /// `estimated_tokens` is a rough estimate of the compacted context size.
     pub fn reset_effective_tokens(&mut self, estimated_tokens: u32) {
         self.effective_input_tokens = estimated_tokens;
+    }
+
+    /// Whether `stage` should run, given what already ran and at what context size.
+    ///
+    /// A stage is worth repeating only once the context has grown past the point where
+    /// it last ran. Otherwise the same stage fires on every iteration, rewriting the
+    /// message list without reducing anything.
+    pub fn should_run_compaction_stage(
+        &self,
+        stage: crate::agent::compaction_stages::CompactionStage,
+    ) -> bool {
+        match self.last_compaction {
+            Some((last_stage, tokens_at_run)) if last_stage == stage => {
+                self.effective_input_tokens > tokens_at_run
+            }
+            _ => true,
+        }
+    }
+
+    /// Inject `warning` only the first time it is seen.
+    ///
+    /// Loop detectors re-scan the same window every iteration, so once tripped they
+    /// produce the identical warning again and again until the window rolls over —
+    /// which buries the signal in repetition and burns context.
+    pub fn inject_warning_once(&mut self, warning: &str) {
+        if self.delivered_warnings.insert(warning.to_string()) {
+            self.inject_system_notification(warning);
+        }
+    }
+
+    /// Record that `stage` ran at the current context size.
+    pub fn record_compaction_stage(
+        &mut self,
+        stage: crate::agent::compaction_stages::CompactionStage,
+    ) {
+        self.last_compaction = Some((stage, self.effective_input_tokens));
     }
 
     pub fn steps(&self) -> &[StepRecord] {
@@ -253,6 +347,12 @@ impl AgentState {
         };
         result.total_input_tokens = input_tokens;
         result.total_output_tokens = output_tokens;
+        // Report cost on every outcome, not just BudgetExceeded. Cost was tracked all
+        // along but only ever surfaced on a status the loop never constructed, so batch
+        // runs reported no spend at all.
+        if self.total_cost > 0.0 {
+            result.total_cost_usd = Some(self.total_cost);
+        }
         result
     }
 }
@@ -646,7 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn test_effective_input_tokens_accumulates_with_usage() {
+    fn test_effective_input_tokens_tracks_latest_prompt_size() {
         use crate::llm::types::Usage;
 
         let mut state = AgentState::new("task");
@@ -671,8 +771,29 @@ mod tests {
             }),
             "claude-sonnet-4-20250514",
         );
-        assert_eq!(state.effective_input_tokens(), 300);
+        // `effective` is the size of the latest prompt, not a running sum: the API
+        // reports the whole context in every response's `input_tokens`.
+        assert_eq!(state.effective_input_tokens(), 200);
+        // `total` stays cumulative, for spend reporting.
         assert_eq!(state.total_input_tokens(), 300);
+    }
+
+    #[test]
+    fn test_effective_input_tokens_includes_cached_prefix() {
+        use crate::llm::types::Usage;
+
+        let mut state = AgentState::new("task");
+        state.accumulate_usage(
+            Some(&Usage {
+                input_tokens: 1_000,
+                output_tokens: 50,
+                cache_creation_input_tokens: Some(400),
+                cache_read_input_tokens: Some(8_000),
+            }),
+            "claude-sonnet-4-20250514",
+        );
+        // Cached tokens are billed separately but still occupy the context window.
+        assert_eq!(state.effective_input_tokens(), 9_400);
     }
 
     #[test]
@@ -782,8 +903,8 @@ mod tests {
             "claude-sonnet-4-20250514",
         );
 
-        // effective tracks only post-compaction context
-        assert_eq!(state.effective_input_tokens(), 12_000);
+        // effective tracks only the latest prompt, which is the post-compaction context
+        assert_eq!(state.effective_input_tokens(), 10_000);
         // total is cumulative across the whole session
         assert_eq!(state.total_input_tokens(), 160_000);
     }

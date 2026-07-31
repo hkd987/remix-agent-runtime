@@ -114,7 +114,7 @@ impl<T: ToolExecutor> CoordinationExecutor<T> {
                     "required": []
                 }),
                 cache_control: None,
-                read_only: false,
+                read_only: true,
             },
             ToolDefinition {
                 name: "task_get".to_string(),
@@ -130,11 +130,12 @@ impl<T: ToolExecutor> CoordinationExecutor<T> {
                     "required": ["task_id"]
                 }),
                 cache_control: None,
-                read_only: false,
+                read_only: true,
             },
             ToolDefinition {
                 name: "task_update".to_string(),
-                description: "Update an existing task (status, owner, description, etc.).".to_string(),
+                description: "Update an existing task (status, owner, description, etc.)."
+                    .to_string(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -240,39 +241,7 @@ impl<T: ToolExecutor> CoordinationExecutor<T> {
                 cache_control: None,
                 read_only: false,
             },
-            ToolDefinition {
-                name: "spawn_agent".to_string(),
-                description: "Spawn a child agent to handle a subtask. The child agent runs independently with its own conversation and can use a subset of available tools.".to_string(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Name for the subagent"
-                        },
-                        "task": {
-                            "type": "string",
-                            "description": "The task for the subagent to accomplish"
-                        },
-                        "system_prompt": {
-                            "type": "string",
-                            "description": "Optional system prompt for the subagent"
-                        },
-                        "allowed_tools": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "Tool name patterns this subagent can use (regex). If empty, uses all parent tools except spawn_agent."
-                        },
-                        "max_iterations": {
-                            "type": "integer",
-                            "description": "Maximum iterations for the subagent (default from config)"
-                        }
-                    },
-                    "required": ["name", "task"]
-                }),
-                cache_control: None,
-                read_only: false,
-            },
+            crate::subagent::executor::spawn_agent_tool_definition(),
         ]
     }
 
@@ -313,34 +282,7 @@ impl<T: ToolExecutor> CoordinationExecutor<T> {
         &self,
         arguments: Value,
     ) -> Result<ToolExecutionResult, AgentError> {
-        let subject = arguments
-            .get("subject")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AgentError::Coordination("Missing required field 'subject'".into()))?
-            .to_string();
-
-        let description = arguments
-            .get("description")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AgentError::Coordination("Missing required field 'description'".into()))?
-            .to_string();
-
-        let active_form = arguments
-            .get("active_form")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        let metadata = arguments
-            .get("metadata")
-            .and_then(|v| v.as_object())
-            .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
-
-        let params = TaskCreateParams {
-            subject,
-            description,
-            active_form,
-            metadata,
-        };
+        let params: TaskCreateParams = Self::parse_params("task_create", arguments)?;
 
         let task = self.context.task_store.create(params).await?;
         let json = serde_json::to_string_pretty(&task)
@@ -385,73 +327,25 @@ impl<T: ToolExecutor> CoordinationExecutor<T> {
         }
     }
 
+    /// Deserialize tool arguments into a typed params struct.
+    ///
+    /// Replaces hand-destructuring the `Value` field by field. That approach silently
+    /// dropped anything it could not interpret — most sharply an invalid `status`,
+    /// which was routed through a `str -> Value -> TaskStatus` round trip whose error
+    /// was discarded, so a typo read as "no status change" instead of being reported.
+    fn parse_params<P: serde::de::DeserializeOwned>(
+        tool: &str,
+        arguments: Value,
+    ) -> Result<P, AgentError> {
+        serde_json::from_value(arguments)
+            .map_err(|e| AgentError::Coordination(format!("Invalid arguments for {tool}: {e}")))
+    }
+
     async fn handle_task_update(
         &self,
         arguments: Value,
     ) -> Result<ToolExecutionResult, AgentError> {
-        let task_id = arguments
-            .get("task_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AgentError::Coordination("Missing required field 'task_id'".into()))?
-            .to_string();
-
-        let status = arguments.get("status").and_then(|v| {
-            v.as_str()
-                .and_then(|s| serde_json::from_value(json!(s)).ok())
-        });
-
-        let subject = arguments
-            .get("subject")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        let description = arguments
-            .get("description")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        let active_form = arguments
-            .get("active_form")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        let owner = arguments
-            .get("owner")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        let metadata = arguments
-            .get("metadata")
-            .and_then(|v| v.as_object())
-            .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
-
-        let add_blocks = arguments.get("add_blocks").and_then(|v| {
-            v.as_array().map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-        });
-
-        let add_blocked_by = arguments.get("add_blocked_by").and_then(|v| {
-            v.as_array().map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-        });
-
-        let params = TaskUpdateParams {
-            task_id,
-            status,
-            subject,
-            description,
-            active_form,
-            owner,
-            metadata,
-            add_blocks,
-            add_blocked_by,
-        };
+        let params: TaskUpdateParams = Self::parse_params("task_update", arguments)?;
 
         match self.context.task_store.update(params).await {
             Ok(task) => {
@@ -473,21 +367,7 @@ impl<T: ToolExecutor> CoordinationExecutor<T> {
         &self,
         arguments: Value,
     ) -> Result<ToolExecutionResult, AgentError> {
-        let team_name = arguments
-            .get("team_name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AgentError::Coordination("Missing required field 'team_name'".into()))?
-            .to_string();
-
-        let description = arguments
-            .get("description")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        let params = TeamCreateParams {
-            team_name,
-            description,
-        };
+        let params: TeamCreateParams = Self::parse_params("team_create", arguments)?;
 
         match self.context.team_store.create(params).await {
             Ok(team) => {
@@ -1784,5 +1664,68 @@ mod tests {
             .wait_for_children(std::time::Duration::from_secs(1))
             .await;
         assert!(results2.is_empty());
+    }
+
+    // --- Typed argument parsing ---
+
+    #[tokio::test]
+    async fn test_task_update_reports_an_invalid_status() {
+        // Previously the status went through a `str -> Value -> TaskStatus` round trip
+        // whose error was discarded, so a typo was silently read as "no status change"
+        // and the model was told the update succeeded.
+        let exec = make_executor(&[], test_config());
+        let created = exec
+            .execute_tool("task_create", json!({"subject": "s", "description": "d"}))
+            .await
+            .unwrap();
+        let task: serde_json::Value = serde_json::from_str(&created.content).unwrap();
+        let id = task["id"].as_str().unwrap().to_string();
+
+        let err = exec
+            .execute_tool(
+                "task_update",
+                json!({"task_id": id, "status": "definitely_not_a_status"}),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Invalid arguments for task_update"),
+            "invalid status was not reported: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_update_accepts_a_partial_update() {
+        // Every optional field must remain omittable.
+        let exec = make_executor(&[], test_config());
+        let created = exec
+            .execute_tool("task_create", json!({"subject": "s", "description": "d"}))
+            .await
+            .unwrap();
+        let task: serde_json::Value = serde_json::from_str(&created.content).unwrap();
+        let id = task["id"].as_str().unwrap().to_string();
+
+        let result = exec
+            .execute_tool("task_update", json!({"task_id": id, "subject": "renamed"}))
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("renamed"), "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn test_task_create_reports_a_missing_required_field() {
+        let exec = make_executor(&[], test_config());
+        let err = exec
+            .execute_tool("task_create", json!({"subject": "s"}))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Invalid arguments for task_create"),
+            "got: {err}"
+        );
     }
 }

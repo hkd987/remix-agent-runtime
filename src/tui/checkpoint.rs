@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn test_load_missing_file() {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = CheckpointManager::load(&dir.path().to_path_buf()).unwrap();
+        let mgr = CheckpointManager::load(dir.path()).unwrap();
         assert!(mgr.list().is_empty());
     }
 

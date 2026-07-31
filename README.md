@@ -129,6 +129,23 @@ remix-agent run "Navigate to example.com and tell me what's on the page"
 remix-agent run [OPTIONS] [TASK]
 ```
 
+The binary has three subcommands:
+
+| Subcommand | Description |
+|------------|-------------|
+| `run` | Execute a task and exit. The main entry point. |
+| `chat` | Interactive terminal UI with streaming output. Requires the `tui` Cargo feature, so it is not present in published release binaries. |
+| `sessions` | Inspect stored sessions: `sessions list` and `sessions show <ID>`. |
+
+```bash
+# Interactive chat (requires: cargo build --features tui)
+remix-agent chat
+
+# List stored sessions, then inspect one
+remix-agent sessions list
+remix-agent sessions show <SESSION_ID>
+```
+
 **Core:**
 
 | Flag | Short | Env Var | Description |
@@ -674,9 +691,25 @@ Permissions control which tools the agent can call without user confirmation.
 | `default` | Ask the user before each tool call |
 | `accept_edits` | Auto-allow write tools (write_file, edit_file, bash), ask for others |
 | `bypass_permissions` | Allow all tools without asking |
-| `plan` | Read-only mode -- only allows read_file, grep, glob, load_skill, read_skill_resource |
+| `plan` | Read-only mode -- only allows tools that declare themselves read-only |
+| `dont_ask` | Like `default`, but denies instead of asking |
 
-Policy evaluation order: `bypass_permissions` > `plan` mode > `denied_tools` (regex) > `allowed_tools` (regex) > ask user.
+Policy evaluation order: argument-scoped denials > `bypass_permissions` > `plan` mode > `denied_tools` (regex) > `allowed_tools` (regex) > ask user.
+
+**Non-interactive runs:** there is no one to prompt, so a tool that would have
+prompted is executed instead. In `default` mode that makes a headless run
+"allow everything except the denied patterns". The runtime warns about this at
+startup; use `--permission-mode dont_ask` to deny instead.
+
+**Pattern matching:** `allowed_tools` patterns are anchored to the whole tool
+name, so `read` grants `read_file` only if written that way and never matches
+`spread_files`. Alternations still work (`navigate|click`). `denied_tools`
+patterns are unanchored, so a broad pattern catches variants. An invalid regex
+is a startup error, never a silently ignored rule.
+
+**Argument-scoped rules:** a `denied_tools` entry written `tool:pattern` matches
+against the call's argument values rather than just the tool name, so a specific
+dangerous invocation can be blocked without banning the tool outright.
 
 ```bash
 # Run in plan mode (read-only exploration)
@@ -687,6 +720,9 @@ remix-agent run --allow-tool "navigate|click|screenshot" "Take screenshots of ea
 
 # Deny dangerous tools
 remix-agent run --deny-tool "bash|write_file" "Read and summarize the logs"
+
+# Deny one dangerous invocation rather than the whole tool
+remix-agent run --deny-tool 'bash:rm\s+-rf' "Run the test suite"
 ```
 
 ```yaml
@@ -762,7 +798,7 @@ The agent can integrate with language servers and test frameworks for code intel
 |------|-------------|
 | **LSP** | Type checking, go-to-definition, find-references via language servers (rust-analyzer, typescript-language-server, pyright, etc.) |
 | **Test harness** | Run tests with framework auto-detection (cargo test, pytest, jest, go test, etc.) and structured result collection |
-| **Repo map** | Generate a codebase structure overview using tree-sitter parsing |
+| **Repo map** | Generate a codebase structure overview. Uses tree-sitter with the `dev-tools` feature, and falls back to regex extraction without it |
 
 ```yaml
 dev_tools:
@@ -781,7 +817,7 @@ dev_tools:
     max_depth: 10
 ```
 
-Disable individually with `--no-lsp`, `--no-test-harness`, `--no-repo-map`, or all at once with `--no-dev-tools`. The repo map requires the `dev-tools` Cargo feature for tree-sitter support.
+Disable individually with `--no-lsp`, `--no-test-harness`, `--no-repo-map`, or all at once with `--no-dev-tools`. The repo map works without the `dev-tools` Cargo feature, using regex-based extraction; enabling the feature switches it to tree-sitter, which understands the grammar and so handles multi-line signatures and nested items the regexes miss.
 
 ### Webhooks
 
@@ -881,21 +917,26 @@ harbor run \
 
 ## Cargo features
 
-The runtime ships with three optional feature flags:
+The runtime ships with four optional feature flags:
 
 | Feature | Dependencies | Description |
 |---------|-------------|-------------|
 | `postgres` | sqlx | PostgreSQL session storage backend |
 | `sse` | axum | Real-time SSE event streaming server |
-| `dev-tools` | tree-sitter, tree-sitter-{rust,typescript,python,javascript} | Code intelligence via tree-sitter parsing |
+| `dev-tools` | tree-sitter, tree-sitter-{rust,typescript,python,javascript} | Tree-sitter symbol extraction for the repo map |
+| `tui` | ratatui, crossterm | Interactive `remix-agent chat` terminal UI |
 
 ```bash
 # Build with all features
-cargo build --release --features postgres,sse,dev-tools
+cargo build --release --all-features
 
 # Build with just SSE
 cargo build --release --features sse
 ```
+
+**Note:** published release binaries are built with default features only, so
+`chat`, `--sse-port` and the Postgres session backend require building from
+source with the corresponding flag.
 
 ## Development
 
@@ -918,113 +959,190 @@ cargo fmt --check
 The runtime uses a **decorator chain** pattern where each layer intercepts tool calls it owns and delegates everything else to the next layer:
 
 ```
-CoordinationExecutor          ← multi-agent coordination (7 tools)
-  └─ PermissionAwareExecutor  ← permission checking (4 modes)
-       └─ HookAwareExecutor   ← fires pre/post hooks around every tool call
-            └─ LocalToolsExecutor  ← intercepts read_file, write_file, edit_file, bash, grep, glob, web_fetch
-                 └─ SkillAwareExecutor  ← intercepts load_skill, run_skill_script, read_skill_resource
-                      └─ CompositeToolExecutor  ← routes to MCP backends (remix-browser, plugins)
+PermissionAwareExecutor            ← permission checking (5 modes)
+  └─ CoordinationExecutor          ← multi-agent coordination (7 tools)
+       └─ HookAwareExecutor        ← fires hooks; may deny or rewrite a call
+            └─ DevToolsExecutor    ← intercepts lsp_*, run_tests, list_tests, repo_map
+                 └─ LocalToolsExecutor   ← intercepts read_file, write_file, edit_file, multi_edit, bash, grep, glob, web_fetch
+                      └─ SkillAwareExecutor   ← intercepts load_skill, run_skill_script, read_skill_resource
+                           └─ CompositeToolExecutor  ← routes to MCP backends (remix-browser, plugins)
 ```
+
+Permissions sit outermost so that coordination's virtual tools — `spawn_agent` and
+friends, which it handles before delegating inward — are policy-checked like any other
+tool. Spawned child agents are built with the same chain and inherit their parent's
+policy, so a child can never hold more authority than the agent that created it.
 
 All components implement the `ToolExecutor` trait, making every layer independently testable with mocks. The `LlmProvider` trait abstracts the LLM HTTP client for the same reason.
 
 ```
 src/
-├── main.rs                    # CLI entry point, decorator chain wiring
-├── cli.rs                     # Argument parsing (clap)
-├── lib.rs                     # Public module re-exports
-├── error.rs                   # Error types and exit codes
+├── cli.rs                              # Argument parsing (clap)
+├── error.rs                            # Error types and exit codes
+├── lib.rs                              # Public module re-exports
+├── main.rs                             # CLI entry point, decorator chain wiring
 ├── agent/
-│   ├── loop_impl.rs           # Core agent loop (AgentRunner)
-│   ├── state.rs               # Message history + step recording
-│   ├── compaction.rs          # Context compaction logic
-│   ├── compaction_prompt.rs   # Compaction system prompt
-│   ├── loop_detection.rs      # Exact-match + semantic loop detection
-│   ├── reasoning_stages.rs    # Adaptive thinking budget phases
-│   ├── reminders.rs           # Action reminder injection
-│   ├── lsp_tools.rs           # LSP integration (dev tools)
-│   ├── test_harness.rs        # Test framework detection + execution
-│   └── repo_map.rs            # Codebase structure via tree-sitter
+│   ├── compaction.rs                   # Context compaction logic
+│   ├── compaction_prompt.rs            # Compaction system prompt
+│   ├── compaction_stages.rs            # Progressive compaction stages
+│   ├── interactive.rs                  # Streaming response assembly
+│   ├── invariants.rs                   # Conversation-structure validation
+│   ├── loop_detection.rs               # Exact-match + semantic loop detection
+│   ├── loop_impl.rs                    # Core agent loop (AgentRunner) — batch, resume and interactive
+│   ├── mod.rs
+│   ├── reasoning_stages.rs             # Adaptive thinking budget phases
+│   ├── reminders.rs                    # Action reminder injection
+│   ├── self_critique.rs                # Pre-execution critique of planned actions
+│   ├── state.rs                        # Message history + step recording
+│   └── tool_registry.rs                # Lazy tool discovery + search_tools
 ├── agents_md/
-│   ├── mod.rs                 # Public API re-exports
-│   └── discovery.rs           # AGENTS.md walk + injection
+│   ├── discovery.rs
+│   └── mod.rs
 ├── browser/
-│   ├── mcp.rs                 # MCP client + ToolExecutor trait definition
-│   ├── manager.rs             # Browser process lifecycle
-│   └── convert.rs             # MCP → Anthropic schema conversion
+│   ├── convert.rs
+│   ├── manager.rs
+│   ├── mcp.rs
+│   └── mod.rs
 ├── config/
-│   ├── mod.rs                 # Config merging (CLI > env > YAML > defaults)
-│   ├── schema.rs              # AppConfig, LlmConfig, PluginsConfig, etc.
-│   ├── credentials.rs         # Credential adapter (RawCredential → CredentialSet)
-│   └── env.rs                 # ${VAR} interpolation
+│   ├── credentials.rs
+│   ├── env.rs
+│   ├── mod.rs
+│   └── schema.rs
 ├── coordination/
-│   ├── mod.rs                 # Public API re-exports
-│   ├── context.rs             # CoordinationContext (shared state)
-│   ├── executor.rs            # CoordinationExecutor decorator
-│   ├── shared_executor.rs     # SharedToolExecutor for worker agents
-│   ├── task_types.rs          # Task, TaskStatus, TaskId
-│   ├── task_store.rs          # TaskStore (RwLock + file persistence)
-│   ├── team_types.rs          # Team, TeamId, WorkerInfo
-│   ├── team_store.rs          # TeamStore (RwLock + file persistence)
-│   ├── inbox_types.rs         # InboxMessage, InboxId
-│   └── inbox_store.rs         # InboxStore (RwLock + file persistence)
+│   ├── context.rs
+│   ├── default_spawner.rs
+│   ├── executor.rs
+│   ├── inbox_store.rs
+│   ├── inbox_types.rs
+│   ├── mod.rs
+│   ├── prompt.rs
+│   ├── shared_executor.rs
+│   ├── spawn_handler.rs
+│   ├── task_store.rs
+│   ├── task_types.rs
+│   ├── team_store.rs
+│   └── team_types.rs
+├── dev_tools/
+│   ├── config.rs
+│   ├── executor.rs
+│   ├── mod.rs
+│   ├── lsp/
+│   │   ├── detection.rs
+│   │   ├── diagnostics.rs
+│   │   ├── find_references.rs
+│   │   ├── goto_definition.rs
+│   │   ├── manager.rs
+│   │   ├── mod.rs
+│   │   └── types.rs
+│   ├── repo_map/
+│   │   ├── generator.rs
+│   │   ├── mod.rs
+│   │   ├── treesitter.rs
+│   │   └── types.rs
+│   └── test_harness/
+│       ├── detect.rs
+│       ├── exec.rs
+│       ├── list.rs
+│       ├── mod.rs
+│       ├── run.rs
+│       ├── types.rs
+│       └── parsers/
+│           ├── cargo.rs
+│           ├── go.rs
+│           ├── jest.rs
+│           ├── mod.rs
+│           └── pytest.rs
 ├── llm/
-│   ├── client.rs              # Anthropic HTTP client with retry
-│   └── types.rs               # Message, ContentBlock, ToolDefinition
+│   ├── client.rs
+│   ├── mod.rs
+│   ├── stream.rs
+│   └── types.rs
 ├── local_tools/
-│   ├── mod.rs                 # Public API re-exports
-│   ├── executor.rs            # LocalToolsExecutor decorator
+│   ├── executor.rs
+│   ├── mod.rs
 │   ├── sandbox/
-│   │   ├── mod.rs             # BashSandbox trait + factory
-│   │   ├── path_validator.rs  # Sandbox path enforcement
-│   │   ├── seatbelt.rs        # macOS sandbox-exec wrapper
-│   │   └── landlock.rs        # Linux Landlock LSM wrapper
+│   │   ├── landlock.rs
+│   │   ├── mod.rs
+│   │   ├── path_validator.rs
+│   │   └── seatbelt.rs
 │   └── tools/
-│       ├── mod.rs             # Tool module re-exports
-│       ├── read_file.rs       # read_file tool
-│       ├── write_file.rs      # write_file tool
-│       ├── edit_file.rs       # edit_file tool
-│       ├── bash.rs            # bash tool
-│       ├── grep.rs            # grep tool
-│       ├── glob_tool.rs       # glob tool
-│       ├── web_fetch.rs       # web_fetch tool
-│       └── output_filter.rs   # Shared truncation + ANSI stripping
+│       ├── bash.rs
+│       ├── command_parser.rs
+│       ├── edit_file.rs
+│       ├── glob_tool.rs
+│       ├── grep.rs
+│       ├── mod.rs
+│       ├── multi_edit.rs
+│       ├── output_filter.rs
+│       ├── read_file.rs
+│       ├── web_fetch.rs
+│       └── write_file.rs
 ├── output/
-│   ├── result.rs              # AgentResult, StepRecord
-│   ├── webhook.rs             # Webhook dispatcher
-│   ├── events.rs              # Event bus (broadcast channel)
-│   └── sse_server.rs          # Axum SSE server (optional)
+│   ├── events.rs
+│   ├── mod.rs
+│   ├── result.rs
+│   ├── sse_server.rs
+│   └── webhook.rs
 ├── permissions/
-│   ├── mod.rs                 # Public re-exports
-│   ├── types.rs               # PermissionMode, PermissionPolicy
-│   └── executor.rs            # PermissionAwareExecutor decorator
+│   ├── executor.rs
+│   ├── mod.rs
+│   └── types.rs
 ├── plugins/
-│   ├── mod.rs                 # Public re-exports
-│   ├── types.rs               # PluginSet, ResolvedPlugin, PluginComponents
-│   ├── discovery.rs           # discover_all_plugins, resolve_local_dir
-│   ├── github.rs              # Git clone/update for GitHub plugins
-│   ├── composite_executor.rs  # CompositeToolExecutor (multi-backend routing)
-│   ├── hook_executor.rs       # HookAwareExecutor decorator
+│   ├── composite_executor.rs
+│   ├── discovery.rs
+│   ├── github.rs
+│   ├── hook_executor.rs
+│   ├── mod.rs
+│   ├── types.rs
 │   └── components/
-│       ├── skills.rs          # merge_plugin_skills into SkillSet
-│       ├── hooks.rs           # HookRegistry, hooks.json parsing
-│       ├── agents.rs          # Agent .md parsing + system prompt injection
-│       └── mcp.rs             # Plugin MCP server configuration
+│       ├── agents.rs
+│       ├── hooks.rs
+│       ├── mcp.rs
+│       ├── mod.rs
+│       └── skills.rs
 ├── session/
-│   ├── mod.rs                 # Public re-exports
-│   ├── types.rs               # SessionId, SessionMetadata, SessionSnapshot
-│   └── store.rs               # SessionStore (create, load, fork, append)
+│   ├── conformance.rs
+│   ├── file_store.rs
+│   ├── mod.rs
+│   ├── postgres_store.rs
+│   ├── traits.rs
+│   └── types.rs
 ├── skills/
-│   ├── mod.rs                 # Public API re-exports
-│   ├── discovery.rs           # Skill discovery + SKILL.md parsing
-│   ├── executor.rs            # SkillAwareExecutor decorator
-│   └── types.rs               # SkillSet, SkillEntry, SkillMetadata
-└── subagent/
-    ├── mod.rs                 # Public re-exports
-    ├── types.rs               # SubagentDefinition, SpawnRequest
-    ├── executor.rs            # SubagentExecutor decorator
-    └── filtered_executor.rs   # FilteredToolExecutor (regex tool filtering)
+│   ├── discovery.rs
+│   ├── executor.rs
+│   ├── mod.rs
+│   └── types.rs
+├── subagent/
+│   ├── executor.rs
+│   ├── filtered_executor.rs
+│   ├── mod.rs
+│   └── types.rs
+├── tenant/
+│   ├── context.rs
+│   ├── isolation.rs
+│   ├── mod.rs
+│   ├── rate_limiter.rs
+│   └── scheduler.rs
+└── tui/
+    ├── app.rs
+    ├── checkpoint.rs
+    ├── commands.rs
+    ├── event_handler.rs
+    ├── history.rs
+    ├── input.rs
+    ├── mod.rs
+    ├── prompt.rs
+    ├── render.rs
+    └── widgets/
+        ├── chat.rs
+        ├── command_palette.rs
+        ├── input_bar.rs
+        ├── mod.rs
+        ├── permission.rs
+        ├── status_bar.rs
+        └── tool_call.rs
 ```
+
 
 ## License
 
