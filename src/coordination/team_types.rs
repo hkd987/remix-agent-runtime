@@ -39,6 +39,7 @@ pub struct TeamConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamCreateParams {
     pub team_name: String,
+    #[serde(default)]
     pub description: Option<String>,
 }
 

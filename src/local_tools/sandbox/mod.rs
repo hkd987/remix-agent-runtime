@@ -59,6 +59,54 @@ pub trait BashSandbox: Send + Sync {
     }
 }
 
+/// Spawn `cmd` under a timeout and collect its output.
+///
+/// Shared by all three sandbox implementations, which each carried their own copy of
+/// this spawn/timeout/match block. That duplication had already caused a divergence:
+/// the process-group handling below existed only in the fallback sandbox, so a
+/// timed-out command under Landlock or Seatbelt left its grandchildren running.
+pub(crate) async fn run_with_timeout(
+    mut cmd: tokio::process::Command,
+    root: &Path,
+    timeout_secs: u64,
+) -> Result<CommandOutput, AgentError> {
+    cmd.current_dir(root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    // Own process group, so a timeout can kill the whole tree. `kill_on_drop` signals
+    // only the direct child, so a shell that has forked leaves its children running.
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| AgentError::LocalTool(format!("Failed to spawn sandboxed command: {e}")))?;
+
+    #[cfg(unix)]
+    let child_pid = child.id();
+
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => Ok(CommandOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_code: output.status.code().unwrap_or(-1),
+        }),
+        Ok(Err(e)) => Err(AgentError::LocalTool(format!(
+            "Command execution failed: {e}"
+        ))),
+        Err(_) => {
+            #[cfg(unix)]
+            kill_process_group(child_pid);
+            Err(AgentError::LocalTool(format!(
+                "Command timed out after {timeout_secs}s"
+            )))
+        }
+    }
+}
+
 /// Fallback sandbox with no OS-level enforcement (timeout + cwd only).
 pub struct FallbackSandbox {
     root: PathBuf,
@@ -94,48 +142,7 @@ fn shell_command(command: &str) -> tokio::process::Command {
 #[async_trait]
 impl BashSandbox for FallbackSandbox {
     async fn execute(&self, command: &str, timeout_secs: u64) -> Result<CommandOutput, AgentError> {
-        use std::time::Duration;
-
-        let mut builder = shell_command(command);
-        builder
-            .current_dir(&self.root)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-
-        // Put the child in its own process group so a timeout can kill the whole tree.
-        // `kill_on_drop` only signals the direct child, so a shell that has forked
-        // (a build, a test runner) leaves its children running past the timeout.
-        #[cfg(unix)]
-        builder.process_group(0);
-
-        let child = builder
-            .spawn()
-            .map_err(|e| AgentError::LocalTool(format!("Failed to spawn command: {e}")))?;
-
-        #[cfg(unix)]
-        let child_pid = child.id();
-
-        let timeout = Duration::from_secs(timeout_secs);
-        let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
-
-        match result {
-            Ok(Ok(output)) => Ok(CommandOutput {
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                exit_code: output.status.code().unwrap_or(-1),
-            }),
-            Ok(Err(e)) => Err(AgentError::LocalTool(format!(
-                "Command execution failed: {e}"
-            ))),
-            Err(_) => {
-                #[cfg(unix)]
-                kill_process_group(child_pid);
-                Err(AgentError::LocalTool(format!(
-                    "Command timed out after {timeout_secs}s"
-                )))
-            }
-        }
+        run_with_timeout(shell_command(command), &self.root, timeout_secs).await
     }
 
     fn root(&self) -> &Path {

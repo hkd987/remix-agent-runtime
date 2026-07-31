@@ -68,7 +68,9 @@ impl From<&Task> for TaskSummary {
 pub struct TaskCreateParams {
     pub subject: String,
     pub description: String,
+    #[serde(default)]
     pub active_form: Option<String>,
+    #[serde(default)]
     pub metadata: Option<HashMap<String, Value>>,
 }
 
@@ -76,13 +78,21 @@ pub struct TaskCreateParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskUpdateParams {
     pub task_id: String,
+    #[serde(default)]
     pub status: Option<TaskStatus>,
+    #[serde(default)]
     pub subject: Option<String>,
+    #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
     pub active_form: Option<String>,
+    #[serde(default)]
     pub owner: Option<String>,
+    #[serde(default)]
     pub metadata: Option<HashMap<String, Value>>,
+    #[serde(default)]
     pub add_blocks: Option<Vec<String>>,
+    #[serde(default)]
     pub add_blocked_by: Option<Vec<String>>,
 }
 

@@ -27,16 +27,10 @@ mod linux_impl {
             command: &str,
             timeout_secs: u64,
         ) -> Result<CommandOutput, AgentError> {
-            use std::time::Duration;
-
             let root_clone = self.root.clone();
 
             let mut cmd = tokio::process::Command::new("sh");
-            cmd.args(["-c", command])
-                .current_dir(&self.root)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true);
+            cmd.args(["-c", command]);
 
             // Apply Landlock restrictions via pre_exec
             // SAFETY: apply_landlock_rules only calls Landlock syscalls (async-signal-safe)
@@ -45,26 +39,7 @@ mod linux_impl {
                 cmd.pre_exec(move || apply_landlock_rules(&root_for_preexec));
             }
 
-            let child = cmd.spawn().map_err(|e| {
-                AgentError::LocalTool(format!("Failed to spawn sandboxed command: {e}"))
-            })?;
-
-            let timeout = Duration::from_secs(timeout_secs);
-            let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
-
-            match result {
-                Ok(Ok(output)) => Ok(CommandOutput {
-                    stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                    stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                    exit_code: output.status.code().unwrap_or(-1),
-                }),
-                Ok(Err(e)) => Err(AgentError::LocalTool(format!(
-                    "Command execution failed: {e}"
-                ))),
-                Err(_) => Err(AgentError::LocalTool(format!(
-                    "Command timed out after {timeout_secs}s"
-                ))),
-            }
+            super::super::run_with_timeout(cmd, &self.root, timeout_secs).await
         }
 
         fn root(&self) -> &Path {
