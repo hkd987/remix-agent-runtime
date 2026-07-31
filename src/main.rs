@@ -753,6 +753,14 @@ async fn run_chat(chat_args: ChatArgs) -> ExitCode {
         }
     };
 
+    // Same startup checks as `run`. Chat previously skipped both, so a tenant profile
+    // was ignored and an invalid config combination ran anyway.
+    remix_agent_runtime::tenant::isolation::apply_tenant_profile(&mut config);
+    if let Err(e) = config.validate() {
+        eprintln!("Error: invalid configuration: {e}");
+        return ExitStatus::ConfigError.into();
+    }
+
     // Validate API key (skip for localhost)
     if config.llm.api_key.is_empty()
         && !config.llm.base_url.contains("localhost")
@@ -1018,13 +1026,37 @@ async fn run_chat(chat_args: ChatArgs) -> ExitCode {
     // Build AgentRunner
     let thinking_control: std::sync::Arc<dyn remix_agent_runtime::llm::client::ThinkingControl> =
         llm_client.clone();
-    let runner = AgentRunner::new(llm_client, executor, agent_config)
+    // The interactive loop runs self-critique too, so it needs the same dedicated
+    // client the run path gets when `self_critique.model` is configured.
+    let critique_llm: Option<std::sync::Arc<dyn remix_agent_runtime::llm::client::LlmProvider>> =
+        config.agent.self_critique.as_ref().and_then(|sc| {
+            sc.model.as_ref().map(|model| {
+                tracing::info!(model = %model, "Using dedicated self-critique model");
+                let client: std::sync::Arc<dyn remix_agent_runtime::llm::client::LlmProvider> =
+                    std::sync::Arc::new(AnthropicClient::new(
+                        config.llm.base_url.clone(),
+                        config.llm.api_key.clone(),
+                        model.clone(),
+                        sc.max_tokens,
+                        config.llm.custom_headers.clone(),
+                        None,
+                        false,
+                    ));
+                client
+            })
+        });
+
+    let mut runner = AgentRunner::new(llm_client, executor, agent_config)
         .with_hooks(
             std::sync::Arc::new(hook_registry.clone()),
             config.plugins.hook_timeout_secs,
         )
         .with_event_bus(event_bus.clone())
         .with_thinking_control(thinking_control);
+    if let Some(c) = critique_llm {
+        runner = runner.with_critique_llm(c);
+    }
+    let runner = runner;
 
     // Launch TUI
     remix_agent_runtime::tui::run_tui(
