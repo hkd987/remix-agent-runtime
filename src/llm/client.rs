@@ -415,6 +415,9 @@ impl StreamingLlmProvider for AnthropicClient {
         let api_key = self.api_key.clone();
         let custom_headers = self.custom_headers.clone();
         let enable_prompt_caching = self.enable_prompt_caching;
+        // Captured up front: the spawned task cannot borrow `self`.
+        let max_retries = self.max_retries;
+        let retry_base_delay_ms = self.retry_base_delay_ms;
 
         tokio::spawn(async move {
             let mut builder = client
@@ -431,12 +434,65 @@ impl StreamingLlmProvider for AnthropicClient {
                 builder = builder.header(key, value);
             }
 
-            let response = match builder.json(&request.to_wire()).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = tx.send(Err(AgentError::Http(e))).await;
-                    return;
+            // Retry transient failures before opening the stream, matching the
+            // non-streaming path. Only the connection setup is retried: once bytes are
+            // flowing a retry would replay content the caller has already seen.
+            let mut response = None;
+            for attempt in 0..max_retries.max(1) {
+                let mut builder = client
+                    .post(&url)
+                    .header("x-api-key", &api_key)
+                    .header("content-type", "application/json")
+                    .header("anthropic-version", "2023-06-01");
+                if enable_prompt_caching {
+                    builder = builder.header("anthropic-beta", "prompt-caching-2024-07-31");
                 }
+                for (key, value) in &custom_headers {
+                    builder = builder.header(key, value);
+                }
+
+                let attempt_result = match builder.json(&request.to_wire()).send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if is_retryable_transport_error(&e) && attempt + 1 < max_retries.max(1) {
+                            let delay = retry_delay_ms(attempt, None, retry_base_delay_ms);
+                            tracing::warn!(
+                                attempt = attempt,
+                                delay_ms = delay,
+                                error = %e,
+                                "Transport error opening stream, retrying"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                            continue;
+                        }
+                        let _ = tx.send(Err(AgentError::Http(e))).await;
+                        return;
+                    }
+                };
+
+                let status = attempt_result.status();
+                let retryable_status =
+                    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+                if retryable_status && attempt + 1 < max_retries.max(1) {
+                    let retry_after = parse_retry_after(attempt_result.headers());
+                    let delay = retry_delay_ms(attempt, retry_after, retry_base_delay_ms);
+                    tracing::warn!(
+                        attempt = attempt,
+                        delay_ms = delay,
+                        status = status.as_u16(),
+                        "Retryable status opening stream, retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    continue;
+                }
+
+                response = Some(attempt_result);
+                break;
+            }
+
+            let Some(response) = response else {
+                let _ = tx.send(Err(AgentError::LlmRateLimited)).await;
+                return;
             };
 
             let status = response.status();
@@ -448,6 +504,8 @@ impl StreamingLlmProvider for AnthropicClient {
                     AgentError::LlmAuth(body)
                 } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     AgentError::LlmRateLimited
+                } else if status == reqwest::StatusCode::BAD_REQUEST && is_context_overflow(&body) {
+                    AgentError::LlmContextOverflow(body)
                 } else {
                     AgentError::Llm(format!("HTTP {}: {}", status.as_u16(), body))
                 };
@@ -1514,5 +1572,101 @@ mod tests {
         let response = client.send_messages(None, &messages, None).await.unwrap();
         assert_eq!(response.id, "msg_1");
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_stream_retries_a_server_error_before_opening() {
+        // The streaming path had no retries at all, so a single 503 while opening the
+        // stream ended the turn even though the same failure was retried on the
+        // non-streaming path.
+        use crate::llm::client::StreamingLlmProvider;
+        use tokio_stream::StreamExt as _;
+
+        let mut server = mockito::Server::new_async().await;
+        let fail = server
+            .mock("POST", "/v1/messages")
+            .with_status(503)
+            .with_body("overloaded")
+            .expect(1)
+            .create_async()
+            .await;
+        let ok = server
+            .mock("POST", "/v1/messages")
+            .with_status(200)
+            .with_body("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = AnthropicClient::new(
+            server.url(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            8192,
+            Default::default(),
+            None,
+            false,
+        )
+        .with_retry_base_delay_ms(1);
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "hi".to_string(),
+            }],
+        }];
+
+        let mut stream = client.send_messages_stream(None, &messages, None);
+        let mut saw_error = false;
+        while let Some(event) = stream.next().await {
+            if event.is_err() {
+                saw_error = true;
+            }
+        }
+
+        assert!(!saw_error, "the 503 was surfaced instead of being retried");
+        fail.assert_async().await;
+        ok.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_stream_surfaces_context_overflow_distinctly() {
+        use crate::llm::client::StreamingLlmProvider;
+        use tokio_stream::StreamExt as _;
+
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v1/messages")
+            .with_status(400)
+            .with_body(r#"{"error":{"message":"prompt is too long: 300000 tokens"}}"#)
+            .create_async()
+            .await;
+
+        let client = AnthropicClient::new(
+            server.url(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            8192,
+            Default::default(),
+            None,
+            false,
+        )
+        .with_retry_base_delay_ms(1);
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "hi".to_string(),
+            }],
+        }];
+
+        let mut stream = client.send_messages_stream(None, &messages, None);
+        let mut got_overflow = false;
+        while let Some(event) = stream.next().await {
+            if matches!(event, Err(AgentError::LlmContextOverflow(_))) {
+                got_overflow = true;
+            }
+        }
+        assert!(got_overflow, "context overflow was not distinguished");
     }
 }
