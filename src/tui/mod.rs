@@ -126,6 +126,9 @@ where
                 &agents_md,
                 session_store_ref,
                 compaction_ref,
+                // The chat path has no dedicated compaction client wired yet; the
+                // primary model is used, as before.
+                None,
             )
             .await
     });

@@ -165,6 +165,149 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         None
     }
 
+    /// Run everything that must happen before the LLM call each iteration.
+    ///
+    /// This exists because the same pre-flight was written out three times — once per
+    /// loop — and had already drifted: `resume` was missing loop detection, reasoning
+    /// stages and the budget warning entirely, and the batch loop ran the reminder
+    /// scheduler twice per iteration while `resume` ran it once. Every loop now calls
+    /// this, so a new pre-flight step is added in one place.
+    fn prepare_iteration(&self, state: &mut AgentState, reminder_scheduler: &ReminderScheduler) {
+        // Action progress reminder
+        if let Some(reminder) = self.build_action_reminder(state) {
+            state.inject_system_notification(&reminder);
+        }
+
+        // Iteration budget warning (one-time)
+        if let Some(warning) = self.build_budget_warning(state) {
+            state.inject_system_notification(&warning);
+        }
+
+        // Loop detection. Warnings are latched: the detectors re-scan the same window
+        // each iteration, so an un-latched warning repeats until the window rolls over.
+        if let Some(ref loop_config) = self.config.loop_detection {
+            if let Some(warning) = super::loop_detection::detect_loop(state.steps(), loop_config) {
+                state.inject_warning_once(&warning);
+            }
+
+            // Semantic loop detection (test-without-modify)
+            if let Some(warning) =
+                super::loop_detection::detect_semantic_loop(state.steps(), loop_config)
+            {
+                state.inject_warning_once(&warning);
+            }
+        }
+
+        // System reminders. Called once per iteration, before the LLM call — the
+        // `EveryNIterations` arm ignores pending tools, so calling it again after the
+        // response simply fired the same reminder twice.
+        if !reminder_scheduler.is_empty() {
+            for reminder in reminder_scheduler.check(state.current_iteration(), &[]) {
+                state.inject_system_notification(&reminder);
+            }
+        }
+
+        // Reasoning budget stages: adjust thinking budget based on phase
+        if let (Some(ref stages_config), Some(ref thinking_ctl)) =
+            (&self.config.reasoning_stages, &self.thinking_control)
+        {
+            let budget = super::reasoning_stages::compute_thinking_budget(
+                stages_config,
+                state.current_iteration(),
+                self.config.max_iterations,
+            );
+            thinking_ctl
+                .set_thinking_config(Some(crate::llm::types::ThinkingConfig::enabled(budget)));
+        }
+    }
+
+    /// Run the self-critique pass on planned actions.
+    ///
+    /// Returns `Some(content)` when the actions were approved (or critique is disabled)
+    /// and the caller should execute them, `None` when they were rejected and the
+    /// caller should `continue` the loop.
+    ///
+    /// Extracted so the interactive loop gets it too — it was implemented only in the
+    /// batch loop, so a chat session silently ran without the critic its config asked
+    /// for.
+    async fn run_self_critique(
+        &self,
+        state: &mut AgentState,
+        assistant_content: Vec<ContentBlock>,
+        task: &str,
+        critique_rounds: &mut u32,
+    ) -> Option<Vec<ContentBlock>> {
+        let Some(ref critique_config) = self.config.self_critique else {
+            return Some(assistant_content);
+        };
+        if *critique_rounds >= critique_config.max_rounds
+            || !self_critique::should_critique(critique_config, &assistant_content)
+        {
+            return Some(assistant_content);
+        }
+
+        debug!("Running self-critique on planned actions");
+        let critique_prompt = self_critique::build_critique_prompt(&assistant_content, task);
+        let critique_system = [SystemContent::text(self_critique::CRITIQUE_SYSTEM_PROMPT)];
+        let critique_messages = vec![crate::llm::types::Message {
+            role: crate::llm::types::Role::User,
+            content: vec![ContentBlock::Text {
+                text: critique_prompt,
+            }],
+        }];
+
+        // Use the configured critique model when one was wired in, falling back to the
+        // primary client. The client is injected rather than built here so the runner
+        // stays generic over the provider.
+        let critique_provider: &dyn LlmProvider = match self.critique_llm.as_deref() {
+            Some(c) => c,
+            None => &self.llm,
+        };
+
+        let Ok(critique_response) = critique_provider
+            .send_messages(Some(&critique_system), &critique_messages, None)
+            .await
+        else {
+            warn!("Self-critique request failed; proceeding with the planned actions");
+            return Some(assistant_content);
+        };
+
+        let critique_text = critique_response
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let result = self_critique::parse_critique_response(&critique_text);
+        if result.approved {
+            return Some(assistant_content);
+        }
+
+        *critique_rounds += 1;
+        info!(
+            round = *critique_rounds,
+            max_rounds = critique_config.max_rounds,
+            "Self-critique rejected actions: {}",
+            result.reasoning
+        );
+        let feedback = format!(
+            "[SELF_CRITIQUE] Your planned actions were rejected.\nReason: {}\n{}Please revise your approach.",
+            result.reasoning,
+            result
+                .suggestions
+                .map(|s| format!("Suggestions: {s}\n"))
+                .unwrap_or_default(),
+        );
+        // The rejected content carries tool_use blocks by construction, so each one
+        // needs a tool_result.
+        state.add_assistant_message_refusing_tools(assistant_content, &feedback);
+        None
+    }
+
     /// Ask the model to continue a response that was cut off by the output token cap.
     ///
     /// Returns `None` if a continuation was requested (caller should `continue` the
@@ -461,6 +604,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         };
 
         // Feature 1: Lazy tool discovery — build registry only when needed
+
         let all_tool_defs = self.tools.tool_definitions().to_vec();
         let mut tool_registry = if self.config.lazy_tool_discovery {
             let always_avail = ALWAYS_AVAILABLE_TOOLS
@@ -551,53 +695,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 },
             );
 
-            // Action progress reminder
-            if let Some(reminder) = self.build_action_reminder(&state) {
-                state.inject_system_notification(&reminder);
-            }
-
-            // Iteration budget warning (one-time)
-            if let Some(warning) = self.build_budget_warning(&state) {
-                state.inject_system_notification(&warning);
-            }
-
-            // Loop detection
-            if let Some(ref loop_config) = self.config.loop_detection {
-                if let Some(warning) =
-                    super::loop_detection::detect_loop(state.steps(), loop_config)
-                {
-                    state.inject_system_notification(&warning);
-                }
-
-                // Semantic loop detection (test-without-modify)
-                if let Some(warning) =
-                    super::loop_detection::detect_semantic_loop(state.steps(), loop_config)
-                {
-                    state.inject_system_notification(&warning);
-                }
-            }
-
-            // Feature 5: Check system reminders before LLM call
-            if !reminder_scheduler.is_empty() {
-                let pending_tools: Vec<String> = Vec::new(); // pre-execution, no pending tools yet
-                let reminders = reminder_scheduler.check(state.current_iteration(), &pending_tools);
-                for reminder in reminders {
-                    state.inject_system_notification(&reminder);
-                }
-            }
-
-            // Reasoning budget stages: adjust thinking budget based on phase
-            if let (Some(ref stages_config), Some(ref thinking_ctl)) =
-                (&self.config.reasoning_stages, &self.thinking_control)
-            {
-                let budget = super::reasoning_stages::compute_thinking_budget(
-                    stages_config,
-                    state.current_iteration(),
-                    self.config.max_iterations,
-                );
-                thinking_ctl
-                    .set_thinking_config(Some(crate::llm::types::ThinkingConfig::enabled(budget)));
-            }
+            self.prepare_iteration(&mut state, &reminder_scheduler);
 
             // Feature 1 + 4: Resolve tool definitions based on mode
             let effective_tool_defs: Cow<'_, [ToolDefinition]> =
@@ -709,78 +807,23 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                                 _ => None,
                             })
                             .collect();
-                        let tool_reminders = reminder_scheduler
-                            .check(state.current_iteration(), &pending_tool_names);
+                        let tool_reminders = reminder_scheduler.check_tools(&pending_tool_names);
                         for reminder in tool_reminders {
                             state.inject_system_notification(&reminder);
                         }
                     }
 
-                    // Feature 6: Self-critique phase
-                    if let Some(ref critique_config) = self.config.self_critique {
-                        if critique_rounds < critique_config.max_rounds
-                            && self_critique::should_critique(critique_config, &assistant_content)
-                        {
-                            debug!("Running self-critique on planned actions");
-                            let critique_prompt =
-                                self_critique::build_critique_prompt(&assistant_content, task);
-                            let critique_system =
-                                [SystemContent::text(self_critique::CRITIQUE_SYSTEM_PROMPT)];
-                            let critique_messages = vec![crate::llm::types::Message {
-                                role: crate::llm::types::Role::User,
-                                content: vec![ContentBlock::Text {
-                                    text: critique_prompt,
-                                }],
-                            }];
-                            // Use the configured critique model when one was wired in,
-                            // falling back to the primary client. `model` and
-                            // `max_tokens` were previously ignored entirely; the client
-                            // is injected rather than built here so the runner stays
-                            // generic over the provider.
-                            let critique_provider: &dyn LlmProvider =
-                                match self.critique_llm.as_deref() {
-                                    Some(c) => c,
-                                    None => &self.llm,
-                                };
-
-                            if let Ok(critique_response) = critique_provider
-                                .send_messages(Some(&critique_system), &critique_messages, None)
-                                .await
-                            {
-                                let critique_text = critique_response
-                                    .content
-                                    .iter()
-                                    .filter_map(|b| match b {
-                                        ContentBlock::Text { text } => Some(text.clone()),
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                let result = self_critique::parse_critique_response(&critique_text);
-                                if !result.approved {
-                                    critique_rounds += 1;
-                                    info!(
-                                        round = critique_rounds,
-                                        max_rounds = critique_config.max_rounds,
-                                        "Self-critique rejected actions: {}",
-                                        result.reasoning
-                                    );
-                                    let feedback = format!(
-                                        "[SELF_CRITIQUE] Your planned actions were rejected.\nReason: {}\n{}Please revise your approach.",
-                                        result.reasoning,
-                                        result.suggestions.map(|s| format!("Suggestions: {s}\n")).unwrap_or_default(),
-                                    );
-                                    // The rejected content carries tool_use blocks by
-                                    // construction, so each one needs a tool_result.
-                                    state.add_assistant_message_refusing_tools(
-                                        assistant_content,
-                                        &feedback,
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
-                    }
+                    let Some(assistant_content) = self
+                        .run_self_critique(
+                            &mut state,
+                            assistant_content,
+                            task,
+                            &mut critique_rounds,
+                        )
+                        .await
+                    else {
+                        continue;
+                    };
 
                     state.add_assistant_message(assistant_content.clone());
 
@@ -1247,6 +1290,9 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             Some(system_blocks)
         };
 
+        // The resumed conversation carries the original task as its first message.
+        let resumed_task = state.original_task().unwrap_or_default().to_string();
+
         let all_tool_defs = self.tools.tool_definitions().to_vec();
         let mut tool_registry = if self.config.lazy_tool_discovery {
             let always_avail = ALWAYS_AVAILABLE_TOOLS
@@ -1261,6 +1307,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         let timeout_ms = self.config.timeout_secs * 1000;
         let session_metadata = session_store.load_metadata(session_id).await.ok();
         let mut nudge_count: u32 = 0;
+        let mut critique_rounds: u32 = 0;
         let mut goal_check_fired = false;
 
         loop {
@@ -1324,18 +1371,9 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 },
             );
 
-            // Action progress reminder
-            if let Some(reminder) = self.build_action_reminder(&state) {
-                state.inject_system_notification(&reminder);
-            }
-
-            // System reminders
-            if !reminder_scheduler.is_empty() {
-                let reminders = reminder_scheduler.check(state.current_iteration(), &[]);
-                for reminder in reminders {
-                    state.inject_system_notification(&reminder);
-                }
-            }
+            // Resuming previously skipped loop detection, reasoning stages and the
+            // budget warning; going through the shared pre-flight restores them.
+            self.prepare_iteration(&mut state, &reminder_scheduler);
 
             // Resolve tool definitions
             let effective_tool_defs: Cow<'_, [ToolDefinition]> =
@@ -1434,6 +1472,18 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         self.emit_completed(AgentStatus::Success, Some(final_text.clone()), &state);
                         return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                     }
+
+                    let Some(assistant_content) = self
+                        .run_self_critique(
+                            &mut state,
+                            assistant_content,
+                            &resumed_task,
+                            &mut critique_rounds,
+                        )
+                        .await
+                    else {
+                        continue;
+                    };
 
                     state.add_assistant_message(assistant_content.clone());
                     let (tool_results, step_records) = self
@@ -1669,6 +1719,7 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
         agents_md: &Option<crate::agents_md::AgentsMdContent>,
         session_store: Option<&dyn SessionStorage>,
         compaction_config: Option<&CompactionConfig>,
+        compaction_llm: Option<&dyn LlmProvider>,
     ) -> Result<AgentResult, AgentError> {
         use super::interactive::{InteractiveSignal, StreamAssembler, UserMessage};
         use crate::llm::types::compute_cost;
@@ -1728,6 +1779,7 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
         let reminder_scheduler = ReminderScheduler::from_configs(&self.config.reminders);
         let timeout_ms = self.config.timeout_secs * 1000;
         let mut nudge_count: u32 = 0;
+        let mut critique_rounds: u32 = 0;
         let mut goal_check_fired = false;
 
         loop {
@@ -1766,7 +1818,8 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
 
             // Progressive context compaction (no dedicated compaction LLM in interactive mode)
             if let Some(compact_config) = compaction_config {
-                self.run_compaction(compact_config, &mut state, None).await;
+                self.run_compaction(compact_config, &mut state, compaction_llm)
+                    .await;
             }
 
             state.increment_iteration();
@@ -1779,51 +1832,7 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
                 },
             );
 
-            // Action progress reminder
-            if let Some(reminder) = self.build_action_reminder(&state) {
-                state.inject_system_notification(&reminder);
-            }
-
-            // Iteration budget warning (one-time)
-            if let Some(warning) = self.build_budget_warning(&state) {
-                state.inject_system_notification(&warning);
-            }
-
-            // Loop detection
-            if let Some(ref loop_config) = self.config.loop_detection {
-                if let Some(warning) =
-                    super::loop_detection::detect_loop(state.steps(), loop_config)
-                {
-                    state.inject_system_notification(&warning);
-                }
-                if let Some(warning) =
-                    super::loop_detection::detect_semantic_loop(state.steps(), loop_config)
-                {
-                    state.inject_system_notification(&warning);
-                }
-            }
-
-            // System reminders
-            if !reminder_scheduler.is_empty() {
-                let reminders =
-                    reminder_scheduler.check(state.current_iteration(), &Vec::<String>::new());
-                for reminder in reminders {
-                    state.inject_system_notification(&reminder);
-                }
-            }
-
-            // Reasoning budget stages
-            if let (Some(ref stages_config), Some(ref thinking_ctl)) =
-                (&self.config.reasoning_stages, &self.thinking_control)
-            {
-                let budget = super::reasoning_stages::compute_thinking_budget(
-                    stages_config,
-                    state.current_iteration(),
-                    self.config.max_iterations,
-                );
-                thinking_ctl
-                    .set_thinking_config(Some(crate::llm::types::ThinkingConfig::enabled(budget)));
-            }
+            self.prepare_iteration(&mut state, &reminder_scheduler);
 
             // Resolve effective tool definitions
             let effective_tool_defs: std::borrow::Cow<'_, [ToolDefinition]> =
@@ -2047,6 +2056,20 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
                         }
                     }
 
+                    // Self-critique. Previously implemented only in the batch loop, so
+                    // a chat session silently ran without the critic its config asked for.
+                    let Some(assistant_content) = self
+                        .run_self_critique(
+                            &mut state,
+                            assistant_content,
+                            &first_task,
+                            &mut critique_rounds,
+                        )
+                        .await
+                    else {
+                        continue;
+                    };
+
                     // Execute tools
                     state.add_assistant_message(assistant_content.clone());
                     let (tool_results, step_records) = self
@@ -2086,15 +2109,25 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
                             "Unrecognized stop_reason from the API; treating as end_turn"
                         );
                     }
-                    let content = if !content_has_tool_use(&response.content) {
-                        let Some(content) =
-                            self.try_nudge(&mut state, response.content, &mut nudge_count)
-                        else {
+                    // Normalization above guarantees no tool_use is pending here.
+                    // `max_tokens` means the output was cut off mid-sentence, so ask for
+                    // a continuation rather than reporting the fragment as the answer.
+                    let content = if effective_stop_reason == StopReason::MaxTokens {
+                        let Some(c) = self.try_continue_truncated(
+                            &mut state,
+                            response.content,
+                            &mut nudge_count,
+                        ) else {
                             continue;
                         };
-                        content
+                        c
                     } else {
                         response.content
+                    };
+
+                    let Some(content) = self.try_nudge(&mut state, content, &mut nudge_count)
+                    else {
+                        continue;
                     };
 
                     let Some(content) =

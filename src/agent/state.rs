@@ -21,6 +21,9 @@ pub struct AgentState {
     /// The compaction stage most recently applied, and the context size at the time.
     /// Used to stop a stage from re-running when it cannot reduce the context further.
     last_compaction: Option<(crate::agent::compaction_stages::CompactionStage, u32)>,
+    /// Loop-detection warnings already delivered, so a tripped detector nags once
+    /// rather than on every iteration until its window rolls over.
+    delivered_warnings: std::collections::HashSet<String>,
 }
 
 impl AgentState {
@@ -41,6 +44,7 @@ impl AgentState {
             effective_input_tokens: 0,
             has_written_files: false,
             last_compaction: None,
+            delivered_warnings: std::collections::HashSet::new(),
         }
     }
 
@@ -61,6 +65,7 @@ impl AgentState {
             effective_input_tokens: 0,
             has_written_files,
             last_compaction: None,
+            delivered_warnings: std::collections::HashSet::new(),
         }
     }
 
@@ -224,6 +229,17 @@ impl AgentState {
                 self.effective_input_tokens > tokens_at_run
             }
             _ => true,
+        }
+    }
+
+    /// Inject `warning` only the first time it is seen.
+    ///
+    /// Loop detectors re-scan the same window every iteration, so once tripped they
+    /// produce the identical warning again and again until the window rolls over —
+    /// which buries the signal in repetition and burns context.
+    pub fn inject_warning_once(&mut self, warning: &str) {
+        if self.delivered_warnings.insert(warning.to_string()) {
+            self.inject_system_notification(warning);
         }
     }
 
