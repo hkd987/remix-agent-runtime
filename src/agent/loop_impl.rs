@@ -25,7 +25,7 @@ use super::compaction_stages;
 use super::reminders::ReminderScheduler;
 use super::self_critique;
 use super::state::AgentState;
-use super::tool_registry::ToolRegistry;
+use super::tool_registry::{ToolRegistry, SEARCH_TOOLS_NAME};
 
 /// Message injected when the LLM returns text-only without using any tools.
 const NUDGE_MESSAGE: &str = "You provided analysis but did not take any action. Continue with the implementation. Use tools to make progress on the task.";
@@ -283,96 +283,33 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
 
     /// Returns `true` for tools that only read state.
     /// Used for plan mode filtering and potential future parallel execution.
-    pub fn is_read_only_tool(name: &str) -> bool {
-        matches!(
-            name,
-            "read_file"
-                | "grep"
-                | "glob"
-                | "list_files"
-                | "screenshot"
-                | "get_page_info"
-                | "get_console_logs"
-                | "get_page_content"
-                | "search_tools"
-        )
+    /// Whether a tool is read-only, according to the definitions currently in scope.
+    ///
+    /// Reads the declaration rather than a hardcoded name list. There used to be three
+    /// such lists — here and twice in `permissions` — and they had already drifted, so
+    /// plan mode advertised tools that were then refused at execution and refused tools
+    /// it never advertised.
+    fn is_read_only_tool(tools: &[ToolDefinition], name: &str) -> bool {
+        // `search_tools` is a meta-tool synthesized by the registry rather than a
+        // registered definition, and it only queries the registry.
+        if name == SEARCH_TOOLS_NAME {
+            return true;
+        }
+        tools
+            .iter()
+            .find(|t| t.name == name)
+            .map(|t| t.read_only)
+            .unwrap_or(false)
     }
 
     /// Filter tool definitions to only include read-only tools (for plan mode).
     fn filter_read_only_tools(tools: &[ToolDefinition]) -> Vec<ToolDefinition> {
-        tools
-            .iter()
-            .filter(|t| t.read_only || Self::is_read_only_tool(&t.name))
-            .cloned()
-            .collect()
+        tools.iter().filter(|t| t.read_only).cloned().collect()
     }
 
     /// Execute tool_use blocks from an assistant response sequentially.
     ///
     /// Returns `(tool_results, step_records)` preserving the original block order.
-    #[cfg(test)]
-    async fn execute_tools(
-        &self,
-        assistant_content: &[ContentBlock],
-        iteration: u32,
-    ) -> (Vec<ContentBlock>, Vec<StepRecord>) {
-        let mut tool_results = Vec::new();
-        let mut step_records = Vec::new();
-
-        for block in assistant_content {
-            match block {
-                ContentBlock::ToolUse { id, name, input } => {
-                    debug!(tool = %name, "Executing tool");
-                    events::emit(
-                        &self.event_bus,
-                        AgentEvent::ToolUseStart {
-                            id: id.clone(),
-                            name: name.clone(),
-                            input: input.clone(),
-                        },
-                    );
-                    let step_start = Instant::now();
-                    let exec_result = self.tools.execute_tool(name, input.clone()).await;
-                    let step_duration = step_start.elapsed().as_millis() as u64;
-                    let (content_block, step) = Self::process_tool_result(
-                        id,
-                        name,
-                        input,
-                        exec_result,
-                        step_duration,
-                        iteration,
-                    );
-                    events::emit(
-                        &self.event_bus,
-                        AgentEvent::ToolUseResult {
-                            id: id.clone(),
-                            name: name.clone(),
-                            output: step.output.clone(),
-                            duration_ms: step.duration_ms,
-                            is_error: step.is_error.unwrap_or(false),
-                        },
-                    );
-                    tool_results.push(content_block);
-                    step_records.push(step);
-                }
-                ContentBlock::Thinking { thinking, .. } => {
-                    debug!(
-                        thinking_length = thinking.len(),
-                        "Model produced thinking block"
-                    );
-                    events::emit(
-                        &self.event_bus,
-                        AgentEvent::ThinkingComplete {
-                            thinking: thinking.clone(),
-                        },
-                    );
-                }
-                _ => {}
-            }
-        }
-
-        (tool_results, step_records)
-    }
 
     /// Process a single tool execution result into a ContentBlock and StepRecord.
     fn process_tool_result(
@@ -994,7 +931,9 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     }
 
                     // Feature 4: Block non-read-only tools in plan mode
-                    if self.config.plan_mode && !Self::is_read_only_tool(name) {
+                    if self.config.plan_mode
+                        && !Self::is_read_only_tool(self.tools.tool_definitions(), name)
+                    {
                         let error_msg = format!(
                             "Tool '{}' is blocked in plan mode. Only read-only tools are allowed.",
                             name
@@ -2995,39 +2934,95 @@ mod tests {
     }
 
     #[test]
-    fn test_is_read_only_tool() {
-        // Read-only tools
+    fn test_is_read_only_tool_reads_the_declaration() {
+        // Read-only status now comes from each tool's own definition rather than a
+        // hardcoded name list, so the same name can be read-only or not depending on
+        // what the executor in scope declares.
+        let defs = vec![
+            ToolDefinition {
+                name: "read_file".to_string(),
+                description: String::new(),
+                input_schema: json!({}),
+                cache_control: None,
+                read_only: true,
+            },
+            ToolDefinition {
+                name: "write_file".to_string(),
+                description: String::new(),
+                input_schema: json!({}),
+                cache_control: None,
+                read_only: false,
+            },
+        ];
+
         assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
+            &defs,
             "read_file"
         ));
-        assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool("grep"));
-        assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool("glob"));
-        assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
-            "list_files"
-        ));
-        assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
-            "screenshot"
-        ));
-
-        // Write / side-effecting tools
         assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
+            &defs,
             "write_file"
         ));
-        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
-            "edit_file"
+
+        // The registry meta-tool has no definition but only queries the registry.
+        assert!(AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
+            &defs,
+            "search_tools"
         ));
+
+        // An unknown tool is assumed to mutate — the safe default for plan mode.
         assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
-            "bash"
+            &defs,
+            "something_unknown"
         ));
-        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
-            "navigate"
-        ));
-        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
-            "click"
-        ));
-        assert!(!AgentRunner::<MockLlm, MockTools>::is_read_only_tool(
-            "unknown_tool"
-        ));
+    }
+
+    #[test]
+    fn test_plan_mode_advertised_set_matches_permitted_set() {
+        // The bug this guards against: the loop advertised tools that the permission
+        // layer then denied, and hid tools the permission layer would have allowed.
+        use crate::permissions::types::{PermissionDecision, PermissionMode, PermissionPolicy};
+
+        let defs = vec![
+            ToolDefinition {
+                name: "read_file".to_string(),
+                description: String::new(),
+                input_schema: json!({}),
+                cache_control: None,
+                read_only: true,
+            },
+            ToolDefinition {
+                name: "web_fetch".to_string(),
+                description: String::new(),
+                input_schema: json!({}),
+                cache_control: None,
+                read_only: false,
+            },
+            ToolDefinition {
+                name: "bash".to_string(),
+                description: String::new(),
+                input_schema: json!({}),
+                cache_control: None,
+                read_only: false,
+            },
+        ];
+
+        let advertised = AgentRunner::<MockLlm, MockTools>::filter_read_only_tools(&defs);
+        let policy = PermissionPolicy {
+            mode: PermissionMode::Plan,
+            ..Default::default()
+        };
+
+        for tool in &defs {
+            let permitted =
+                policy.check_tool(&tool.name, tool.read_only) == PermissionDecision::Allow;
+            let shown = advertised.iter().any(|t| t.name == tool.name);
+            assert_eq!(
+                shown, permitted,
+                "`{}` is advertised={shown} but permitted={permitted}",
+                tool.name
+            );
+        }
     }
 
     #[tokio::test]
@@ -3044,7 +3039,8 @@ mod tests {
         let content = vec![ContentBlock::Text {
             text: "No tools here".to_string(),
         }];
-        let (tool_results, step_records) = runner.execute_tools(&content, 1).await;
+        let (tool_results, step_records) =
+            runner.execute_tools_with_registry(&content, 1, None).await;
         assert!(tool_results.is_empty());
         assert!(step_records.is_empty());
     }
@@ -3068,7 +3064,8 @@ mod tests {
             name: "navigate".to_string(),
             input: json!({"url": "https://example.com"}),
         }];
-        let (tool_results, step_records) = runner.execute_tools(&content, 1).await;
+        let (tool_results, step_records) =
+            runner.execute_tools_with_registry(&content, 1, None).await;
         assert_eq!(tool_results.len(), 1);
         assert_eq!(step_records.len(), 1);
         assert!(matches!(
@@ -3125,7 +3122,8 @@ mod tests {
                 input: json!({"pattern": "foo"}),
             },
         ];
-        let (tool_results, step_records) = runner.execute_tools(&content, 1).await;
+        let (tool_results, step_records) =
+            runner.execute_tools_with_registry(&content, 1, None).await;
         assert_eq!(tool_results.len(), 3);
 
         // Results should be in original order regardless of execution order
@@ -3169,7 +3167,8 @@ mod tests {
             name: "bash".to_string(),
             input: json!({"command": "false"}),
         }];
-        let (tool_results, step_records) = runner.execute_tools(&content, 1).await;
+        let (tool_results, step_records) =
+            runner.execute_tools_with_registry(&content, 1, None).await;
         assert_eq!(tool_results.len(), 1);
         assert!(matches!(
             &tool_results[0],
@@ -3206,7 +3205,7 @@ mod tests {
         )
         .with_event_bus(bus);
 
-        runner.execute_tools(&content, 1).await;
+        runner.execute_tools_with_registry(&content, 1, None).await;
 
         // Should receive ToolUseStart then ToolUseResult
         let ev1 = rx.recv().await.unwrap();
@@ -3240,7 +3239,7 @@ mod tests {
         )
         .with_event_bus(bus);
 
-        runner.execute_tools(&content, 1).await;
+        runner.execute_tools_with_registry(&content, 1, None).await;
 
         let ev = rx.recv().await.unwrap();
         assert_eq!(ev.event_type(), "thinking_complete");

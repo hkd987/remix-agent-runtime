@@ -353,7 +353,7 @@ fn virtual_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["name"]
             }),
             cache_control: None,
-            read_only: false,
+            read_only: true,
         },
         ToolDefinition {
             name: "run_skill_script".to_string(),
@@ -398,7 +398,7 @@ fn virtual_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["skill_name", "path"]
             }),
             cache_control: None,
-            read_only: false,
+            read_only: true,
         },
     ]
 }

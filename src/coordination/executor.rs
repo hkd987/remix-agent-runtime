@@ -114,7 +114,7 @@ impl<T: ToolExecutor> CoordinationExecutor<T> {
                     "required": []
                 }),
                 cache_control: None,
-                read_only: false,
+                read_only: true,
             },
             ToolDefinition {
                 name: "task_get".to_string(),
@@ -130,7 +130,7 @@ impl<T: ToolExecutor> CoordinationExecutor<T> {
                     "required": ["task_id"]
                 }),
                 cache_control: None,
-                read_only: false,
+                read_only: true,
             },
             ToolDefinition {
                 name: "task_update".to_string(),

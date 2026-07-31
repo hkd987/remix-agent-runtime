@@ -55,11 +55,14 @@ pub enum EffortLevel {
     Max,
 }
 
-#[derive(clap::Args, Debug)]
-pub struct RunArgs {
-    /// Task to execute (natural language)
-    pub task: Option<String>,
-
+/// Flags shared by `run` and `chat`.
+///
+/// `RunArgs` and `ChatArgs` previously declared these 38 fields twice, with
+/// their own doc comments, env-var bindings and defaults, and a hand-written
+/// field-by-field conversion between them. Flattening one definition into both means a
+/// new flag is declared once and cannot drift between the two subcommands.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct CommonArgs {
     /// Path to YAML configuration file
     #[arg(short, long)]
     pub config: Option<PathBuf>,
@@ -80,10 +83,6 @@ pub struct RunArgs {
     #[arg(long)]
     pub max_tokens: Option<u32>,
 
-    /// Maximum duration in seconds
-    #[arg(long)]
-    pub timeout: Option<u64>,
-
     /// Maximum agent loop iterations
     #[arg(long)]
     pub max_iterations: Option<u32>,
@@ -99,10 +98,6 @@ pub struct RunArgs {
     /// Enable verbose logging to stderr
     #[arg(short, long)]
     pub verbose: bool,
-
-    /// Write results to file instead of stdout
-    #[arg(short, long)]
-    pub output: Option<PathBuf>,
 
     /// Path to remix-browser binary
     #[arg(long, env = "REMIX_BROWSER_PATH")]
@@ -148,10 +143,6 @@ pub struct RunArgs {
     #[arg(long)]
     pub session_id: Option<String>,
 
-    /// Fork from an existing session
-    #[arg(long)]
-    pub fork_session: Option<String>,
-
     /// Override session storage directory
     #[arg(long, env = "REMIX_SESSION_DIR")]
     pub session_dir: Option<PathBuf>,
@@ -184,14 +175,6 @@ pub struct RunArgs {
     #[arg(long = "continue", alias = "resume", alias = "continue-session")]
     pub continue_session: bool,
 
-    /// Effort level (low, medium, high, max)
-    #[arg(long)]
-    pub effort: Option<EffortLevel>,
-
-    /// Port for SSE event server (enables real-time streaming to UI)
-    #[arg(long, env = "REMIX_SSE_PORT")]
-    pub sse_port: Option<u16>,
-
     /// Custom system prompt
     #[arg(long)]
     pub system_prompt: Option<String>,
@@ -207,18 +190,6 @@ pub struct RunArgs {
     /// Disable context compaction entirely
     #[arg(long)]
     pub disable_compaction: bool,
-
-    /// Nudge the LLM to continue when it returns text-only responses without tool use
-    #[arg(long)]
-    pub nudge_on_text_only: bool,
-
-    /// Maximum number of text-only nudges before terminating (default: 3)
-    #[arg(long)]
-    pub nudge_max_count: Option<u32>,
-
-    /// Verify goal completion before terminating (one-time check)
-    #[arg(long)]
-    pub goal_check_on_complete: bool,
 
     /// Disable all dev tools (LSP, test harness, repo map)
     #[arg(long)]
@@ -239,6 +210,51 @@ pub struct RunArgs {
     /// Override LSP server command for a language (e.g., "rust=rust-analyzer")
     #[arg(long = "lsp-server", value_name = "LANG=CMD")]
     pub lsp_server: Vec<String>,
+
+    /// Base thinking budget tokens for LLM requests
+    #[arg(long)]
+    pub thinking_budget_tokens: Option<u32>,
+}
+
+#[derive(clap::Args, Debug, Default)]
+pub struct RunArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+
+    /// Task to execute (natural language)
+    pub task: Option<String>,
+
+    /// Maximum duration in seconds
+    #[arg(long)]
+    pub timeout: Option<u64>,
+
+    /// Write results to file instead of stdout
+    #[arg(short, long)]
+    pub output: Option<PathBuf>,
+
+    /// Fork from an existing session
+    #[arg(long)]
+    pub fork_session: Option<String>,
+
+    /// Effort level (low, medium, high, max)
+    #[arg(long)]
+    pub effort: Option<EffortLevel>,
+
+    /// Port for SSE event server (enables real-time streaming to UI)
+    #[arg(long, env = "REMIX_SSE_PORT")]
+    pub sse_port: Option<u16>,
+
+    /// Nudge the LLM to continue when it returns text-only responses without tool use
+    #[arg(long)]
+    pub nudge_on_text_only: bool,
+
+    /// Maximum number of text-only nudges before terminating (default: 3)
+    #[arg(long)]
+    pub nudge_max_count: Option<u32>,
+
+    /// Verify goal completion before terminating (one-time check)
+    #[arg(long)]
+    pub goal_check_on_complete: bool,
 
     /// Inject action reminders every N iterations (e.g., 15)
     #[arg(long)]
@@ -279,10 +295,6 @@ pub struct RunArgs {
     /// Inject one-time budget warning at this fraction of max_iterations (e.g., 0.7)
     #[arg(long)]
     pub iteration_budget_warning_threshold: Option<f32>,
-
-    /// Base thinking budget tokens for LLM requests
-    #[arg(long)]
-    pub thinking_budget_tokens: Option<u32>,
 }
 
 /// Arguments for the interactive chat command.
@@ -290,213 +302,36 @@ pub struct RunArgs {
 #[cfg(feature = "tui")]
 #[derive(clap::Args, Debug)]
 pub struct ChatArgs {
-    /// Path to YAML configuration file
-    #[arg(short, long)]
-    pub config: Option<PathBuf>,
-
-    /// LLM provider base URL
-    #[arg(long, env = "REMIX_LLM_BASE_URL")]
-    pub base_url: Option<String>,
-
-    /// LLM API key
-    #[arg(long, env = "REMIX_LLM_API_KEY")]
-    pub api_key: Option<String>,
-
-    /// LLM model identifier
-    #[arg(long, env = "REMIX_LLM_MODEL")]
-    pub model: Option<String>,
-
-    /// Maximum tokens per LLM response
-    #[arg(long)]
-    pub max_tokens: Option<u32>,
-
-    /// Maximum agent loop iterations per turn (default: 75)
-    #[arg(long)]
-    pub max_iterations: Option<u32>,
-
-    /// Run browser in headed mode (visible)
-    #[arg(long)]
-    pub headed: bool,
-
-    /// Disable browser connection (terminal-only mode)
-    #[arg(long)]
-    pub no_browser: bool,
-
-    /// Enable verbose logging to stderr
-    #[arg(short, long)]
-    pub verbose: bool,
-
-    /// Path to remix-browser binary
-    #[arg(long, env = "REMIX_BROWSER_PATH")]
-    pub browser_path: Option<String>,
-
-    /// Additional directory to scan for skills
-    #[arg(long, env = "REMIX_SKILLS_DIR")]
-    pub skills_dir: Option<PathBuf>,
-
-    /// Disable skill discovery
-    #[arg(long)]
-    pub no_skills: bool,
-
-    /// Directory to search for AGENTS.md files
-    #[arg(long, env = "REMIX_AGENTS_MD_DIR")]
-    pub agents_md_dir: Option<PathBuf>,
-
-    /// Disable AGENTS.md discovery
-    #[arg(long)]
-    pub no_agents_md: bool,
-
-    /// Disable local filesystem tools
-    #[arg(long)]
-    pub no_local_tools: bool,
-
-    /// Sandbox root directory for local tools
-    #[arg(long, env = "REMIX_SANDBOX_DIR")]
-    pub sandbox_dir: Option<PathBuf>,
-
-    /// Disable all plugin discovery
-    #[arg(long)]
-    pub no_plugins: bool,
-
-    /// Additional directory to scan for plugins
-    #[arg(long, env = "REMIX_PLUGINS_DIR")]
-    pub plugins_dir: Option<PathBuf>,
-
-    /// Disable Claude Code plugin cache discovery
-    #[arg(long)]
-    pub no_claude_plugins: bool,
-
-    /// Resume the most recent session
-    #[arg(long = "continue", alias = "resume")]
-    pub continue_session: bool,
-
-    /// Resume a specific session by ID
-    #[arg(long)]
-    pub session_id: Option<String>,
-
-    /// Override session storage directory
-    #[arg(long, env = "REMIX_SESSION_DIR")]
-    pub session_dir: Option<PathBuf>,
-
-    /// Permission mode (default, accept_edits, bypass_permissions, plan)
-    #[arg(long)]
-    pub permission_mode: Option<String>,
-
-    /// Allow specific tool patterns (repeatable)
-    #[arg(long)]
-    pub allow_tool: Vec<String>,
-
-    /// Deny specific tool patterns (repeatable)
-    #[arg(long)]
-    pub deny_tool: Vec<String>,
-
-    /// Disable multi-agent coordination
-    #[arg(long)]
-    pub no_coordination: bool,
-
-    /// Maximum concurrent worker agents
-    #[arg(long)]
-    pub max_workers: Option<u32>,
-
-    /// Override coordination storage directory
-    #[arg(long, env = "REMIX_COORDINATION_DIR")]
-    pub coordination_dir: Option<PathBuf>,
-
-    /// Custom system prompt (overrides built-in interactive prompt)
-    #[arg(long)]
-    pub system_prompt: Option<String>,
-
-    /// Override context window size in tokens for compaction
-    #[arg(long, env = "REMIX_CONTEXT_WINDOW")]
-    pub context_window: Option<u32>,
-
-    /// Disable context compaction
-    #[arg(long)]
-    pub disable_compaction: bool,
-
-    /// Disable all dev tools (LSP, test harness, repo map)
-    #[arg(long)]
-    pub no_dev_tools: bool,
-
-    /// Disable LSP integration
-    #[arg(long)]
-    pub no_lsp: bool,
-
-    /// Disable test harness tools
-    #[arg(long)]
-    pub no_test_harness: bool,
-
-    /// Disable repo map tool
-    #[arg(long)]
-    pub no_repo_map: bool,
-
-    /// Override LSP server command for a language (e.g., "rust=rust-analyzer")
-    #[arg(long = "lsp-server", value_name = "LANG=CMD")]
-    pub lsp_server: Vec<String>,
-
-    /// Base thinking budget tokens for LLM requests (default: 10000)
-    #[arg(long)]
-    pub thinking_budget_tokens: Option<u32>,
-
-    /// Maximum bytes for tool result output
-    #[arg(long, env = "REMIX_TOOL_RESULT_MAX_BYTES")]
-    pub tool_result_max_bytes: Option<usize>,
+    #[command(flatten)]
+    pub common: CommonArgs,
 }
 
 #[cfg(feature = "tui")]
 impl ChatArgs {
     /// Convert ChatArgs into a RunArgs with interactive-optimized defaults.
     pub fn to_run_args(&self) -> RunArgs {
+        // Only the fields chat does not share, plus the interactive-mode defaults.
+        // Everything else rides along in `common`, so a new shared flag needs no change
+        // here — it used to require a line in this function and a field in both structs.
+        let mut common = self.common.clone();
+        common.max_iterations = common.max_iterations.or(Some(75));
+        common.permission_mode = common
+            .permission_mode
+            .clone()
+            .or_else(|| Some("accept_edits".to_string()));
+        common.thinking_budget_tokens = common.thinking_budget_tokens.or(Some(10000));
+
         RunArgs {
+            common,
             task: None,
-            config: self.config.clone(),
-            base_url: self.base_url.clone(),
-            api_key: self.api_key.clone(),
-            model: self.model.clone(),
-            max_tokens: self.max_tokens,
             timeout: None,
-            max_iterations: self.max_iterations.or(Some(75)),
-            headed: self.headed,
-            no_browser: self.no_browser,
-            verbose: self.verbose,
             output: None,
-            browser_path: self.browser_path.clone(),
-            skills_dir: self.skills_dir.clone(),
-            no_skills: self.no_skills,
-            agents_md_dir: self.agents_md_dir.clone(),
-            no_agents_md: self.no_agents_md,
-            no_local_tools: self.no_local_tools,
-            sandbox_dir: self.sandbox_dir.clone(),
-            no_plugins: self.no_plugins,
-            plugins_dir: self.plugins_dir.clone(),
-            no_claude_plugins: self.no_claude_plugins,
-            session_id: self.session_id.clone(),
             fork_session: None,
-            session_dir: self.session_dir.clone(),
-            permission_mode: self
-                .permission_mode
-                .clone()
-                .or_else(|| Some("accept_edits".to_string())),
-            allow_tool: self.allow_tool.clone(),
-            deny_tool: self.deny_tool.clone(),
-            no_coordination: self.no_coordination,
-            max_workers: self.max_workers,
-            coordination_dir: self.coordination_dir.clone(),
-            continue_session: self.continue_session,
             effort: None,
             sse_port: None,
-            system_prompt: self.system_prompt.clone(),
-            tool_result_max_bytes: self.tool_result_max_bytes,
-            context_window: self.context_window,
-            disable_compaction: self.disable_compaction,
             nudge_on_text_only: false,
             nudge_max_count: None,
             goal_check_on_complete: false,
-            no_dev_tools: self.no_dev_tools,
-            no_lsp: self.no_lsp,
-            no_test_harness: self.no_test_harness,
-            no_repo_map: self.no_repo_map,
-            lsp_server: self.lsp_server.clone(),
             action_reminder_interval: None,
             loop_detection: true,
             loop_detection_max_repeats: Some(3),
@@ -507,7 +342,6 @@ impl ChatArgs {
             execution_budget_tokens: Some(5000),
             verification_budget_tokens: Some(10000),
             iteration_budget_warning_threshold: None,
-            thinking_budget_tokens: self.thinking_budget_tokens.or(Some(10000)),
         }
     }
 }
@@ -533,17 +367,17 @@ mod tests {
             "navigate to google.com",
         ]));
         assert_eq!(args.task, Some("navigate to google.com".to_string()));
-        assert!(args.config.is_none());
-        assert!(args.base_url.is_none());
-        assert!(args.api_key.is_none());
-        assert!(args.model.is_none());
-        assert!(args.max_tokens.is_none());
+        assert!(args.common.config.is_none());
+        assert!(args.common.base_url.is_none());
+        assert!(args.common.api_key.is_none());
+        assert!(args.common.model.is_none());
+        assert!(args.common.max_tokens.is_none());
         assert!(args.timeout.is_none());
-        assert!(args.max_iterations.is_none());
-        assert!(!args.headed);
-        assert!(!args.verbose);
+        assert!(args.common.max_iterations.is_none());
+        assert!(!args.common.headed);
+        assert!(!args.common.verbose);
         assert!(args.output.is_none());
-        assert!(args.browser_path.is_none());
+        assert!(args.common.browser_path.is_none());
     }
 
     #[test]
@@ -560,7 +394,7 @@ mod tests {
             "--config",
             "task.yaml",
         ]));
-        assert_eq!(args.config, Some(PathBuf::from("task.yaml")));
+        assert_eq!(args.common.config, Some(PathBuf::from("task.yaml")));
     }
 
     #[test]
@@ -657,50 +491,59 @@ mod tests {
             "do something",
         ]));
         assert_eq!(args.task, Some("do something".to_string()));
-        assert_eq!(args.config, Some(PathBuf::from("task.yaml")));
-        assert_eq!(args.base_url, Some("https://api.example.com".to_string()));
-        assert_eq!(args.api_key, Some("sk-test".to_string()));
-        assert_eq!(args.model, Some("gpt-4".to_string()));
-        assert_eq!(args.max_tokens, Some(4096));
+        assert_eq!(args.common.config, Some(PathBuf::from("task.yaml")));
+        assert_eq!(
+            args.common.base_url,
+            Some("https://api.example.com".to_string())
+        );
+        assert_eq!(args.common.api_key, Some("sk-test".to_string()));
+        assert_eq!(args.common.model, Some("gpt-4".to_string()));
+        assert_eq!(args.common.max_tokens, Some(4096));
         assert_eq!(args.timeout, Some(600));
-        assert_eq!(args.max_iterations, Some(100));
-        assert!(args.headed);
-        assert!(args.no_browser);
-        assert!(args.verbose);
+        assert_eq!(args.common.max_iterations, Some(100));
+        assert!(args.common.headed);
+        assert!(args.common.no_browser);
+        assert!(args.common.verbose);
         assert_eq!(args.output, Some(PathBuf::from("result.json")));
         assert_eq!(
-            args.browser_path,
+            args.common.browser_path,
             Some("/usr/local/bin/remix-browser".to_string())
         );
-        assert_eq!(args.skills_dir, Some(PathBuf::from("/tmp/skills")));
-        assert!(args.no_skills);
-        assert_eq!(args.agents_md_dir, Some(PathBuf::from("/tmp/agents")));
-        assert!(args.no_agents_md);
-        assert!(args.no_local_tools);
-        assert_eq!(args.sandbox_dir, Some(PathBuf::from("/tmp/sandbox")));
-        assert!(args.no_plugins);
-        assert_eq!(args.plugins_dir, Some(PathBuf::from("/tmp/plugins")));
-        assert!(args.no_claude_plugins);
-        assert_eq!(args.session_id, Some("abc-123".to_string()));
-        assert_eq!(args.fork_session, Some("def-456".to_string()));
-        assert_eq!(args.session_dir, Some(PathBuf::from("/tmp/sessions")));
-        assert_eq!(args.permission_mode, Some("plan".to_string()));
-        assert_eq!(args.allow_tool, vec!["navigate", "click"]);
-        assert_eq!(args.deny_tool, vec!["bash"]);
-        assert!(args.no_coordination);
-        assert_eq!(args.max_workers, Some(10));
+        assert_eq!(args.common.skills_dir, Some(PathBuf::from("/tmp/skills")));
+        assert!(args.common.no_skills);
         assert_eq!(
-            args.coordination_dir,
+            args.common.agents_md_dir,
+            Some(PathBuf::from("/tmp/agents"))
+        );
+        assert!(args.common.no_agents_md);
+        assert!(args.common.no_local_tools);
+        assert_eq!(args.common.sandbox_dir, Some(PathBuf::from("/tmp/sandbox")));
+        assert!(args.common.no_plugins);
+        assert_eq!(args.common.plugins_dir, Some(PathBuf::from("/tmp/plugins")));
+        assert!(args.common.no_claude_plugins);
+        assert_eq!(args.common.session_id, Some("abc-123".to_string()));
+        assert_eq!(args.fork_session, Some("def-456".to_string()));
+        assert_eq!(
+            args.common.session_dir,
+            Some(PathBuf::from("/tmp/sessions"))
+        );
+        assert_eq!(args.common.permission_mode, Some("plan".to_string()));
+        assert_eq!(args.common.allow_tool, vec!["navigate", "click"]);
+        assert_eq!(args.common.deny_tool, vec!["bash"]);
+        assert!(args.common.no_coordination);
+        assert_eq!(args.common.max_workers, Some(10));
+        assert_eq!(
+            args.common.coordination_dir,
             Some(PathBuf::from("/tmp/coordination"))
         );
         assert_eq!(args.sse_port, Some(3100));
         assert_eq!(
-            args.system_prompt,
+            args.common.system_prompt,
             Some("You are a helpful agent".to_string())
         );
-        assert_eq!(args.context_window, Some(128_000));
-        assert!(args.disable_compaction);
-        assert_eq!(args.tool_result_max_bytes, Some(16_384));
+        assert_eq!(args.common.context_window, Some(128_000));
+        assert!(args.common.disable_compaction);
+        assert_eq!(args.common.tool_result_max_bytes, Some(16_384));
         assert!(args.nudge_on_text_only);
         assert_eq!(args.nudge_max_count, Some(5));
         assert!(args.goal_check_on_complete);
@@ -714,7 +557,7 @@ mod tests {
         assert_eq!(args.execution_budget_tokens, Some(6_000));
         assert_eq!(args.verification_budget_tokens, Some(15_000));
         assert_eq!(args.iteration_budget_warning_threshold, Some(0.7));
-        assert_eq!(args.thinking_budget_tokens, Some(10_000));
+        assert_eq!(args.common.thinking_budget_tokens, Some(10_000));
     }
 
     #[test]
@@ -726,7 +569,7 @@ mod tests {
             "You are a helpful agent",
         ]));
         assert_eq!(
-            args.system_prompt,
+            args.common.system_prompt,
             Some("You are a helpful agent".to_string())
         );
     }
@@ -734,7 +577,7 @@ mod tests {
     #[test]
     fn test_parse_run_system_prompt_default_none() {
         let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
-        assert!(args.system_prompt.is_none());
+        assert!(args.common.system_prompt.is_none());
     }
 
     #[test]
@@ -748,8 +591,8 @@ mod tests {
             "-o",
             "out.json",
         ]));
-        assert_eq!(args.config, Some(PathBuf::from("task.yaml")));
-        assert!(args.verbose);
+        assert_eq!(args.common.config, Some(PathBuf::from("task.yaml")));
+        assert!(args.common.verbose);
         assert_eq!(args.output, Some(PathBuf::from("out.json")));
     }
 
@@ -761,23 +604,26 @@ mod tests {
             "--skills-dir",
             "/path/to/skills",
         ]));
-        assert_eq!(args.skills_dir, Some(PathBuf::from("/path/to/skills")));
-        assert!(!args.no_skills);
+        assert_eq!(
+            args.common.skills_dir,
+            Some(PathBuf::from("/path/to/skills"))
+        );
+        assert!(!args.common.no_skills);
     }
 
     #[test]
     fn test_parse_run_with_no_skills() {
         let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--no-skills"]));
-        assert!(args.no_skills);
-        assert!(args.skills_dir.is_none());
+        assert!(args.common.no_skills);
+        assert!(args.common.skills_dir.is_none());
     }
 
     #[test]
     fn test_parse_run_with_no_plugins() {
         let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--no-plugins"]));
-        assert!(args.no_plugins);
-        assert!(args.plugins_dir.is_none());
-        assert!(!args.no_claude_plugins);
+        assert!(args.common.no_plugins);
+        assert!(args.common.plugins_dir.is_none());
+        assert!(!args.common.no_claude_plugins);
     }
 
     #[test]
@@ -788,8 +634,11 @@ mod tests {
             "--plugins-dir",
             "/path/to/plugins",
         ]));
-        assert_eq!(args.plugins_dir, Some(PathBuf::from("/path/to/plugins")));
-        assert!(!args.no_plugins);
+        assert_eq!(
+            args.common.plugins_dir,
+            Some(PathBuf::from("/path/to/plugins"))
+        );
+        assert!(!args.common.no_plugins);
     }
 
     #[test]
@@ -799,8 +648,8 @@ mod tests {
             "run",
             "--no-claude-plugins",
         ]));
-        assert!(args.no_claude_plugins);
-        assert!(!args.no_plugins);
+        assert!(args.common.no_claude_plugins);
+        assert!(!args.common.no_plugins);
     }
 
     #[test]
@@ -823,22 +672,25 @@ mod tests {
             "--agents-md-dir",
             "/path/to/project",
         ]));
-        assert_eq!(args.agents_md_dir, Some(PathBuf::from("/path/to/project")));
-        assert!(!args.no_agents_md);
+        assert_eq!(
+            args.common.agents_md_dir,
+            Some(PathBuf::from("/path/to/project"))
+        );
+        assert!(!args.common.no_agents_md);
     }
 
     #[test]
     fn test_parse_run_with_no_agents_md() {
         let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--no-agents-md"]));
-        assert!(args.no_agents_md);
-        assert!(args.agents_md_dir.is_none());
+        assert!(args.common.no_agents_md);
+        assert!(args.common.agents_md_dir.is_none());
     }
 
     #[test]
     fn test_parse_run_with_no_local_tools() {
         let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--no-local-tools"]));
-        assert!(args.no_local_tools);
-        assert!(args.sandbox_dir.is_none());
+        assert!(args.common.no_local_tools);
+        assert!(args.common.sandbox_dir.is_none());
     }
 
     #[test]
@@ -849,8 +701,8 @@ mod tests {
             "--sandbox-dir",
             "/tmp/sandbox",
         ]));
-        assert_eq!(args.sandbox_dir, Some(PathBuf::from("/tmp/sandbox")));
-        assert!(!args.no_local_tools);
+        assert_eq!(args.common.sandbox_dir, Some(PathBuf::from("/tmp/sandbox")));
+        assert!(!args.common.no_local_tools);
     }
 
     #[test]
@@ -861,7 +713,7 @@ mod tests {
             "--session-id",
             "abc-123",
         ]));
-        assert_eq!(args.session_id, Some("abc-123".to_string()));
+        assert_eq!(args.common.session_id, Some("abc-123".to_string()));
         assert!(args.fork_session.is_none());
     }
 
@@ -874,7 +726,7 @@ mod tests {
             "def-456",
         ]));
         assert_eq!(args.fork_session, Some("def-456".to_string()));
-        assert!(args.session_id.is_none());
+        assert!(args.common.session_id.is_none());
     }
 
     #[test]
@@ -885,7 +737,10 @@ mod tests {
             "--session-dir",
             "/tmp/sessions",
         ]));
-        assert_eq!(args.session_dir, Some(PathBuf::from("/tmp/sessions")));
+        assert_eq!(
+            args.common.session_dir,
+            Some(PathBuf::from("/tmp/sessions"))
+        );
     }
 
     #[test]
@@ -896,15 +751,15 @@ mod tests {
             "--permission-mode",
             "plan",
         ]));
-        assert_eq!(args.permission_mode, Some("plan".to_string()));
+        assert_eq!(args.common.permission_mode, Some("plan".to_string()));
     }
 
     #[test]
     fn test_parse_run_with_no_coordination() {
         let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--no-coordination"]));
-        assert!(args.no_coordination);
-        assert!(args.max_workers.is_none());
-        assert!(args.coordination_dir.is_none());
+        assert!(args.common.no_coordination);
+        assert!(args.common.max_workers.is_none());
+        assert!(args.common.coordination_dir.is_none());
     }
 
     #[test]
@@ -915,8 +770,8 @@ mod tests {
             "--max-workers",
             "8",
         ]));
-        assert_eq!(args.max_workers, Some(8));
-        assert!(!args.no_coordination);
+        assert_eq!(args.common.max_workers, Some(8));
+        assert!(!args.common.no_coordination);
     }
 
     #[test]
@@ -928,7 +783,7 @@ mod tests {
             "/tmp/coordination",
         ]));
         assert_eq!(
-            args.coordination_dir,
+            args.common.coordination_dir,
             Some(PathBuf::from("/tmp/coordination"))
         );
     }
@@ -945,8 +800,8 @@ mod tests {
             "--deny-tool",
             "bash",
         ]));
-        assert_eq!(args.allow_tool, vec!["navigate", "click"]);
-        assert_eq!(args.deny_tool, vec!["bash"]);
+        assert_eq!(args.common.allow_tool, vec!["navigate", "click"]);
+        assert_eq!(args.common.deny_tool, vec!["bash"]);
     }
 
     // --- New tests for --continue, --effort, and sessions subcommand ---
@@ -954,7 +809,7 @@ mod tests {
     #[test]
     fn test_parse_run_with_continue_flag() {
         let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--continue"]));
-        assert!(args.continue_session);
+        assert!(args.common.continue_session);
     }
 
     #[test]
@@ -964,19 +819,19 @@ mod tests {
             "run",
             "--continue-session",
         ]));
-        assert!(args.continue_session);
+        assert!(args.common.continue_session);
     }
 
     #[test]
     fn test_parse_run_with_resume_alias() {
         let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--resume"]));
-        assert!(args.continue_session);
+        assert!(args.common.continue_session);
     }
 
     #[test]
     fn test_parse_run_continue_default_false() {
         let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
-        assert!(!args.continue_session);
+        assert!(!args.common.continue_session);
     }
 
     #[test]
@@ -1023,13 +878,13 @@ mod tests {
     #[test]
     fn test_parse_run_with_no_browser() {
         let args = extract_run_args(Cli::parse_from(["remix-agent", "run", "--no-browser"]));
-        assert!(args.no_browser);
+        assert!(args.common.no_browser);
     }
 
     #[test]
     fn test_parse_run_no_browser_default_false() {
         let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
-        assert!(!args.no_browser);
+        assert!(!args.common.no_browser);
     }
 
     #[test]
@@ -1123,13 +978,13 @@ mod tests {
             "--context-window",
             "128000",
         ]));
-        assert_eq!(args.context_window, Some(128_000));
+        assert_eq!(args.common.context_window, Some(128_000));
     }
 
     #[test]
     fn test_parse_run_context_window_default_none() {
         let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
-        assert!(args.context_window.is_none());
+        assert!(args.common.context_window.is_none());
     }
 
     #[test]
@@ -1139,13 +994,13 @@ mod tests {
             "run",
             "--disable-compaction",
         ]));
-        assert!(args.disable_compaction);
+        assert!(args.common.disable_compaction);
     }
 
     #[test]
     fn test_parse_run_disable_compaction_default_false() {
         let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
-        assert!(!args.disable_compaction);
+        assert!(!args.common.disable_compaction);
     }
 
     #[test]
@@ -1156,13 +1011,13 @@ mod tests {
             "--tool-result-max-bytes",
             "16384",
         ]));
-        assert_eq!(args.tool_result_max_bytes, Some(16_384));
+        assert_eq!(args.common.tool_result_max_bytes, Some(16_384));
     }
 
     #[test]
     fn test_parse_run_tool_result_max_bytes_default_none() {
         let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
-        assert!(args.tool_result_max_bytes.is_none());
+        assert!(args.common.tool_result_max_bytes.is_none());
     }
 
     #[test]
@@ -1332,12 +1187,12 @@ mod tests {
             "--thinking-budget-tokens",
             "10000",
         ]));
-        assert_eq!(args.thinking_budget_tokens, Some(10_000));
+        assert_eq!(args.common.thinking_budget_tokens, Some(10_000));
     }
 
     #[test]
     fn test_parse_run_thinking_budget_tokens_default_none() {
         let args = extract_run_args(Cli::parse_from(["remix-agent", "run"]));
-        assert!(args.thinking_budget_tokens.is_none());
+        assert!(args.common.thinking_budget_tokens.is_none());
     }
 }

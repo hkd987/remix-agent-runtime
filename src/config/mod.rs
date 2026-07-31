@@ -20,7 +20,7 @@ pub fn load_config(args: &RunArgs) -> Result<AppConfig, AgentError> {
     let mut config = AppConfig::default();
 
     // If --config provided, parse YAML with env var interpolation and merge
-    if let Some(ref config_path) = args.config {
+    if let Some(ref config_path) = args.common.config {
         let raw_yaml = std::fs::read_to_string(config_path).map_err(|e| {
             AgentError::Config(format!(
                 "Failed to read config file '{}': {}",
@@ -44,40 +44,40 @@ pub fn load_config(args: &RunArgs) -> Result<AppConfig, AgentError> {
     }
 
     // Apply CLI flags (highest priority)
-    if let Some(ref base_url) = args.base_url {
+    if let Some(ref base_url) = args.common.base_url {
         config.llm.base_url = base_url.clone();
     }
-    if let Some(ref api_key) = args.api_key {
+    if let Some(ref api_key) = args.common.api_key {
         config.llm.api_key = api_key.clone();
     }
-    if let Some(ref model) = args.model {
+    if let Some(ref model) = args.common.model {
         config.llm.model = model.clone();
     }
-    if let Some(max_tokens) = args.max_tokens {
+    if let Some(max_tokens) = args.common.max_tokens {
         config.llm.max_tokens = max_tokens;
     }
     if let Some(timeout) = args.timeout {
         config.browser.timeout_secs = timeout;
         config.agent.timeout_secs = timeout;
     }
-    if let Some(max_iterations) = args.max_iterations {
+    if let Some(max_iterations) = args.common.max_iterations {
         config.agent.max_iterations = max_iterations;
     }
-    if args.headed {
+    if args.common.headed {
         config.browser.headless = false;
     }
-    if let Some(ref browser_path) = args.browser_path {
+    if let Some(ref browser_path) = args.common.browser_path {
         config.browser.browser_path = Some(browser_path.clone());
     }
-    if args.no_browser {
+    if args.common.no_browser {
         config.browser.enabled = false;
     }
 
     // Apply skills configuration
-    if let Some(ref skills_dir) = args.skills_dir {
+    if let Some(ref skills_dir) = args.common.skills_dir {
         config.skills.dirs.push(skills_dir.clone());
     }
-    if args.no_skills {
+    if args.common.no_skills {
         config.skills.enabled = false;
     }
     if let Ok(val) = std::env::var("REMIX_SKILLS_DIR") {
@@ -88,10 +88,10 @@ pub fn load_config(args: &RunArgs) -> Result<AppConfig, AgentError> {
     }
 
     // Apply agents_md configuration
-    if let Some(ref dir) = args.agents_md_dir {
+    if let Some(ref dir) = args.common.agents_md_dir {
         config.agents_md.search_dir = Some(dir.clone());
     }
-    if args.no_agents_md {
+    if args.common.no_agents_md {
         config.agents_md.enabled = false;
     }
     if let Ok(val) = std::env::var("REMIX_AGENTS_MD_DIR") {
@@ -101,10 +101,10 @@ pub fn load_config(args: &RunArgs) -> Result<AppConfig, AgentError> {
     }
 
     // Apply local_tools configuration
-    if let Some(ref dir) = args.sandbox_dir {
+    if let Some(ref dir) = args.common.sandbox_dir {
         config.local_tools.sandbox_dir = Some(dir.clone());
     }
-    if args.no_local_tools {
+    if args.common.no_local_tools {
         config.local_tools.enabled = false;
     }
     if let Ok(val) = std::env::var("REMIX_SANDBOX_DIR") {
@@ -114,17 +114,17 @@ pub fn load_config(args: &RunArgs) -> Result<AppConfig, AgentError> {
     }
 
     // Apply plugins configuration
-    if let Some(ref dir) = args.plugins_dir {
+    if let Some(ref dir) = args.common.plugins_dir {
         config.plugins.sources.push(schema::PluginSourceConfig {
             path: Some(dir.clone()),
             github: None,
             git_ref: None,
         });
     }
-    if args.no_plugins {
+    if args.common.no_plugins {
         config.plugins.enabled = false;
     }
-    if args.no_claude_plugins {
+    if args.common.no_claude_plugins {
         config.plugins.claude_code_cache = false;
     }
     if let Ok(val) = std::env::var("REMIX_PLUGINS_DIR") {
@@ -144,17 +144,17 @@ pub fn load_config(args: &RunArgs) -> Result<AppConfig, AgentError> {
     }
 
     // Apply session configuration
-    if let Some(ref dir) = args.session_dir {
+    if let Some(ref dir) = args.common.session_dir {
         config.session.storage_dir = dir.clone();
     }
     if let Ok(val) = std::env::var("REMIX_SESSION_DIR") {
-        if args.session_dir.is_none() {
+        if args.common.session_dir.is_none() {
             config.session.storage_dir = PathBuf::from(val);
         }
     }
 
     // Apply permissions configuration
-    if let Some(ref mode_str) = args.permission_mode {
+    if let Some(ref mode_str) = args.common.permission_mode {
         match mode_str.as_str() {
             "default" => config.permissions.mode = schema::PermissionModeConfig::Default,
             "accept_edits" => config.permissions.mode = schema::PermissionModeConfig::AcceptEdits,
@@ -169,50 +169,50 @@ pub fn load_config(args: &RunArgs) -> Result<AppConfig, AgentError> {
             }
         }
     }
-    if !args.allow_tool.is_empty() {
+    if !args.common.allow_tool.is_empty() {
         config
             .permissions
             .allowed_tools
-            .extend(args.allow_tool.clone());
+            .extend(args.common.allow_tool.clone());
     }
-    if !args.deny_tool.is_empty() {
+    if !args.common.deny_tool.is_empty() {
         config
             .permissions
             .denied_tools
-            .extend(args.deny_tool.clone());
+            .extend(args.common.deny_tool.clone());
     }
 
     // Apply coordination configuration
-    if args.no_coordination {
+    if args.common.no_coordination {
         config.coordination.enabled = false;
     }
-    if let Some(max_workers) = args.max_workers {
+    if let Some(max_workers) = args.common.max_workers {
         config.coordination.max_workers = max_workers;
     }
-    if let Some(ref dir) = args.coordination_dir {
+    if let Some(ref dir) = args.common.coordination_dir {
         config.coordination.storage_dir = dir.clone();
     }
     if let Ok(val) = std::env::var("REMIX_COORDINATION_DIR") {
-        if args.coordination_dir.is_none() {
+        if args.common.coordination_dir.is_none() {
             config.coordination.storage_dir = PathBuf::from(val);
         }
     }
 
     // Apply system prompt from CLI
-    if let Some(ref system_prompt) = args.system_prompt {
+    if let Some(ref system_prompt) = args.common.system_prompt {
         config.agent.system_prompt = Some(system_prompt.clone());
     }
 
     // Apply tool result max bytes from CLI
-    if let Some(max_bytes) = args.tool_result_max_bytes {
+    if let Some(max_bytes) = args.common.tool_result_max_bytes {
         config.agent.tool_result_max_bytes = max_bytes;
     }
 
     // Apply compaction configuration
-    if let Some(context_window) = args.context_window {
+    if let Some(context_window) = args.common.context_window {
         config.compaction.context_window_tokens = context_window;
     }
-    if args.disable_compaction {
+    if args.common.disable_compaction {
         config.compaction.enabled = false;
     }
 
@@ -235,19 +235,19 @@ pub fn load_config(args: &RunArgs) -> Result<AppConfig, AgentError> {
     }
 
     // Apply dev_tools configuration
-    if args.no_dev_tools {
+    if args.common.no_dev_tools {
         config.dev_tools.enabled = false;
     }
-    if args.no_lsp {
+    if args.common.no_lsp {
         config.dev_tools.lsp.enabled = false;
     }
-    if args.no_test_harness {
+    if args.common.no_test_harness {
         config.dev_tools.test_harness.enabled = false;
     }
-    if args.no_repo_map {
+    if args.common.no_repo_map {
         config.dev_tools.repo_map.enabled = false;
     }
-    for entry in &args.lsp_server {
+    for entry in &args.common.lsp_server {
         if let Some((lang, cmd)) = entry.split_once('=') {
             config
                 .dev_tools
@@ -307,7 +307,7 @@ pub fn load_config(args: &RunArgs) -> Result<AppConfig, AgentError> {
     }
 
     // Apply thinking budget tokens
-    if let Some(tokens) = args.thinking_budget_tokens {
+    if let Some(tokens) = args.common.thinking_budget_tokens {
         config.llm.thinking_budget_tokens = Some(tokens);
     }
 
@@ -322,6 +322,7 @@ pub fn load_config(args: &RunArgs) -> Result<AppConfig, AgentError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::CommonArgs;
     use std::io::Write;
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -333,65 +334,7 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn default_run_args() -> RunArgs {
-        RunArgs {
-            task: None,
-            config: None,
-            base_url: None,
-            api_key: None,
-            model: None,
-            max_tokens: None,
-            timeout: None,
-            max_iterations: None,
-            headed: false,
-            no_browser: false,
-            verbose: false,
-            output: None,
-            browser_path: None,
-            skills_dir: None,
-            no_skills: false,
-            agents_md_dir: None,
-            no_agents_md: false,
-            no_local_tools: false,
-            sandbox_dir: None,
-            no_plugins: false,
-            plugins_dir: None,
-            no_claude_plugins: false,
-            session_id: None,
-            fork_session: None,
-            session_dir: None,
-            permission_mode: None,
-            allow_tool: Vec::new(),
-            deny_tool: Vec::new(),
-            no_coordination: false,
-            max_workers: None,
-            coordination_dir: None,
-            continue_session: false,
-            effort: None,
-            sse_port: None,
-            system_prompt: None,
-            tool_result_max_bytes: None,
-            context_window: None,
-            disable_compaction: false,
-            nudge_on_text_only: false,
-            nudge_max_count: None,
-            goal_check_on_complete: false,
-            no_dev_tools: false,
-            no_lsp: false,
-            no_test_harness: false,
-            no_repo_map: false,
-            lsp_server: Vec::new(),
-            action_reminder_interval: None,
-            loop_detection: false,
-            loop_detection_max_repeats: None,
-            loop_detection_window: None,
-            loop_detection_max_failures: None,
-            reasoning_stages: false,
-            planning_budget_tokens: None,
-            execution_budget_tokens: None,
-            verification_budget_tokens: None,
-            iteration_budget_warning_threshold: None,
-            thinking_budget_tokens: None,
-        }
+        RunArgs::default()
     }
 
     fn write_yaml_tempfile(content: &str) -> NamedTempFile {
@@ -450,7 +393,10 @@ agent:
 "#;
         let file = write_yaml_tempfile(yaml);
         let args = RunArgs {
-            config: Some(file.path().to_path_buf()),
+            common: CommonArgs {
+                config: Some(file.path().to_path_buf()),
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -483,7 +429,10 @@ llm:
         }
 
         let args = RunArgs {
-            config: Some(file.path().to_path_buf()),
+            common: CommonArgs {
+                config: Some(file.path().to_path_buf()),
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -523,53 +472,57 @@ agent:
 "#;
         let file = write_yaml_tempfile(yaml);
         let args = RunArgs {
+            common: CommonArgs {
+                config: Some(file.path().to_path_buf()),
+                base_url: Some("https://cli.api.com".to_string()),
+                api_key: Some("cli-key".to_string()),
+                model: Some("cli-model".to_string()),
+                max_tokens: Some(4096),
+                max_iterations: Some(10),
+                headed: true,
+                no_browser: false,
+                verbose: false,
+                browser_path: Some("/custom/path".to_string()),
+                skills_dir: None,
+                no_skills: false,
+                agents_md_dir: None,
+                no_agents_md: false,
+                no_local_tools: false,
+                sandbox_dir: None,
+                no_plugins: false,
+                plugins_dir: None,
+                no_claude_plugins: false,
+                session_id: None,
+                session_dir: None,
+                permission_mode: None,
+                allow_tool: Vec::new(),
+                deny_tool: Vec::new(),
+                no_coordination: false,
+                max_workers: None,
+                coordination_dir: None,
+                continue_session: false,
+                system_prompt: None,
+                tool_result_max_bytes: None,
+                context_window: None,
+                disable_compaction: false,
+                no_dev_tools: false,
+                no_lsp: false,
+                no_test_harness: false,
+                no_repo_map: false,
+                lsp_server: Vec::new(),
+                thinking_budget_tokens: None,
+                ..Default::default()
+            },
             task: Some("cli task".to_string()),
-            config: Some(file.path().to_path_buf()),
-            base_url: Some("https://cli.api.com".to_string()),
-            api_key: Some("cli-key".to_string()),
-            model: Some("cli-model".to_string()),
-            max_tokens: Some(4096),
             timeout: Some(120),
-            max_iterations: Some(10),
-            headed: true,
-            no_browser: false,
-            verbose: false,
             output: None,
-            browser_path: Some("/custom/path".to_string()),
-            skills_dir: None,
-            no_skills: false,
-            agents_md_dir: None,
-            no_agents_md: false,
-            no_local_tools: false,
-            sandbox_dir: None,
-            no_plugins: false,
-            plugins_dir: None,
-            no_claude_plugins: false,
-            session_id: None,
             fork_session: None,
-            session_dir: None,
-            permission_mode: None,
-            allow_tool: Vec::new(),
-            deny_tool: Vec::new(),
-            no_coordination: false,
-            max_workers: None,
-            coordination_dir: None,
-            continue_session: false,
             effort: None,
             sse_port: None,
-            system_prompt: None,
-            tool_result_max_bytes: None,
-            context_window: None,
-            disable_compaction: false,
             nudge_on_text_only: false,
             nudge_max_count: None,
             goal_check_on_complete: false,
             action_reminder_interval: None,
-            no_dev_tools: false,
-            no_lsp: false,
-            no_test_harness: false,
-            no_repo_map: false,
-            lsp_server: Vec::new(),
             loop_detection: false,
             loop_detection_max_repeats: None,
             loop_detection_window: None,
@@ -579,7 +532,7 @@ agent:
             execution_budget_tokens: None,
             verification_budget_tokens: None,
             iteration_budget_warning_threshold: None,
-            thinking_budget_tokens: None,
+            ..Default::default()
         };
         let config = load_config(&args).unwrap();
 
@@ -616,10 +569,13 @@ llm:
 
         // Set CLI flags (should override env)
         let args = RunArgs {
-            config: Some(file.path().to_path_buf()),
-            base_url: Some("https://cli.api.com".to_string()),
-            api_key: Some("cli-key".to_string()),
-            model: Some("cli-model".to_string()),
+            common: CommonArgs {
+                config: Some(file.path().to_path_buf()),
+                base_url: Some("https://cli.api.com".to_string()),
+                api_key: Some("cli-key".to_string()),
+                model: Some("cli-model".to_string()),
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -647,7 +603,10 @@ llm:
         }
 
         let args = RunArgs {
-            config: Some(PathBuf::from("/nonexistent/path/config.yaml")),
+            common: CommonArgs {
+                config: Some(PathBuf::from("/nonexistent/path/config.yaml")),
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let result = load_config(&args);
@@ -663,7 +622,10 @@ llm:
 
         let file = write_yaml_tempfile("{{{{invalid yaml content");
         let args = RunArgs {
-            config: Some(file.path().to_path_buf()),
+            common: CommonArgs {
+                config: Some(file.path().to_path_buf()),
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let result = load_config(&args);
@@ -687,7 +649,10 @@ llm:
 "#;
         let file = write_yaml_tempfile(yaml);
         let args = RunArgs {
-            config: Some(file.path().to_path_buf()),
+            common: CommonArgs {
+                config: Some(file.path().to_path_buf()),
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -703,7 +668,10 @@ llm:
         clear_env_vars();
 
         let args = RunArgs {
-            headed: true,
+            common: CommonArgs {
+                headed: true,
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -716,7 +684,10 @@ llm:
         clear_env_vars();
 
         let args = RunArgs {
-            no_browser: true,
+            common: CommonArgs {
+                no_browser: true,
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -739,7 +710,10 @@ llm:
         clear_env_vars();
 
         let args = RunArgs {
-            headed: false,
+            common: CommonArgs {
+                headed: false,
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -761,7 +735,10 @@ credentials:
 "#;
         let file = write_yaml_tempfile(yaml);
         let args = RunArgs {
-            config: Some(file.path().to_path_buf()),
+            common: CommonArgs {
+                config: Some(file.path().to_path_buf()),
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -789,8 +766,11 @@ task: "yaml task"
 "#;
         let file = write_yaml_tempfile(yaml);
         let args = RunArgs {
+            common: CommonArgs {
+                config: Some(file.path().to_path_buf()),
+                ..default_run_args().common
+            },
             task: Some("cli task".to_string()),
-            config: Some(file.path().to_path_buf()),
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -807,7 +787,10 @@ task: "yaml task"
 "#;
         let file = write_yaml_tempfile(yaml);
         let args = RunArgs {
-            config: Some(file.path().to_path_buf()),
+            common: CommonArgs {
+                config: Some(file.path().to_path_buf()),
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -820,7 +803,10 @@ task: "yaml task"
         clear_env_vars();
 
         let args = RunArgs {
-            skills_dir: Some(PathBuf::from("/custom/skills")),
+            common: CommonArgs {
+                skills_dir: Some(PathBuf::from("/custom/skills")),
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -837,7 +823,10 @@ task: "yaml task"
         clear_env_vars();
 
         let args = RunArgs {
-            no_skills: true,
+            common: CommonArgs {
+                no_skills: true,
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -869,7 +858,10 @@ task: "yaml task"
             std::env::set_var("REMIX_SKILLS_DIR", "/same/path");
         }
         let args = RunArgs {
-            skills_dir: Some(PathBuf::from("/same/path")),
+            common: CommonArgs {
+                skills_dir: Some(PathBuf::from("/same/path")),
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -891,7 +883,10 @@ task: "yaml task"
         clear_env_vars();
 
         let args = RunArgs {
-            agents_md_dir: Some(PathBuf::from("/custom/agents")),
+            common: CommonArgs {
+                agents_md_dir: Some(PathBuf::from("/custom/agents")),
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -908,7 +903,10 @@ task: "yaml task"
         clear_env_vars();
 
         let args = RunArgs {
-            no_agents_md: true,
+            common: CommonArgs {
+                no_agents_md: true,
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -921,7 +919,10 @@ task: "yaml task"
         clear_env_vars();
 
         let args = RunArgs {
-            sandbox_dir: Some(PathBuf::from("/custom/sandbox")),
+            common: CommonArgs {
+                sandbox_dir: Some(PathBuf::from("/custom/sandbox")),
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -938,7 +939,10 @@ task: "yaml task"
         clear_env_vars();
 
         let args = RunArgs {
-            no_local_tools: true,
+            common: CommonArgs {
+                no_local_tools: true,
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -960,7 +964,10 @@ skills:
 "#;
         let file = write_yaml_tempfile(yaml);
         let args = RunArgs {
-            config: Some(file.path().to_path_buf()),
+            common: CommonArgs {
+                config: Some(file.path().to_path_buf()),
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -989,7 +996,10 @@ skills:
         clear_env_vars();
 
         let args = RunArgs {
-            no_plugins: true,
+            common: CommonArgs {
+                no_plugins: true,
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -1002,7 +1012,10 @@ skills:
         clear_env_vars();
 
         let args = RunArgs {
-            no_claude_plugins: true,
+            common: CommonArgs {
+                no_claude_plugins: true,
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -1016,7 +1029,10 @@ skills:
         clear_env_vars();
 
         let args = RunArgs {
-            plugins_dir: Some(PathBuf::from("/custom/plugins")),
+            common: CommonArgs {
+                plugins_dir: Some(PathBuf::from("/custom/plugins")),
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -1069,7 +1085,10 @@ plugins:
 "#;
         let file = write_yaml_tempfile(yaml);
         let args = RunArgs {
-            config: Some(file.path().to_path_buf()),
+            common: CommonArgs {
+                config: Some(file.path().to_path_buf()),
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -1086,7 +1105,10 @@ plugins:
         clear_env_vars();
 
         let args = RunArgs {
-            session_dir: Some(PathBuf::from("/custom/sessions")),
+            common: CommonArgs {
+                session_dir: Some(PathBuf::from("/custom/sessions")),
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -1102,7 +1124,10 @@ plugins:
         clear_env_vars();
 
         let args = RunArgs {
-            permission_mode: Some("bypass_permissions".to_string()),
+            common: CommonArgs {
+                permission_mode: Some("bypass_permissions".to_string()),
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -1118,7 +1143,10 @@ plugins:
         clear_env_vars();
 
         let args = RunArgs {
-            permission_mode: Some("invalid_mode".to_string()),
+            common: CommonArgs {
+                permission_mode: Some("invalid_mode".to_string()),
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let result = load_config(&args);
@@ -1135,7 +1163,10 @@ plugins:
         clear_env_vars();
 
         let args = RunArgs {
-            system_prompt: Some("You are a helpful agent".to_string()),
+            common: CommonArgs {
+                system_prompt: Some("You are a helpful agent".to_string()),
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -1166,8 +1197,11 @@ agent:
 "#;
         let file = write_yaml_tempfile(yaml);
         let args = RunArgs {
-            config: Some(file.path().to_path_buf()),
-            system_prompt: Some("cli prompt".to_string()),
+            common: CommonArgs {
+                config: Some(file.path().to_path_buf()),
+                system_prompt: Some("cli prompt".to_string()),
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -1180,8 +1214,11 @@ agent:
         clear_env_vars();
 
         let args = RunArgs {
-            allow_tool: vec!["navigate".to_string(), "click".to_string()],
-            deny_tool: vec!["bash".to_string()],
+            common: CommonArgs {
+                allow_tool: vec!["navigate".to_string(), "click".to_string()],
+                deny_tool: vec!["bash".to_string()],
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -1195,7 +1232,10 @@ agent:
         clear_env_vars();
 
         let args = RunArgs {
-            context_window: Some(128_000),
+            common: CommonArgs {
+                context_window: Some(128_000),
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -1218,7 +1258,10 @@ agent:
         clear_env_vars();
 
         let args = RunArgs {
-            disable_compaction: true,
+            common: CommonArgs {
+                disable_compaction: true,
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -1241,7 +1284,10 @@ agent:
         clear_env_vars();
 
         let args = RunArgs {
-            tool_result_max_bytes: Some(16_384),
+            common: CommonArgs {
+                tool_result_max_bytes: Some(16_384),
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();
@@ -1338,7 +1384,10 @@ agent:
 "#;
         let file = write_yaml_tempfile(yaml);
         let args = RunArgs {
-            config: Some(file.path().to_path_buf()),
+            common: CommonArgs {
+                config: Some(file.path().to_path_buf()),
+                ..default_run_args().common
+            },
             goal_check_on_complete: true,
             ..default_run_args()
         };
@@ -1358,7 +1407,10 @@ agent:
 "#;
         let file = write_yaml_tempfile(yaml);
         let args = RunArgs {
-            config: Some(file.path().to_path_buf()),
+            common: CommonArgs {
+                config: Some(file.path().to_path_buf()),
+                ..default_run_args().common
+            },
             nudge_on_text_only: true,
             nudge_max_count: Some(10),
             ..default_run_args()
@@ -1402,7 +1454,10 @@ agent:
 "#;
         let file = write_yaml_tempfile(yaml);
         let args = RunArgs {
-            config: Some(file.path().to_path_buf()),
+            common: CommonArgs {
+                config: Some(file.path().to_path_buf()),
+                ..default_run_args().common
+            },
             action_reminder_interval: Some(20),
             ..default_run_args()
         };
@@ -1467,7 +1522,10 @@ agent:
 "#;
         let file = write_yaml_tempfile(yaml);
         let args = RunArgs {
-            config: Some(file.path().to_path_buf()),
+            common: CommonArgs {
+                config: Some(file.path().to_path_buf()),
+                ..default_run_args().common
+            },
             loop_detection_max_repeats: Some(8),
             ..default_run_args()
         };
@@ -1568,7 +1626,10 @@ agent:
         clear_env_vars();
 
         let args = RunArgs {
-            thinking_budget_tokens: Some(10_000),
+            common: CommonArgs {
+                thinking_budget_tokens: Some(10_000),
+                ..default_run_args().common
+            },
             ..default_run_args()
         };
         let config = load_config(&args).unwrap();

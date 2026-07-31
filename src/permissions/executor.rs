@@ -7,15 +7,6 @@ use crate::llm::types::ToolDefinition;
 
 use super::types::{PermissionDecision, PermissionMode, PermissionPolicy};
 
-/// Read-only tools allowed in Plan mode (must match `PLAN_MODE_ALLOWED` in types.rs).
-const PLAN_MODE_ALLOWED: &[&str] = &[
-    "read_file",
-    "grep",
-    "glob",
-    "load_skill",
-    "read_skill_resource",
-];
-
 /// Permission request sent through the channel for interactive TUI prompts.
 #[derive(Debug)]
 pub struct PermissionRequest {
@@ -36,11 +27,13 @@ pub struct PermissionAwareExecutor<T: ToolExecutor> {
 
 impl<T: ToolExecutor> PermissionAwareExecutor<T> {
     pub fn new(inner: T, policy: PermissionPolicy) -> Self {
+        // Filter on the definition's own `read_only` flag, the same signal
+        // `check_tool` uses, so the advertised set and the permitted set cannot drift.
         let filtered_tools = if policy.mode == PermissionMode::Plan {
             inner
                 .tool_definitions()
                 .iter()
-                .filter(|t| PLAN_MODE_ALLOWED.contains(&t.name.as_str()))
+                .filter(|t| t.read_only)
                 .cloned()
                 .collect()
         } else {
@@ -97,7 +90,16 @@ impl<T: ToolExecutor> ToolExecutor for PermissionAwareExecutor<T> {
         name: &str,
         arguments: Value,
     ) -> Result<ToolExecutionResult, AgentError> {
-        match self.policy.check(name) {
+        // Look the tool up so the policy sees its declared read_only flag.
+        let read_only = self
+            .inner
+            .tool_definitions()
+            .iter()
+            .find(|t| t.name == name)
+            .map(|t| t.read_only)
+            .unwrap_or(false);
+
+        match self.policy.check_call(name, read_only, Some(&arguments)) {
             PermissionDecision::Allow => self.inner.execute_tool(name, arguments).await,
             PermissionDecision::Deny { reason } => Ok(ToolExecutionResult {
                 content: format!("Permission denied: {reason}"),
@@ -171,6 +173,15 @@ mod tests {
         }
     }
 
+    /// Tools that genuinely do not mutate, mirroring what the real executors declare.
+    const READ_ONLY_IN_TESTS: &[&str] = &[
+        "read_file",
+        "grep",
+        "glob",
+        "load_skill",
+        "read_skill_resource",
+    ];
+
     fn mock_with_tools(names: &[&str]) -> MockExecutor {
         let tools = names
             .iter()
@@ -179,7 +190,7 @@ mod tests {
                 description: format!("{n} tool"),
                 input_schema: json!({"type": "object"}),
                 cache_control: None,
-                read_only: false,
+                read_only: READ_ONLY_IN_TESTS.contains(n),
             })
             .collect();
         MockExecutor {

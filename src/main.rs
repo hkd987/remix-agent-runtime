@@ -36,7 +36,7 @@ async fn main() -> ExitCode {
     match cli.command {
         Commands::Run(args) => {
             // Set up logging
-            let filter = if args.verbose {
+            let filter = if args.common.verbose {
                 EnvFilter::new("remix_agent_runtime=debug")
             } else {
                 EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"))
@@ -496,40 +496,41 @@ async fn main() -> ExitCode {
             let runner = runner;
             // `--continue` resumes the most recently updated session. The flag was
             // parsed and stored but never read, so it silently did nothing.
-            let continue_session_id = if args.continue_session && args.session_id.is_none() {
-                match session_store.as_ref() {
-                    Some(store) => match store.list().await {
-                        Ok(mut sessions) => {
-                            sessions.sort_by_key(|s| s.updated_at);
-                            match sessions.last() {
-                                Some(latest) => {
-                                    tracing::info!(
-                                        session_id = %latest.id,
-                                        "Continuing most recent session"
-                                    );
-                                    Some(latest.id.0.clone())
-                                }
-                                None => {
-                                    eprintln!("Error: --continue found no previous session.");
-                                    return ExitStatus::ConfigError.into();
+            let continue_session_id =
+                if args.common.continue_session && args.common.session_id.is_none() {
+                    match session_store.as_ref() {
+                        Some(store) => match store.list().await {
+                            Ok(mut sessions) => {
+                                sessions.sort_by_key(|s| s.updated_at);
+                                match sessions.last() {
+                                    Some(latest) => {
+                                        tracing::info!(
+                                            session_id = %latest.id,
+                                            "Continuing most recent session"
+                                        );
+                                        Some(latest.id.0.clone())
+                                    }
+                                    None => {
+                                        eprintln!("Error: --continue found no previous session.");
+                                        return ExitStatus::ConfigError.into();
+                                    }
                                 }
                             }
+                            Err(e) => {
+                                eprintln!("Error: --continue could not list sessions: {e}");
+                                return ExitStatus::AgentError.into();
+                            }
+                        },
+                        None => {
+                            eprintln!("Error: --continue requires sessions to be enabled.");
+                            return ExitStatus::ConfigError.into();
                         }
-                        Err(e) => {
-                            eprintln!("Error: --continue could not list sessions: {e}");
-                            return ExitStatus::AgentError.into();
-                        }
-                    },
-                    None => {
-                        eprintln!("Error: --continue requires sessions to be enabled.");
-                        return ExitStatus::ConfigError.into();
                     }
-                }
-            } else {
-                None
-            };
+                } else {
+                    None
+                };
 
-            let resume_id = args.session_id.clone().or(continue_session_id);
+            let resume_id = args.common.session_id.clone().or(continue_session_id);
 
             let result = if let Some(ref session_id) = resume_id {
                 // Resume existing session
@@ -729,7 +730,7 @@ async fn run_chat(chat_args: ChatArgs) -> ExitCode {
     let run_args = chat_args.to_run_args();
 
     // Set up logging: suppress all output when not verbose to avoid bleeding into TUI
-    if chat_args.verbose {
+    if chat_args.common.verbose {
         let filter = EnvFilter::new("remix_agent_runtime=debug");
         tracing_subscriber::fmt()
             .with_env_filter(filter)
@@ -765,7 +766,7 @@ async fn run_chat(chat_args: ChatArgs) -> ExitCode {
     }
 
     // Apply interactive defaults that differ from batch mode
-    if chat_args.system_prompt.is_none() && config.agent.system_prompt.is_none() {
+    if chat_args.common.system_prompt.is_none() && config.agent.system_prompt.is_none() {
         config.agent.system_prompt =
             Some(remix_agent_runtime::tui::prompt::INTERACTIVE_SYSTEM_PROMPT.to_string());
     }

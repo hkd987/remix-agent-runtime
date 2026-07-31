@@ -159,7 +159,7 @@ fn local_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["path"]
             }),
             cache_control: None,
-            read_only: false,
+            read_only: true,
         },
         ToolDefinition {
             name: "write_file".to_string(),
@@ -244,7 +244,7 @@ fn local_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["pattern"]
             }),
             cache_control: None,
-            read_only: false,
+            read_only: true,
         },
         ToolDefinition {
             name: "glob".to_string(),
@@ -258,7 +258,7 @@ fn local_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["pattern"]
             }),
             cache_control: None,
-            read_only: false,
+            read_only: true,
         },
         ToolDefinition {
             name: "web_fetch".to_string(),
@@ -279,7 +279,7 @@ fn local_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["url"]
             }),
             cache_control: None,
-            read_only: true,
+            read_only: false,
         },
     ]
 }
