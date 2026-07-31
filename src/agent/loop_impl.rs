@@ -446,7 +446,9 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         compaction_config: Option<&CompactionConfig>,
         compaction_llm: Option<&dyn LlmProvider>,
     ) -> Result<AgentResult, AgentError> {
-        // Validate reasoning stages config if present
+        // Reasoning-stage thresholds are validated at startup by `AppConfig::validate`,
+        // which errors rather than warning. This is a defensive check for callers that
+        // construct an AgentConfig directly (tests, embedders).
         if let Some(ref stages_config) = self.config.reasoning_stages {
             if let Err(e) = super::reasoning_stages::validate_config(stages_config) {
                 warn!("{}", e);
@@ -1733,7 +1735,9 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
         use crate::llm::types::compute_cost;
         use tokio_stream::StreamExt as _;
 
-        // Validate reasoning stages config if present
+        // Reasoning-stage thresholds are validated at startup by `AppConfig::validate`,
+        // which errors rather than warning. This is a defensive check for callers that
+        // construct an AgentConfig directly (tests, embedders).
         if let Some(ref stages_config) = self.config.reasoning_stages {
             if let Err(e) = super::reasoning_stages::validate_config(stages_config) {
                 warn!("{}", e);

@@ -3,7 +3,13 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
+/// Top-level YAML configuration.
+///
+/// `deny_unknown_fields` is deliberate: without it a misspelled key (`complaction:`,
+/// `max_iteration:`) parses cleanly and silently does nothing, which looks identical to
+/// a setting that is being ignored for some other reason.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub task: Option<String>,
     #[serde(default)]
@@ -44,6 +50,57 @@ pub struct AppConfig {
     /// implemented and tested but had no call sites anywhere in the binary.
     #[serde(default)]
     pub tenant: Option<crate::tenant::context::TenantContext>,
+}
+
+impl AppConfig {
+    /// Validate settings whose invalid combinations produce silently wrong behaviour
+    /// rather than an obvious failure.
+    ///
+    /// Called at startup so a bad config is a clear error instead of a run that quietly
+    /// does the wrong thing — inverted reasoning thresholds make a whole phase
+    /// unreachable, and out-of-order compaction stages make the ladder fire backwards.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(ref stages) = self.agent.reasoning_stages {
+            crate::agent::reasoning_stages::validate_config(stages)?;
+        }
+
+        if let Some(ref t) = self.compaction.stage_thresholds {
+            let ordered = [
+                ("tool_output_compression", t.tool_output_compression),
+                ("observation_merging", t.observation_merging),
+                ("conversation_summary", t.conversation_summary),
+                ("low_value_pruning", t.low_value_pruning),
+            ];
+            for pair in ordered.windows(2) {
+                let (lo_name, lo) = pair[0];
+                let (hi_name, hi) = pair[1];
+                if lo >= hi {
+                    return Err(format!(
+                        "compaction.stage_thresholds: {lo_name} ({lo}) must be less than \
+                         {hi_name} ({hi}); stages escalate in order and equal or inverted \
+                         thresholds make earlier stages unreachable"
+                    ));
+                }
+            }
+        }
+
+        if self.compaction.trigger_threshold <= 0.0 || self.compaction.trigger_threshold > 1.0 {
+            return Err(format!(
+                "compaction.trigger_threshold ({}) must be in (0.0, 1.0]",
+                self.compaction.trigger_threshold
+            ));
+        }
+
+        if let Some(threshold) = self.agent.iteration_budget_warning_threshold {
+            if !(0.0..=1.0).contains(&threshold) {
+                return Err(format!(
+                    "agent.iteration_budget_warning_threshold ({threshold}) must be in [0.0, 1.0]"
+                ));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 pub fn default_base_url() -> String {
@@ -1788,5 +1845,76 @@ iteration_budget_warning_threshold: 0.75
         assert!(config.loop_detection.is_none());
         assert!(config.reasoning_stages.is_none());
         assert!(config.iteration_budget_warning_threshold.is_none());
+    }
+
+    #[test]
+    fn test_unknown_top_level_key_is_rejected() {
+        // A typo must fail loudly rather than parsing to a default and looking like the
+        // setting was ignored for some other reason.
+        let yaml = "task: do it\ncomplaction:\n  enabled: true\n";
+        let err = serde_yaml::from_str::<AppConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("complaction"),
+            "error did not name the offending key: {err}"
+        );
+    }
+
+    #[test]
+    fn test_known_keys_still_parse() {
+        let yaml = "task: do it\ncompaction:\n  enabled: false\n";
+        let config: AppConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.task.as_deref(), Some("do it"));
+        assert!(!config.compaction.enabled);
+    }
+
+    #[test]
+    fn test_validate_accepts_default_config() {
+        assert!(AppConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_inverted_reasoning_thresholds() {
+        // Inverted thresholds make the execution phase unreachable, which produces a
+        // wrong run rather than a failed one.
+        let mut config = AppConfig::default();
+        config.agent.reasoning_stages = Some(ReasoningStagesConfig {
+            planning_threshold: 0.9,
+            verification_threshold: 0.2,
+            ..Default::default()
+        });
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("planning_threshold"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_out_of_order_compaction_stages() {
+        let mut config = AppConfig::default();
+        config.compaction.stage_thresholds = Some(StageThresholds {
+            tool_output_compression: 0.9,
+            observation_merging: 0.75,
+            conversation_summary: 0.85,
+            low_value_pruning: 0.95,
+        });
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("stage_thresholds"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_out_of_range_trigger_threshold() {
+        let mut config = AppConfig::default();
+        config.compaction.trigger_threshold = 1.5;
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("trigger_threshold"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_out_of_range_budget_warning() {
+        let mut config = AppConfig::default();
+        config.agent.iteration_budget_warning_threshold = Some(2.0);
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.contains("iteration_budget_warning_threshold"),
+            "got: {err}"
+        );
     }
 }

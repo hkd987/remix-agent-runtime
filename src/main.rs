@@ -77,6 +77,14 @@ async fn main() -> ExitCode {
             // the limits it constrains.
             remix_agent_runtime::tenant::isolation::apply_tenant_profile(&mut config);
 
+            // Reject config whose values are individually valid but collectively wrong.
+            // These used to warn and continue, producing a run that quietly behaved
+            // differently from what the config described.
+            if let Err(e) = config.validate() {
+                eprintln!("Error: invalid configuration: {e}");
+                return ExitStatus::ConfigError.into();
+            }
+
             tracing::info!("Starting agent with config: {}", config.llm);
 
             // Create LLM client (wrapped in Arc for sharing with child agents)
