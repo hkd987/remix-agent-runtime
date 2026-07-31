@@ -1,0 +1,13 @@
+# Pinned so local development, CI, and release builds all resolve the same compiler.
+#
+# This exists because they did not. CI ran `dtolnay/rust-toolchain@stable`, which moved
+# to 1.97 and failed `cargo clippy -- -D warnings` on three lints, against code that had
+# been untouched for months and was green on the 1.94 toolchain it was written against.
+# A floating channel makes "green locally" and "green in CI" different claims.
+#
+# The trade-off is that new lints and compiler fixes now arrive only when this pin is
+# bumped. That is the point: bumping it is a deliberate change with its own diff, not
+# something that lands on an unrelated pull request six weeks later.
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]
