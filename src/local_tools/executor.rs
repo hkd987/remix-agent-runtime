@@ -9,8 +9,8 @@ use crate::local_tools::sandbox::{create_sandbox, BashSandbox, PathValidator};
 
 /// Decorator that wraps a ToolExecutor and adds local file/shell tools.
 ///
-/// When `config.enabled` is true, seven virtual tools are added:
-/// - `read_file`, `write_file`, `edit_file` for file operations
+/// When `config.enabled` is true, eight virtual tools are added:
+/// - `read_file`, `write_file`, `edit_file`, `multi_edit` for file operations
 /// - `bash` for sandboxed shell execution
 /// - `grep` for regex search across files
 /// - `glob` for file pattern matching
@@ -106,6 +106,13 @@ impl<T: ToolExecutor> ToolExecutor for LocalToolsExecutor<T> {
                     )
                     .await;
                 }
+                "multi_edit" => {
+                    return super::tools::multi_edit::execute_multi_edit(
+                        arguments,
+                        &self.path_validator,
+                    )
+                    .await;
+                }
                 "bash" => {
                     return super::tools::bash::execute_bash(
                         arguments,
@@ -179,6 +186,32 @@ fn local_tool_definitions() -> Vec<ToolDefinition> {
                     "new_string": { "type": "string", "description": "The replacement string" }
                 },
                 "required": ["path", "old_string", "new_string"]
+            }),
+            cache_control: None,
+            read_only: false,
+        },
+        ToolDefinition {
+            name: "multi_edit".to_string(),
+            description: "Apply several edits to one file in a single call. Edits apply in order, each against the result of the previous one. If any edit fails to match, no edits are applied.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Path to the file to edit" },
+                    "edits": {
+                        "type": "array",
+                        "description": "Edits to apply, in order",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_string": { "type": "string", "description": "Exact text to replace" },
+                                "new_string": { "type": "string", "description": "Replacement text" },
+                                "replace_all": { "type": "boolean", "description": "Replace every occurrence instead of requiring a unique match (default false)" }
+                            },
+                            "required": ["old_string", "new_string"]
+                        }
+                    }
+                },
+                "required": ["path", "edits"]
             }),
             cache_control: None,
             read_only: false,
@@ -313,8 +346,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let inner = mock_inner();
         let executor = LocalToolsExecutor::new(inner, test_config(&dir), 32_768).unwrap();
-        // 1 inner + 7 local tools = 8
-        assert_eq!(executor.tool_definitions().len(), 8);
+        // 1 inner + 8 local tools = 9
+        assert_eq!(executor.tool_definitions().len(), 9);
         let names: Vec<&str> = executor
             .tool_definitions()
             .iter()
@@ -466,7 +499,7 @@ mod tests {
     #[test]
     fn test_tool_definitions_count() {
         let defs = local_tool_definitions();
-        assert_eq!(defs.len(), 7);
+        assert_eq!(defs.len(), 8);
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(
             names,
@@ -474,6 +507,7 @@ mod tests {
                 "read_file",
                 "write_file",
                 "edit_file",
+                "multi_edit",
                 "bash",
                 "grep",
                 "glob",

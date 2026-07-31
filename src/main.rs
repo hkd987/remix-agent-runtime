@@ -440,10 +440,86 @@ async fn main() -> ExitCode {
             let thinking_control: std::sync::Arc<
                 dyn remix_agent_runtime::llm::client::ThinkingControl,
             > = llm_client.clone();
-            let runner = AgentRunner::new(llm_client, executor, agent_config)
+            // A dedicated (cheaper) compaction model, when configured. Previously every
+            // call site passed None, so `compaction_model` had no effect.
+            let compaction_llm = remix_agent_runtime::llm::client::build_compaction_client(
+                &config.llm,
+                &config.compaction,
+            );
+            if let Some(ref m) = config.compaction.compaction_model {
+                tracing::info!(model = %m, "Using dedicated compaction model");
+            }
+
+            // Dedicated client for the self-critique pass, when `self_critique.model`
+            // is configured. Previously model/max_tokens were declared and never read.
+            let critique_llm: Option<
+                std::sync::Arc<dyn remix_agent_runtime::llm::client::LlmProvider>,
+            > = config.agent.self_critique.as_ref().and_then(|sc| {
+                sc.model.as_ref().map(|model| {
+                    tracing::info!(model = %model, "Using dedicated self-critique model");
+                    let client: std::sync::Arc<dyn remix_agent_runtime::llm::client::LlmProvider> =
+                        std::sync::Arc::new(AnthropicClient::new(
+                            config.llm.base_url.clone(),
+                            config.llm.api_key.clone(),
+                            model.clone(),
+                            sc.max_tokens,
+                            config.llm.custom_headers.clone(),
+                            None,
+                            false,
+                        ));
+                    client
+                })
+            });
+
+            let mut runner = AgentRunner::new(llm_client, executor, agent_config)
                 .with_event_bus(event_bus)
-                .with_thinking_control(thinking_control);
-            let result = if let Some(ref session_id) = args.session_id {
+                .with_thinking_control(thinking_control)
+                .with_hooks(
+                    std::sync::Arc::new(hook_registry.clone()),
+                    config.plugins.hook_timeout_secs,
+                );
+            if let Some(c) = critique_llm {
+                runner = runner.with_critique_llm(c);
+            }
+            let runner = runner;
+            // `--continue` resumes the most recently updated session. The flag was
+            // parsed and stored but never read, so it silently did nothing.
+            let continue_session_id = if args.continue_session && args.session_id.is_none() {
+                match session_store.as_ref() {
+                    Some(store) => match store.list().await {
+                        Ok(mut sessions) => {
+                            sessions.sort_by_key(|s| s.updated_at);
+                            match sessions.last() {
+                                Some(latest) => {
+                                    tracing::info!(
+                                        session_id = %latest.id,
+                                        "Continuing most recent session"
+                                    );
+                                    Some(latest.id.0.clone())
+                                }
+                                None => {
+                                    eprintln!("Error: --continue found no previous session.");
+                                    return ExitStatus::ConfigError.into();
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error: --continue could not list sessions: {e}");
+                            return ExitStatus::AgentError.into();
+                        }
+                    },
+                    None => {
+                        eprintln!("Error: --continue requires sessions to be enabled.");
+                        return ExitStatus::ConfigError.into();
+                    }
+                }
+            } else {
+                None
+            };
+
+            let resume_id = args.session_id.clone().or(continue_session_id);
+
+            let result = if let Some(ref session_id) = resume_id {
                 // Resume existing session
                 let store = session_store.as_ref().unwrap_or_else(|| {
                     eprintln!("Error: --session-id requires sessions to be enabled");
@@ -458,7 +534,9 @@ async fn main() -> ExitCode {
                         &skill_set,
                         &agents_md,
                         compaction_config.as_ref(),
-                        None,
+                        compaction_llm
+                            .as_ref()
+                            .map(|c| c as &dyn remix_agent_runtime::llm::client::LlmProvider),
                     )
                     .await
             } else if let Some(ref fork_id) = args.fork_session {
@@ -483,7 +561,9 @@ async fn main() -> ExitCode {
                                 &skill_set,
                                 &agents_md,
                                 compaction_config.as_ref(),
-                                None,
+                                compaction_llm.as_ref().map(|c| {
+                                    c as &dyn remix_agent_runtime::llm::client::LlmProvider
+                                }),
                             )
                             .await
                     }
@@ -503,7 +583,9 @@ async fn main() -> ExitCode {
                             .as_ref()
                             .map(|s| s as &dyn remix_agent_runtime::session::SessionStorage),
                         compaction_config.as_ref(),
-                        None,
+                        compaction_llm
+                            .as_ref()
+                            .map(|c| c as &dyn remix_agent_runtime::llm::client::LlmProvider),
                     )
                     .await
             };
@@ -925,6 +1007,10 @@ async fn run_chat(chat_args: ChatArgs) -> ExitCode {
     let thinking_control: std::sync::Arc<dyn remix_agent_runtime::llm::client::ThinkingControl> =
         llm_client.clone();
     let runner = AgentRunner::new(llm_client, executor, agent_config)
+        .with_hooks(
+            std::sync::Arc::new(hook_registry.clone()),
+            config.plugins.hook_timeout_secs,
+        )
         .with_event_bus(event_bus.clone())
         .with_thinking_control(thinking_control);
 

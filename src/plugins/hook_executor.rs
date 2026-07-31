@@ -11,18 +11,163 @@ use crate::plugins::components::hooks::{HookRegistry, HookTiming};
 /// Output beyond this limit is truncated to prevent OOM from misbehaving hooks.
 const MAX_HOOK_STDOUT_BYTES: usize = 65536;
 
+/// A hook's decision about whether the tool call may proceed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HookPermissionDecision {
+    Allow,
+    Deny,
+    /// No interactive prompt exists at this layer, so `ask` is treated as `deny`:
+    /// a hook that wants confirmation is not granting permission.
+    Ask,
+}
+
+/// Structured output a hook may emit on stdout.
+///
+/// Deserialized into a typed struct rather than navigated with `.get("key")` chains,
+/// so an unexpected shape is a parse error rather than a silently ignored field.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HookStdout {
+    permission_decision: Option<HookPermissionDecision>,
+    updated_input: Option<Value>,
+    system_message: Option<String>,
+}
+
 /// Structured output parsed from hook stdout.
 ///
 /// Hooks may optionally emit a JSON object to stdout containing any of these
 /// keys. If multiple hooks return decisions, the last one wins.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HookResult {
-    /// Permission decision: "allow", "deny", or "ask"
-    pub permission_decision: Option<String>,
+    /// Permission decision from the hook, if it expressed one.
+    pub permission_decision: Option<HookPermissionDecision>,
     /// Replacement input for the tool call
     pub updated_input: Option<Value>,
     /// System message to inject into the conversation
     pub system_message: Option<String>,
+}
+
+impl HookResult {
+    /// Whether a hook refused the call.
+    pub fn is_denied(&self) -> bool {
+        matches!(
+            self.permission_decision,
+            Some(HookPermissionDecision::Deny) | Some(HookPermissionDecision::Ask)
+        )
+    }
+}
+
+/// Fire every hook registered for a lifecycle `timing`, passing `context` on stdin.
+///
+/// Lifecycle events (SessionStart, SessionEnd, Stop, PreCompact, SubagentStop) are not
+/// tool calls, so they never reach `HookAwareExecutor`, which is a `ToolExecutor`
+/// decorator. This is a free function so the agent loop — the only place that knows
+/// when a session starts, stops, or compacts — can fire them directly.
+pub async fn fire_lifecycle_hooks(
+    registry: &HookRegistry,
+    timeout_secs: u64,
+    timing: &HookTiming,
+    context: Value,
+) {
+    let hooks = registry.lifecycle_hooks(timing);
+    if hooks.is_empty() {
+        return;
+    }
+
+    let context_bytes = match serde_json::to_vec(&context) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to serialize lifecycle hook context");
+            return;
+        }
+    };
+
+    let timeout = Duration::from_secs(timeout_secs);
+
+    for hook in hooks {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(&hook.command)
+            .current_dir(&hook.plugin_root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    command = %hook.command,
+                    timing = ?timing,
+                    error = %e,
+                    "Failed to spawn lifecycle hook command"
+                );
+                continue;
+            }
+        };
+
+        if let Some(stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let mut stdin = stdin;
+            if let Err(e) = stdin.write_all(&context_bytes).await {
+                tracing::warn!(
+                    command = %hook.command,
+                    error = %e,
+                    "Failed to write to lifecycle hook stdin"
+                );
+            }
+            drop(stdin);
+        }
+
+        match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(Ok(status)) => {
+                if !status.success() {
+                    tracing::warn!(
+                        command = %hook.command,
+                        timing = ?timing,
+                        exit_code = status.code().unwrap_or(-1),
+                        "Lifecycle hook exited with non-zero status"
+                    );
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    command = %hook.command,
+                    timing = ?timing,
+                    error = %e,
+                    "Lifecycle hook command failed"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    command = %hook.command,
+                    timing = ?timing,
+                    timeout_secs = timeout_secs,
+                    "Lifecycle hook timed out"
+                );
+            }
+        }
+    }
+}
+
+/// Append any `systemMessage` a hook emitted to the tool result the model will read.
+fn append_hook_messages(result: &mut ToolExecutionResult, pre: &HookResult, post: &HookResult) {
+    for msg in [
+        pre.system_message.as_deref(),
+        post.system_message.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|m| !m.trim().is_empty())
+    {
+        if !result.content.is_empty() {
+            result.content.push('\n');
+        }
+        result.content.push_str("[HOOK] ");
+        result.content.push_str(msg);
+    }
 }
 
 /// Decorator that wraps a ToolExecutor and fires hooks before/after tool calls.
@@ -63,86 +208,7 @@ impl<T: ToolExecutor> HookAwareExecutor<T> {
     /// These hooks match by timing only — all hooks with the given timing will fire.
     /// Context is passed as JSON via stdin.
     pub async fn fire_lifecycle_hook(&self, timing: &HookTiming, context: Value) {
-        let hooks = self.hook_registry.lifecycle_hooks(timing);
-        if hooks.is_empty() {
-            return;
-        }
-
-        let context_bytes = match serde_json::to_vec(&context) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to serialize lifecycle hook context");
-                return;
-            }
-        };
-
-        let timeout = Duration::from_secs(self.timeout_secs);
-
-        for hook in hooks {
-            let mut cmd = tokio::process::Command::new("sh");
-            cmd.arg("-c")
-                .arg(&hook.command)
-                .current_dir(&hook.plugin_root)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true);
-
-            let mut child = match cmd.spawn() {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(
-                        command = %hook.command,
-                        timing = ?timing,
-                        error = %e,
-                        "Failed to spawn lifecycle hook command"
-                    );
-                    continue;
-                }
-            };
-
-            if let Some(stdin) = child.stdin.take() {
-                use tokio::io::AsyncWriteExt;
-                let mut stdin = stdin;
-                if let Err(e) = stdin.write_all(&context_bytes).await {
-                    tracing::warn!(
-                        command = %hook.command,
-                        error = %e,
-                        "Failed to write to lifecycle hook stdin"
-                    );
-                }
-                drop(stdin);
-            }
-
-            match tokio::time::timeout(timeout, child.wait()).await {
-                Ok(Ok(status)) => {
-                    if !status.success() {
-                        tracing::warn!(
-                            command = %hook.command,
-                            timing = ?timing,
-                            exit_code = status.code().unwrap_or(-1),
-                            "Lifecycle hook exited with non-zero status"
-                        );
-                    }
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        command = %hook.command,
-                        timing = ?timing,
-                        error = %e,
-                        "Lifecycle hook command failed"
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        command = %hook.command,
-                        timing = ?timing,
-                        timeout_secs = self.timeout_secs,
-                        "Lifecycle hook timed out"
-                    );
-                }
-            }
-        }
+        fire_lifecycle_hooks(&self.hook_registry, self.timeout_secs, timing, context).await
     }
 
     /// Execute matching hooks for a given tool call and timing.
@@ -242,22 +308,33 @@ impl<T: ToolExecutor> HookAwareExecutor<T> {
                     if let Ok(stdout_str) = String::from_utf8(raw_stdout) {
                         let trimmed = stdout_str.trim();
                         if !trimmed.is_empty() {
-                            if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
-                                if let Some(decision) =
-                                    parsed.get("permissionDecision").and_then(|v| v.as_str())
-                                {
-                                    result.permission_decision = Some(decision.to_string());
+                            match serde_json::from_str::<HookStdout>(trimmed) {
+                                Ok(parsed) => {
+                                    if parsed.permission_decision.is_some() {
+                                        result.permission_decision = parsed.permission_decision;
+                                    }
+                                    if parsed.updated_input.is_some() {
+                                        result.updated_input = parsed.updated_input;
+                                    }
+                                    if parsed.system_message.is_some() {
+                                        result.system_message = parsed.system_message;
+                                    }
                                 }
-                                if let Some(input) = parsed.get("updatedInput") {
-                                    result.updated_input = Some(input.clone());
-                                }
-                                if let Some(msg) =
-                                    parsed.get("systemMessage").and_then(|v| v.as_str())
-                                {
-                                    result.system_message = Some(msg.to_string());
+                                Err(e) => {
+                                    // Plain-text stdout is a normal, supported way to
+                                    // write a hook, so this is not an error — but a
+                                    // malformed JSON object is worth surfacing rather
+                                    // than dropping the decision it was trying to make.
+                                    if trimmed.starts_with('{') {
+                                        tracing::warn!(
+                                            command = %hook.command,
+                                            error = %e,
+                                            "Hook emitted JSON that could not be parsed; \
+                                             its decision was ignored"
+                                        );
+                                    }
                                 }
                             }
-                            // If JSON parsing fails, silently ignore (backwards compatible)
                         }
                     }
                 }
@@ -294,14 +371,38 @@ impl<T: ToolExecutor> ToolExecutor for HookAwareExecutor<T> {
         name: &str,
         arguments: Value,
     ) -> Result<ToolExecutionResult, AgentError> {
-        // Run PreToolUse hooks
-        self.run_hooks(name, &arguments, None, &HookTiming::PreToolUse)
+        // Run PreToolUse hooks and act on what they returned. The decision, the
+        // rewritten input and the system message were all parsed and then discarded, so
+        // a hook could observe a call but never influence it.
+        let pre = self
+            .run_hooks(name, &arguments, None, &HookTiming::PreToolUse)
             .await;
+
+        if pre.is_denied() {
+            let reason = pre
+                .system_message
+                .clone()
+                .unwrap_or_else(|| format!("A PreToolUse hook denied '{name}'."));
+            tracing::info!(tool = %name, "PreToolUse hook denied tool call");
+            return Ok(ToolExecutionResult {
+                content: reason,
+                is_error: true,
+            });
+        }
+
+        // A hook may rewrite the arguments before the tool sees them.
+        let arguments = match pre.updated_input.clone() {
+            Some(updated) => {
+                tracing::debug!(tool = %name, "PreToolUse hook rewrote tool input");
+                updated
+            }
+            None => arguments,
+        };
 
         // Execute actual tool
         match self.inner.execute_tool(name, arguments.clone()).await {
-            Ok(result) => {
-                if result.is_error {
+            Ok(mut result) => {
+                let post = if result.is_error {
                     // Fire PostToolUseFailure hooks for tool-level errors
                     self.run_hooks(
                         name,
@@ -309,7 +410,7 @@ impl<T: ToolExecutor> ToolExecutor for HookAwareExecutor<T> {
                         Some(&result.content),
                         &HookTiming::PostToolUseFailure,
                     )
-                    .await;
+                    .await
                 } else {
                     // Run PostToolUse hooks for successful results
                     self.run_hooks(
@@ -318,8 +419,13 @@ impl<T: ToolExecutor> ToolExecutor for HookAwareExecutor<T> {
                         Some(&result.content),
                         &HookTiming::PostToolUse,
                     )
-                    .await;
-                }
+                    .await
+                };
+
+                // Surface any hook message to the model by appending it to the tool
+                // result. A decorator cannot reach the conversation directly, and the
+                // tool result is the one channel back to the agent from here.
+                append_hook_messages(&mut result, &pre, &post);
                 Ok(result)
             }
             Err(e) => {
@@ -903,7 +1009,10 @@ mod tests {
         let result = executor
             .run_hooks("navigate", &json!({}), None, &HookTiming::PreToolUse)
             .await;
-        assert_eq!(result.permission_decision, Some("allow".to_string()));
+        assert_eq!(
+            result.permission_decision,
+            Some(HookPermissionDecision::Allow)
+        );
         assert_eq!(result.updated_input, None);
         assert_eq!(result.system_message, None);
     }
@@ -962,7 +1071,10 @@ mod tests {
         let result = executor
             .run_hooks("navigate", &json!({}), None, &HookTiming::PreToolUse)
             .await;
-        assert_eq!(result.permission_decision, Some("deny".to_string()));
+        assert_eq!(
+            result.permission_decision,
+            Some(HookPermissionDecision::Deny)
+        );
         assert_eq!(result.updated_input, Some(json!({"x": 1})));
         assert_eq!(result.system_message, Some("blocked".to_string()));
     }
@@ -1034,7 +1146,10 @@ mod tests {
             .run_hooks("navigate", &json!({}), None, &HookTiming::PreToolUse)
             .await;
         // Last hook should win
-        assert_eq!(result.permission_decision, Some("deny".to_string()));
+        assert_eq!(
+            result.permission_decision,
+            Some(HookPermissionDecision::Deny)
+        );
     }
 
     #[tokio::test]
@@ -1075,13 +1190,15 @@ mod tests {
             .run_hooks("navigate", &json!({}), None, &HookTiming::PreToolUse)
             .await;
         // First hook's permissionDecision should persist, second adds systemMessage
-        assert_eq!(result.permission_decision, Some("allow".to_string()));
+        assert_eq!(
+            result.permission_decision,
+            Some(HookPermissionDecision::Allow)
+        );
         assert_eq!(result.system_message, Some("hello".to_string()));
     }
 
     #[tokio::test]
-    async fn test_execute_tool_backwards_compatible_with_structured_hooks() {
-        // Hooks that return structured output should not break execute_tool
+    async fn test_execute_tool_allow_decision_runs_tool_and_surfaces_message() {
         let dir = TempDir::new().unwrap();
         let cmd = script_command(
             dir.path(),
@@ -1089,15 +1206,105 @@ mod tests {
             r#"printf '{"permissionDecision": "allow", "systemMessage": "ok"}'"#,
         );
         let registry = registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, &cmd);
-        let inner = mock_inner();
-        let executor = HookAwareExecutor::new(inner, registry, 30);
+        let executor = HookAwareExecutor::new(mock_inner(), registry, 30);
 
         let result = executor
             .execute_tool("navigate", json!({"url": "test"}))
             .await
             .unwrap();
-        // Tool should still return normal result
-        assert_eq!(result.content, "Page loaded");
+
         assert!(!result.is_error);
+        assert!(
+            result.content.starts_with("Page loaded"),
+            "{}",
+            result.content
+        );
+        // The message is now delivered to the model instead of being discarded.
+        assert!(result.content.contains("[HOOK] ok"), "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn test_pre_tool_use_hook_can_deny() {
+        let dir = TempDir::new().unwrap();
+        let cmd = script_command(
+            dir.path(),
+            "hook.sh",
+            r#"printf '{"permissionDecision": "deny", "systemMessage": "not allowed here"}'"#,
+        );
+        let registry = registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, &cmd);
+        let executor = HookAwareExecutor::new(mock_inner(), registry, 30);
+
+        let result = executor
+            .execute_tool("navigate", json!({"url": "test"}))
+            .await
+            .unwrap();
+
+        assert!(result.is_error, "deny decision did not block the call");
+        assert_eq!(result.content, "not allowed here");
+        // The inner executor must not have run.
+        assert!(!result.content.contains("Page loaded"));
+    }
+
+    #[tokio::test]
+    async fn test_pre_tool_use_hook_ask_is_treated_as_deny() {
+        // There is no interactive prompt at this layer, so a hook asking for
+        // confirmation is not granting permission.
+        let dir = TempDir::new().unwrap();
+        let cmd = script_command(
+            dir.path(),
+            "hook.sh",
+            r#"printf '{"permissionDecision": "ask"}'"#,
+        );
+        let registry = registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, &cmd);
+        let executor = HookAwareExecutor::new(mock_inner(), registry, 30);
+
+        let result = executor
+            .execute_tool("navigate", json!({"url": "test"}))
+            .await
+            .unwrap();
+        assert!(result.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_pre_tool_use_hook_can_rewrite_input() {
+        let dir = TempDir::new().unwrap();
+        let cmd = script_command(
+            dir.path(),
+            "hook.sh",
+            r#"printf '{"updatedInput": {"url": "https://rewritten.example"}}'"#,
+        );
+        let registry = registry_with_hook(dir.path(), "navigate", HookTiming::PreToolUse, &cmd);
+        let executor = HookAwareExecutor::new(EchoArgsExecutor, registry, 30);
+
+        let result = executor
+            .execute_tool("navigate", json!({"url": "https://original.example"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.content.contains("rewritten.example"),
+            "hook input rewrite was ignored: {}",
+            result.content
+        );
+    }
+
+    /// Echoes the arguments it received, so a test can observe input rewriting.
+    struct EchoArgsExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for EchoArgsExecutor {
+        fn tool_definitions(&self) -> &[ToolDefinition] {
+            &[]
+        }
+        async fn execute_tool(
+            &self,
+            _name: &str,
+            arguments: Value,
+        ) -> Result<ToolExecutionResult, AgentError> {
+            Ok(ToolExecutionResult {
+                content: arguments.to_string(),
+                is_error: false,
+            })
+        }
     }
 }

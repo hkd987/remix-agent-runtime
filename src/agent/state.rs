@@ -330,6 +330,12 @@ impl AgentState {
         };
         result.total_input_tokens = input_tokens;
         result.total_output_tokens = output_tokens;
+        // Report cost on every outcome, not just BudgetExceeded. Cost was tracked all
+        // along but only ever surfaced on a status the loop never constructed, so batch
+        // runs reported no spend at all.
+        if self.total_cost > 0.0 {
+            result.total_cost_usd = Some(self.total_cost);
+        }
         result
     }
 }

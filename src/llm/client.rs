@@ -212,6 +212,34 @@ impl LlmProvider for AnthropicClient {
     }
 }
 
+/// Build a dedicated client for context compaction, if one is configured.
+///
+/// `compaction_model` and `compaction_max_tokens` were declared in config and
+/// documented but never reached the loop — every call site passed `None` for the
+/// compaction LLM — so summarization always ran on the primary (expensive) model.
+///
+/// Returns `None` when no compaction model is configured, in which case the caller
+/// should fall back to the primary client.
+pub fn build_compaction_client(
+    llm: &crate::config::schema::LlmConfig,
+    compaction: &crate::config::schema::CompactionConfig,
+) -> Option<AnthropicClient> {
+    compaction.compaction_model.as_ref().map(|model| {
+        AnthropicClient::new(
+            llm.base_url.clone(),
+            llm.api_key.clone(),
+            model.clone(),
+            // Summaries are short; a smaller cap keeps the cheap model cheap.
+            compaction.compaction_max_tokens.unwrap_or(4096),
+            llm.custom_headers.clone(),
+            // Compaction is a one-shot summarization, so neither extended thinking nor
+            // prompt caching earns its keep here.
+            None,
+            false,
+        )
+    })
+}
+
 impl ThinkingControl for AnthropicClient {
     fn set_thinking_config(&self, config: Option<ThinkingConfig>) {
         *self.thinking.write().expect("thinking RwLock poisoned") = config;

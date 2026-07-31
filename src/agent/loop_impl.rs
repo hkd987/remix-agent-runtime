@@ -59,6 +59,15 @@ pub struct AgentRunner<L: LlmProvider, T: ToolExecutor> {
     config: AgentConfig,
     event_bus: Option<Arc<EventBus>>,
     thinking_control: Option<Arc<dyn crate::llm::client::ThinkingControl>>,
+    /// Registry for lifecycle hooks (SessionStart, SessionEnd, Stop, PreCompact).
+    ///
+    /// These are not tool calls, so they never reach `HookAwareExecutor`, which is a
+    /// `ToolExecutor` decorator. The runner is the only layer that knows when a session
+    /// starts, stops, or compacts, so it fires them.
+    hooks: Option<(Arc<crate::plugins::components::hooks::HookRegistry>, u64)>,
+    /// Dedicated client for self-critique, honouring `self_critique.model` and
+    /// `self_critique.max_tokens`. Falls back to the primary client when unset.
+    critique_llm: Option<Arc<dyn LlmProvider>>,
 }
 
 impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
@@ -69,6 +78,41 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             config,
             event_bus: None,
             thinking_control: None,
+            hooks: None,
+            critique_llm: None,
+        }
+    }
+
+    /// Attach a dedicated client for the self-critique pass.
+    pub fn with_critique_llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
+        self.critique_llm = Some(llm);
+        self
+    }
+
+    /// Attach a hook registry so the runner can fire lifecycle hooks.
+    pub fn with_hooks(
+        mut self,
+        registry: Arc<crate::plugins::components::hooks::HookRegistry>,
+        timeout_secs: u64,
+    ) -> Self {
+        self.hooks = Some((registry, timeout_secs));
+        self
+    }
+
+    /// Fire lifecycle hooks for `timing`, if a registry is attached.
+    async fn fire_lifecycle(
+        &self,
+        timing: crate::plugins::components::hooks::HookTiming,
+        context: Value,
+    ) {
+        if let Some((registry, timeout_secs)) = &self.hooks {
+            crate::plugins::hook_executor::fire_lifecycle_hooks(
+                registry,
+                *timeout_secs,
+                &timing,
+                context,
+            )
+            .await;
         }
     }
 
@@ -419,6 +463,12 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             },
         );
 
+        self.fire_lifecycle(
+            crate::plugins::components::hooks::HookTiming::SessionStart,
+            serde_json::json!({ "task": task }),
+        )
+        .await;
+
         // Create session if store is provided
         let session_metadata = if let Some(store) = session_store {
             match store.create(task).await {
@@ -489,6 +539,10 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         let timeout_ms = self.config.timeout_secs * 1000;
         let mut nudge_count: u32 = 0;
         let mut goal_check_fired = false;
+        // Self-critique rejections were unbounded: `max_rounds` was declared in config
+        // and never read, so a critic that kept rejecting could loop until the
+        // iteration cap.
+        let mut critique_rounds: u32 = 0;
 
         loop {
             if state.current_iteration() >= self.config.max_iterations {
@@ -505,6 +559,28 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 .await;
                 self.emit_completed(AgentStatus::MaxIterations, None, &state);
                 return Ok(state.into_result(AgentStatus::MaxIterations, None));
+            }
+
+            // Budget check. `max_budget_usd` was declared in config and documented but
+            // never compared against anything, so a runaway agent could spend without
+            // limit while the knob appeared to be doing something.
+            if let Some(max_budget) = self.config.max_budget_usd {
+                if state.total_cost() >= max_budget {
+                    info!(
+                        spent_usd = state.total_cost(),
+                        budget_usd = max_budget,
+                        "Budget exhausted"
+                    );
+                    self.finalize_session(
+                        session_store,
+                        &session_metadata,
+                        &state,
+                        SessionStatus::Completed,
+                    )
+                    .await;
+                    self.emit_completed(AgentStatus::BudgetExceeded, None, &state);
+                    return Ok(state.into_result(AgentStatus::BudgetExceeded, None));
+                }
             }
 
             if state.elapsed_ms() >= timeout_ms {
@@ -703,7 +779,9 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
 
                     // Feature 6: Self-critique phase
                     if let Some(ref critique_config) = self.config.self_critique {
-                        if self_critique::should_critique(critique_config, &assistant_content) {
+                        if critique_rounds < critique_config.max_rounds
+                            && self_critique::should_critique(critique_config, &assistant_content)
+                        {
                             debug!("Running self-critique on planned actions");
                             let critique_prompt =
                                 self_critique::build_critique_prompt(&assistant_content, task);
@@ -715,8 +793,18 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                                     text: critique_prompt,
                                 }],
                             }];
-                            if let Ok(critique_response) = self
-                                .llm
+                            // Use the configured critique model when one was wired in,
+                            // falling back to the primary client. `model` and
+                            // `max_tokens` were previously ignored entirely; the client
+                            // is injected rather than built here so the runner stays
+                            // generic over the provider.
+                            let critique_provider: &dyn LlmProvider =
+                                match self.critique_llm.as_deref() {
+                                    Some(c) => c,
+                                    None => &self.llm,
+                                };
+
+                            if let Ok(critique_response) = critique_provider
                                 .send_messages(Some(&critique_system), &critique_messages, None)
                                 .await
                             {
@@ -731,7 +819,13 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                                     .join("\n");
                                 let result = self_critique::parse_critique_response(&critique_text);
                                 if !result.approved {
-                                    info!("Self-critique rejected actions: {}", result.reasoning);
+                                    critique_rounds += 1;
+                                    info!(
+                                        round = critique_rounds,
+                                        max_rounds = critique_config.max_rounds,
+                                        "Self-critique rejected actions: {}",
+                                        result.reasoning
+                                    );
                                     let feedback = format!(
                                         "[SELF_CRITIQUE] Your planned actions were rejected.\nReason: {}\n{}Please revise your approach.",
                                         result.reasoning,
@@ -1023,6 +1117,15 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             return;
         }
 
+        self.fire_lifecycle(
+            crate::plugins::components::hooks::HookTiming::PreCompact,
+            serde_json::json!({
+                "iteration": state.current_iteration(),
+                "input_tokens": state.effective_input_tokens(),
+            }),
+        )
+        .await;
+
         // Feature 3: Progressive compaction stages
         if let Some(ref thresholds) = compact_config.stage_thresholds {
             if let Some(stage) = compaction_stages::determine_stage(
@@ -1230,6 +1333,28 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 .await;
                 self.emit_completed(AgentStatus::MaxIterations, None, &state);
                 return Ok(state.into_result(AgentStatus::MaxIterations, None));
+            }
+
+            // Budget check. `max_budget_usd` was declared in config and documented but
+            // never compared against anything, so a runaway agent could spend without
+            // limit while the knob appeared to be doing something.
+            if let Some(max_budget) = self.config.max_budget_usd {
+                if state.total_cost() >= max_budget {
+                    info!(
+                        spent_usd = state.total_cost(),
+                        budget_usd = max_budget,
+                        "Budget exhausted"
+                    );
+                    self.finalize_session(
+                        Some(session_store),
+                        &session_metadata,
+                        &state,
+                        SessionStatus::Completed,
+                    )
+                    .await;
+                    self.emit_completed(AgentStatus::BudgetExceeded, None, &state);
+                    return Ok(state.into_result(AgentStatus::BudgetExceeded, None));
+                }
             }
 
             if state.elapsed_ms() >= timeout_ms {
@@ -1494,6 +1619,26 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         state: &AgentState,
         status: SessionStatus,
     ) {
+        // Every terminal path in every loop routes through here, so this is the one
+        // place that reliably corresponds to "the run is ending".
+        let end_context = serde_json::json!({
+            "status": format!("{status:?}"),
+            "iterations": state.current_iteration(),
+            "total_input_tokens": state.total_input_tokens(),
+            "total_output_tokens": state.total_output_tokens(),
+            "total_cost_usd": state.total_cost(),
+        });
+        self.fire_lifecycle(
+            crate::plugins::components::hooks::HookTiming::Stop,
+            end_context.clone(),
+        )
+        .await;
+        self.fire_lifecycle(
+            crate::plugins::components::hooks::HookTiming::SessionEnd,
+            end_context,
+        )
+        .await;
+
         if let (Some(store), Some(metadata)) = (session_store, session_metadata) {
             let mut updated = metadata.clone();
             updated.status = status;
@@ -1653,7 +1798,23 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
                 return Ok(state.into_result(AgentStatus::MaxIterations, None));
             }
 
+            // Budget check. `max_budget_usd` was declared in config and documented but
+            // never compared against anything, so a runaway agent could spend without
+            // limit while the knob appeared to be doing something.
+            if let Some(max_budget) = self.config.max_budget_usd {
+                if state.total_cost() >= max_budget {
+                    info!(
+                        spent_usd = state.total_cost(),
+                        budget_usd = max_budget,
+                        "Budget exhausted"
+                    );
+                    self.emit_completed(AgentStatus::BudgetExceeded, None, &state);
+                    return Ok(state.into_result(AgentStatus::BudgetExceeded, None));
+                }
+            }
+
             // Check timeout
+
             if state.elapsed_ms() >= timeout_ms {
                 info!(elapsed_ms = state.elapsed_ms(), "Timeout reached");
                 self.emit_completed(AgentStatus::Timeout, None, &state);
