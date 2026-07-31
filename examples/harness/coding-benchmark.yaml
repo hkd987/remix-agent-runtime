@@ -2,7 +2,7 @@
 # Complete example config for running coding benchmarks with remix-agent.
 #
 # Usage:
-#   remix-agent --config examples/harness/coding-benchmark.yaml
+#   remix-agent run --config examples/harness/coding-benchmark.yaml
 #
 # This config enables the three runtime features designed for benchmark
 # workloads: loop detection, reasoning stages, and iteration budget warnings.

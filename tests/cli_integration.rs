@@ -68,3 +68,22 @@ fn test_run_missing_config_file_fails() {
         .failure()
         .stderr(predicate::str::contains("Failed to read config"));
 }
+
+/// The shipped example config must actually deserialize into `AppConfig`.
+///
+/// Nothing validated it, so it could rot silently — and with `deny_unknown_fields` now
+/// in place, a stale key in the example would be an error rather than a no-op.
+#[test]
+fn example_benchmark_config_parses() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/harness/coding-benchmark.yaml"
+    );
+    let yaml = std::fs::read_to_string(path).expect("example config should exist");
+    let config: remix_agent_runtime::config::schema::AppConfig =
+        serde_yaml::from_str(&yaml).expect("example config should deserialize");
+    config
+        .validate()
+        .expect("example config should pass validation");
+    assert!(config.task.is_some(), "example should define a task");
+}

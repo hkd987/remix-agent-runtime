@@ -7,40 +7,16 @@ FAIL=0
 pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1"; }
 
-# --- Functions under test (extracted from install.sh logic) ---
-
-symlink_guard() {
-  local path="$1"
-  if [ -L "$path" ]; then
-    rm -f "$path"
-    return 0
-  fi
-  return 1
-}
-
-resolve_install_dir() {
-  local home_dir="$1"
-  local fallback="${2:-/usr/local/bin}"
-  local local_bin="$home_dir/.local/bin"
-  if mkdir -p "$local_bin" 2>/dev/null; then
-    echo "$local_bin"
-    return 0
-  fi
-  if [ -w "$fallback" ]; then
-    echo "$fallback"
-    return 0
-  fi
-  return 1
-}
-
-path_contains() {
-  local dir="$1"
-  local path_var="$2"
-  case ":$path_var:" in
-    *":$dir:"*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
+# --- Functions under test ---
+#
+# Sourced from install.sh itself rather than reimplemented here. The previous version
+# defined its own copies of these functions, so the tests passed regardless of what
+# install.sh actually did — the script users are told to curl-pipe had no coverage at all.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REMIX_INSTALL_SOURCE_ONLY=1
+export REMIX_INSTALL_SOURCE_ONLY
+# shellcheck source=install.sh
+. "$SCRIPT_DIR/install.sh"
 
 # --- Tests ---
 
@@ -107,7 +83,8 @@ rm -rf "$TMPDIR5"
 
 # Test 6: install dir fails when both paths are unwritable
 echo "Test 6: install dir fails when unwritable"
-if ! resolve_install_dir "/dev" "/dev/null/nonexistent" >/dev/null 2>&1; then
+# Use a path under a regular file, which cannot be created by any user including root.
+if ! resolve_install_dir "/dev/null/nohome" "/dev/null/nonexistent" >/dev/null 2>&1; then
   pass "returns error for unwritable dir"
 else
   fail "should fail when dir is unwritable"

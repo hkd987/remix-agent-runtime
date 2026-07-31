@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use crate::llm::types::{compute_cost, ContentBlock, Message, Role, ToolResultContent};
+use crate::llm::types::{compute_cost_with_cache, ContentBlock, Message, Role, ToolResultContent};
 use crate::output::result::{AgentResult, AgentStatus, StepRecord};
 use crate::session::types::SessionSnapshot;
 
@@ -186,7 +186,8 @@ impl AgentState {
                 + u.cache_read_input_tokens.unwrap_or(0)
                 + u.cache_creation_input_tokens.unwrap_or(0);
 
-            self.total_cost += compute_cost(model, u.input_tokens, u.output_tokens);
+            // Cache reads and writes are billed separately from `input_tokens`.
+            self.total_cost += compute_cost_with_cache(model, u);
         }
     }
 

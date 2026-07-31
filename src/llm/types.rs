@@ -203,10 +203,31 @@ pub fn model_pricing(model: &str) -> (f64, f64) {
     (input_per_m / 1_000_000.0, output_per_m / 1_000_000.0)
 }
 
+/// Cache pricing multipliers relative to the base input rate.
+///
+/// Writing to the cache costs more than an uncached token; reading from it costs far
+/// less. Ignoring both makes cached reads look like full-price input, which understates
+/// the benefit of caching and overstates spend.
+const CACHE_WRITE_MULTIPLIER: f64 = 1.25;
+const CACHE_READ_MULTIPLIER: f64 = 0.1;
+
 /// Compute total cost from token counts and model.
 pub fn compute_cost(model: &str, input_tokens: u32, output_tokens: u32) -> f64 {
     let (input_rate, output_rate) = model_pricing(model);
     (input_tokens as f64 * input_rate) + (output_tokens as f64 * output_rate)
+}
+
+/// Compute total cost including cache reads and writes, which the API bills separately
+/// from `input_tokens`.
+pub fn compute_cost_with_cache(model: &str, usage: &Usage) -> f64 {
+    let (input_rate, output_rate) = model_pricing(model);
+    let base =
+        (usage.input_tokens as f64 * input_rate) + (usage.output_tokens as f64 * output_rate);
+    let write =
+        usage.cache_creation_input_tokens.unwrap_or(0) as f64 * input_rate * CACHE_WRITE_MULTIPLIER;
+    let read =
+        usage.cache_read_input_tokens.unwrap_or(0) as f64 * input_rate * CACHE_READ_MULTIPLIER;
+    base + write + read
 }
 
 #[cfg(test)]

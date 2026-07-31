@@ -63,6 +63,19 @@ pub trait ThinkingControl: Send + Sync {
     fn set_thinking_config(&self, config: Option<ThinkingConfig>);
 }
 
+/// How long a single request may take before it is abandoned.
+///
+/// Extended thinking on a large context can legitimately take minutes, so this is
+/// generous — but it must exist. Without any timeout a hung connection stalls the agent
+/// forever, since the loop only checks its own deadline *between* iterations.
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
+
+/// Retry budget for transient failures.
+const DEFAULT_MAX_RETRIES: u32 = 3;
+const BASE_RETRY_DELAY_MS: u64 = 1000;
+const MAX_RETRY_DELAY_MS: u64 = 30_000;
+
 pub struct AnthropicClient {
     client: reqwest::Client,
     base_url: String,
@@ -72,6 +85,11 @@ pub struct AnthropicClient {
     custom_headers: HashMap<String, String>,
     thinking: std::sync::RwLock<Option<ThinkingConfig>>,
     enable_prompt_caching: bool,
+    max_retries: u32,
+    /// Base backoff delay. Configurable so tests can exercise the real retry path
+    /// without either sleeping for seconds or pausing the clock — pausing also
+    /// virtualizes the request timeout, which then fires immediately.
+    retry_base_delay_ms: u64,
 }
 
 impl AnthropicClient {
@@ -84,8 +102,19 @@ impl AnthropicClient {
         thinking: Option<ThinkingConfig>,
         enable_prompt_caching: bool,
     ) -> Self {
+        // A client with no timeout will wait forever on a stalled connection. Compare
+        // `webhook.rs` and `web_fetch.rs`, which both set one.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))
+            .connect_timeout(std::time::Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
+            .build()
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "Falling back to a default HTTP client without timeouts");
+                reqwest::Client::new()
+            });
+
         Self {
-            client: reqwest::Client::new(),
+            client,
             base_url,
             api_key,
             model,
@@ -93,7 +122,21 @@ impl AnthropicClient {
             custom_headers,
             thinking: std::sync::RwLock::new(thinking),
             enable_prompt_caching,
+            max_retries: DEFAULT_MAX_RETRIES,
+            retry_base_delay_ms: BASE_RETRY_DELAY_MS,
         }
+    }
+
+    /// Override the base retry backoff.
+    pub fn with_retry_base_delay_ms(mut self, delay_ms: u64) -> Self {
+        self.retry_base_delay_ms = delay_ms;
+        self
+    }
+
+    /// Override the retry budget. Mainly for tests and callers with their own policy.
+    pub fn with_max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
+        self
     }
 
     fn build_request(&self, request: &MessagesRequest) -> reqwest::RequestBuilder {
@@ -115,6 +158,65 @@ impl AnthropicClient {
 
         builder.json(request)
     }
+}
+
+/// Compute the backoff delay for `attempt`, honouring a server-supplied `Retry-After`.
+///
+/// Jitter matters when several agents share a rate limit: without it they all back off
+/// for exactly the same interval and retry in lockstep, reproducing the burst that
+/// caused the 429.
+fn retry_delay_ms(attempt: u32, retry_after: Option<u64>, base_delay_ms: u64) -> u64 {
+    if let Some(secs) = retry_after {
+        // The server told us when to come back; that beats any local guess.
+        return (secs * 1000).min(MAX_RETRY_DELAY_MS);
+    }
+    // `checked_pow` because a large attempt count would otherwise overflow before the
+    // cap is applied.
+    let scaled = 2u64
+        .checked_pow(attempt)
+        .and_then(|f| base_delay_ms.checked_mul(f))
+        .unwrap_or(MAX_RETRY_DELAY_MS);
+    let base = scaled.min(MAX_RETRY_DELAY_MS);
+
+    // Deterministic ±25% spread derived from the attempt number, so no RNG dependency.
+    let spread = base / 4;
+    let offset = (attempt as u64 * 7919) % (spread * 2 + 1);
+    // Cap again: jitter is applied after the cap, so it could otherwise exceed it.
+    base.saturating_sub(spread)
+        .saturating_add(offset)
+        .min(MAX_RETRY_DELAY_MS)
+}
+
+/// Parse the `Retry-After` header, which may be either delay-seconds or an HTTP date.
+/// Only the numeric form is handled; a date falls back to computed backoff.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+/// Whether a transport-level failure is worth retrying.
+///
+/// Connection resets, DNS blips and timeouts are transient; a malformed request is not.
+/// These were previously not retried at all — only HTTP status codes were — so a single
+/// dropped connection ended the whole run.
+fn is_retryable_transport_error(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect() || e.is_request()
+}
+
+/// Whether a 400 is the API rejecting an over-long prompt.
+///
+/// This is recoverable by compacting and retrying, unlike other 400s, so it is worth
+/// distinguishing rather than aborting the run.
+pub fn is_context_overflow(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    lower.contains("prompt is too long")
+        || lower.contains("context window")
+        || (lower.contains("too many tokens") && lower.contains("maximum"))
 }
 
 #[async_trait]
@@ -140,15 +242,36 @@ impl LlmProvider for AnthropicClient {
             stream: None,
         };
 
-        let max_retries: u32 = 3;
-        let base_delay_ms: u64 = 1000;
-        let max_delay_ms: u64 = 30000;
+        let max_retries = self.max_retries.max(1);
+        let mut last_error: Option<AgentError> = None;
 
         for attempt in 0..max_retries {
             debug!(attempt = attempt, "Sending request to Anthropic API");
 
-            let response = self.build_request(&request).send().await?;
+            // The send itself is inside the retry loop. Previously a `?` here meant a
+            // dropped connection or DNS blip ended the run without a single retry,
+            // even though only status codes were treated as transient.
+            let response = match self.build_request(&request).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    if is_retryable_transport_error(&e) && attempt < max_retries - 1 {
+                        let delay_ms = retry_delay_ms(attempt, None, self.retry_base_delay_ms);
+                        warn!(
+                            attempt = attempt,
+                            delay_ms = delay_ms,
+                            error = %e,
+                            "Transport error, retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        last_error = Some(AgentError::Http(e));
+                        continue;
+                    }
+                    return Err(AgentError::Http(e));
+                }
+            };
+
             let status = response.status();
+            let retry_after = parse_retry_after(response.headers());
 
             if status.is_success() {
                 let body = response.text().await?;
@@ -168,13 +291,15 @@ impl LlmProvider for AnthropicClient {
 
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                 if attempt < max_retries - 1 {
-                    let delay_ms = (base_delay_ms * 2u64.pow(attempt)).min(max_delay_ms);
+                    let delay_ms = retry_delay_ms(attempt, retry_after, self.retry_base_delay_ms);
                     warn!(
                         attempt = attempt,
                         delay_ms = delay_ms,
+                        retry_after = ?retry_after,
                         "Rate limited, retrying"
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    last_error = Some(AgentError::LlmRateLimited);
                     continue;
                 }
                 return Err(AgentError::LlmRateLimited);
@@ -183,7 +308,7 @@ impl LlmProvider for AnthropicClient {
             if status.is_server_error() {
                 let body = response.text().await.unwrap_or_default();
                 if attempt < max_retries - 1 {
-                    let delay_ms = (base_delay_ms * 2u64.pow(attempt)).min(max_delay_ms);
+                    let delay_ms = retry_delay_ms(attempt, retry_after, self.retry_base_delay_ms);
                     warn!(
                         attempt = attempt,
                         delay_ms = delay_ms,
@@ -191,6 +316,11 @@ impl LlmProvider for AnthropicClient {
                         "Server error, retrying"
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    last_error = Some(AgentError::Llm(format!(
+                        "Server error {}: {}",
+                        status.as_u16(),
+                        body
+                    )));
                     continue;
                 }
                 return Err(AgentError::Llm(format!(
@@ -201,6 +331,13 @@ impl LlmProvider for AnthropicClient {
             }
 
             let body = response.text().await.unwrap_or_default();
+
+            // A 400 for an over-long prompt is recoverable by compacting, unlike other
+            // 400s, so it gets its own error the loop can act on.
+            if status == reqwest::StatusCode::BAD_REQUEST && is_context_overflow(&body) {
+                return Err(AgentError::LlmContextOverflow(body));
+            }
+
             return Err(AgentError::Llm(format!(
                 "Unexpected status {}: {}",
                 status.as_u16(),
@@ -208,7 +345,7 @@ impl LlmProvider for AnthropicClient {
             )));
         }
 
-        Err(AgentError::LlmRateLimited)
+        Err(last_error.unwrap_or(AgentError::LlmRateLimited))
     }
 }
 
@@ -420,7 +557,8 @@ mod tests {
             Default::default(),
             None,
             false,
-        );
+        )
+        .with_retry_base_delay_ms(1);
 
         let messages = vec![Message {
             role: Role::User,
@@ -471,7 +609,8 @@ mod tests {
             Default::default(),
             None,
             false,
-        );
+        )
+        .with_retry_base_delay_ms(1);
 
         let messages = vec![Message {
             role: Role::User,
@@ -513,7 +652,8 @@ mod tests {
             Default::default(),
             None,
             false,
-        );
+        )
+        .with_retry_base_delay_ms(1);
 
         let messages = vec![Message {
             role: Role::User,
@@ -550,7 +690,8 @@ mod tests {
             Default::default(),
             None,
             false,
-        );
+        )
+        .with_retry_base_delay_ms(1);
 
         let messages = vec![Message {
             role: Role::User,
@@ -587,7 +728,8 @@ mod tests {
             Default::default(),
             None,
             false,
-        );
+        )
+        .with_retry_base_delay_ms(1);
 
         let messages = vec![Message {
             role: Role::User,
@@ -596,10 +738,7 @@ mod tests {
             }],
         }];
 
-        // Use tokio::time::pause to speed up sleep in tests
-        tokio::time::pause();
         let result = client.send_messages(None, &messages, None).await;
-        tokio::time::resume();
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), AgentError::LlmRateLimited));
@@ -639,7 +778,8 @@ mod tests {
             Default::default(),
             None,
             false,
-        );
+        )
+        .with_retry_base_delay_ms(1);
 
         let messages = vec![Message {
             role: Role::User,
@@ -647,10 +787,7 @@ mod tests {
                 text: "Hello".to_string(),
             }],
         }];
-
-        tokio::time::pause();
         let result = client.send_messages(None, &messages, None).await;
-        tokio::time::resume();
 
         assert!(result.is_ok());
         let response = result.unwrap();
@@ -680,7 +817,8 @@ mod tests {
             Default::default(),
             None,
             false,
-        );
+        )
+        .with_retry_base_delay_ms(1);
 
         let messages = vec![Message {
             role: Role::User,
@@ -688,10 +826,7 @@ mod tests {
                 text: "Hello".to_string(),
             }],
         }];
-
-        tokio::time::pause();
         let result = client.send_messages(None, &messages, None).await;
-        tokio::time::resume();
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -733,7 +868,8 @@ mod tests {
             Default::default(),
             None,
             false,
-        );
+        )
+        .with_retry_base_delay_ms(1);
 
         let messages = vec![Message {
             role: Role::User,
@@ -741,10 +877,7 @@ mod tests {
                 text: "Hello".to_string(),
             }],
         }];
-
-        tokio::time::pause();
         let result = client.send_messages(None, &messages, None).await;
-        tokio::time::resume();
 
         assert!(result.is_ok());
         let response = result.unwrap();
@@ -774,7 +907,8 @@ mod tests {
             Default::default(),
             None,
             false,
-        );
+        )
+        .with_retry_base_delay_ms(1);
 
         let messages = vec![Message {
             role: Role::User,
@@ -782,10 +916,7 @@ mod tests {
                 text: "Hello".to_string(),
             }],
         }];
-
-        tokio::time::pause();
         let result = client.send_messages(None, &messages, None).await;
-        tokio::time::resume();
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -878,7 +1009,8 @@ mod tests {
             custom_headers,
             None,
             false,
-        );
+        )
+        .with_retry_base_delay_ms(1);
 
         let messages = vec![Message {
             role: Role::User,
@@ -913,7 +1045,8 @@ mod tests {
             Default::default(),
             None,
             false,
-        );
+        )
+        .with_retry_base_delay_ms(1);
 
         let messages = vec![Message {
             role: Role::User,
@@ -1062,7 +1195,8 @@ mod tests {
             Default::default(),
             None,
             false,
-        );
+        )
+        .with_retry_base_delay_ms(1);
 
         let messages = vec![Message {
             role: Role::User,
@@ -1114,5 +1248,171 @@ mod tests {
         assert!(result.is_ok());
 
         mock.assert_async().await;
+    }
+
+    // --- Retry policy ---
+
+    #[test]
+    fn test_retry_after_header_wins_over_backoff() {
+        // The server knows when its limit resets; a local guess does not.
+        assert_eq!(retry_delay_ms(0, Some(7), 1000), 7000);
+    }
+
+    #[test]
+    fn test_retry_after_is_capped() {
+        assert_eq!(retry_delay_ms(0, Some(9999), 1000), MAX_RETRY_DELAY_MS);
+    }
+
+    #[test]
+    fn test_backoff_grows_and_is_capped() {
+        let d0 = retry_delay_ms(0, None, 1000);
+        let d3 = retry_delay_ms(3, None, 1000);
+        assert!(d3 > d0, "{d3} should exceed {d0}");
+        assert!(retry_delay_ms(20, None, 1000) <= MAX_RETRY_DELAY_MS);
+    }
+
+    #[test]
+    fn test_backoff_is_jittered() {
+        // Without jitter, concurrent agents retry in lockstep and reproduce the burst
+        // that triggered the rate limit.
+        let plain: Vec<u64> = (0..4).map(|a| 1000 * 2u64.pow(a)).collect();
+        let actual: Vec<u64> = (0..4).map(|a| retry_delay_ms(a, None, 1000)).collect();
+        assert_ne!(plain, actual, "delays were not jittered");
+    }
+
+    #[test]
+    fn test_parse_retry_after_numeric() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "12".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), Some(12));
+    }
+
+    #[test]
+    fn test_parse_retry_after_http_date_falls_back() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[test]
+    fn test_context_overflow_detection() {
+        assert!(is_context_overflow(
+            r#"{"error":{"message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#
+        ));
+        assert!(is_context_overflow("exceeds the context window"));
+        assert!(!is_context_overflow(
+            r#"{"error":{"message":"invalid model name"}}"#
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_context_overflow_returns_distinct_error() {
+        // Recoverable by compacting, unlike other 400s, so the loop needs to tell them
+        // apart rather than ending the run.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/messages")
+            .with_status(400)
+            .with_body(r#"{"error":{"message":"prompt is too long: 250000 tokens"}}"#)
+            .create_async()
+            .await;
+
+        let client = AnthropicClient::new(
+            server.url(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            8192,
+            Default::default(),
+            None,
+            false,
+        )
+        .with_retry_base_delay_ms(1);
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "Hello".to_string(),
+            }],
+        }];
+
+        let err = client
+            .send_messages(None, &messages, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AgentError::LlmContextOverflow(_)),
+            "got: {err:?}"
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_other_400_is_not_treated_as_overflow() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/messages")
+            .with_status(400)
+            .with_body(r#"{"error":{"message":"invalid model name"}}"#)
+            .create_async()
+            .await;
+
+        let client = AnthropicClient::new(
+            server.url(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            8192,
+            Default::default(),
+            None,
+            false,
+        )
+        .with_retry_base_delay_ms(1);
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "Hello".to_string(),
+            }],
+        }];
+
+        let err = client
+            .send_messages(None, &messages, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::Llm(_)), "got: {err:?}");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_transport_error_is_retried() {
+        // A dropped connection used to end the run without a single retry, because the
+        // send was outside the retry loop.
+        let client = AnthropicClient::new(
+            // Nothing is listening here, so every attempt fails to connect.
+            "http://127.0.0.1:1".to_string(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            8192,
+            Default::default(),
+            None,
+            false,
+        )
+        .with_retry_base_delay_ms(1)
+        .with_max_retries(3);
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "Hello".to_string(),
+            }],
+        }];
+
+        let err = client
+            .send_messages(None, &messages, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::Http(_)), "got: {err:?}");
     }
 }

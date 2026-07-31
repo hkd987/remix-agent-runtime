@@ -15,6 +15,13 @@ pub enum AgentError {
     #[error("LLM rate limited")]
     LlmRateLimited,
 
+    /// The prompt exceeded the model's context window.
+    ///
+    /// Distinguished from a generic `Llm` error because it is recoverable: the loop can
+    /// compact the conversation and retry, rather than ending the run.
+    #[error("LLM context window exceeded: {0}")]
+    LlmContextOverflow(String),
+
     #[error("Browser error: {0}")]
     Browser(String),
 

@@ -30,6 +30,25 @@ use super::tool_registry::{ToolRegistry, SEARCH_TOOLS_NAME};
 /// Message injected when the LLM returns text-only without using any tools.
 const NUDGE_MESSAGE: &str = "You provided analysis but did not take any action. Continue with the implementation. Use tools to make progress on the task.";
 
+/// Place a cache breakpoint on the tool definitions.
+///
+/// The tool block is large, identical on every request, and sits immediately after the
+/// system prompt, so it is the single best cache candidate after the system blocks —
+/// and it was being re-sent uncached on every iteration. Anthropic allows up to four
+/// breakpoints and caches everything *before* each one, so marking the last definition
+/// covers the whole block.
+fn mark_tools_cacheable(tools: &mut [ToolDefinition]) {
+    if let Some(last) = tools.last_mut() {
+        last.cache_control = Some(CacheControl::ephemeral());
+    }
+}
+
+// NOTE: the conversation prefix is still re-sent uncached each iteration, which on a
+// long run is the dominant remaining cost. Caching it needs a `cache_control` field on
+// the `ContentBlock::Text` and `ContentBlock::ToolResult` variants, which are
+// constructed at ~180 sites across the tree; that is tracked separately rather than
+// bundled into this change.
+
 /// Message injected when a response is cut off by the output token limit.
 const TRUNCATION_MESSAGE: &str = "Your previous response was cut off because it reached the output token limit. Continue from exactly where you stopped. Do not repeat what you already produced.";
 
@@ -724,6 +743,30 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             // Do not let the `?` shortcut skip teardown: without this the persisted
             // session stays stuck in its pre-existing status and no terminal event ever
             // reaches the event bus, so a subscriber sees the run simply stop.
+            // A context-overflow 400 is recoverable: compact and retry once rather than
+            // ending the run. The proactive threshold can be overshot by a single large
+            // tool result, and before this that was fatal.
+            let response = match response {
+                Ok(r) => Ok(r),
+                Err(AgentError::LlmContextOverflow(body)) if compaction_config.is_some() => {
+                    warn!(
+                        detail = %body,
+                        "Context window exceeded; compacting and retrying"
+                    );
+                    let compact_config = compaction_config.expect("checked above");
+                    self.force_compaction(compact_config, &mut state, compaction_llm)
+                        .await;
+                    self.llm
+                        .send_messages(
+                            system_prompt.as_deref(),
+                            state.messages(),
+                            Some(&effective_tool_defs),
+                        )
+                        .await
+                }
+                other => other,
+            };
+
             let response = match response {
                 Ok(r) => r,
                 Err(e) => {
@@ -1087,6 +1130,30 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         }
     }
 
+    /// Compact unconditionally, ignoring thresholds and the stage latch.
+    ///
+    /// Used when the API has already rejected the prompt as too long: the thresholds
+    /// have demonstrably been overshot, so the usual "is it time yet" logic has nothing
+    /// useful to say. Runs the LLM summarization directly, which is the stage that
+    /// actually shrinks the conversation.
+    async fn force_compaction(
+        &self,
+        compact_config: &CompactionConfig,
+        state: &mut AgentState,
+        compaction_llm: Option<&dyn LlmProvider>,
+    ) {
+        self.fire_lifecycle(
+            crate::plugins::components::hooks::HookTiming::PreCompact,
+            serde_json::json!({
+                "iteration": state.current_iteration(),
+                "reason": "context_overflow",
+            }),
+        )
+        .await;
+        self.run_llm_compaction(compact_config, state, compaction_llm)
+            .await;
+    }
+
     /// Run compaction with progressive staging support and dedicated compaction LLM.
     async fn run_compaction(
         &self,
@@ -1402,6 +1469,30 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
             // Do not let the `?` shortcut skip teardown: without this the persisted
             // session stays stuck in its pre-existing status and no terminal event ever
             // reaches the event bus, so a subscriber sees the run simply stop.
+            // A context-overflow 400 is recoverable: compact and retry once rather than
+            // ending the run. The proactive threshold can be overshot by a single large
+            // tool result, and before this that was fatal.
+            let response = match response {
+                Ok(r) => Ok(r),
+                Err(AgentError::LlmContextOverflow(body)) if compaction_config.is_some() => {
+                    warn!(
+                        detail = %body,
+                        "Context window exceeded; compacting and retrying"
+                    );
+                    let compact_config = compaction_config.expect("checked above");
+                    self.force_compaction(compact_config, &mut state, compaction_llm)
+                        .await;
+                    self.llm
+                        .send_messages(
+                            system_prompt.as_deref(),
+                            state.messages(),
+                            Some(&effective_tool_defs),
+                        )
+                        .await
+                }
+                other => other,
+            };
+
             let response = match response {
                 Ok(r) => r,
                 Err(e) => {
