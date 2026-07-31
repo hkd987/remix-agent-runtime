@@ -299,16 +299,11 @@ fn extract_rust_fn(line: &str) -> Option<(String, String)> {
     // Match: pub fn name(...) or fn name(...) or pub async fn name(...)
     let line = line.trim();
 
-    let fn_idx = if let Some(idx) = line.find("fn ") {
-        // Make sure 'fn' is preceded by start, space, or keywords
-        if idx == 0 || line[..idx].ends_with(' ') || line[..idx].ends_with(')') {
-            idx
-        } else {
-            return None;
-        }
-    } else {
+    let fn_idx = line.find("fn ")?;
+    // Make sure 'fn' is preceded by start, space, or keywords
+    if fn_idx != 0 && !line[..fn_idx].ends_with(' ') && !line[..fn_idx].ends_with(')') {
         return None;
-    };
+    }
 
     // Don't match inside comments or strings
     if line.starts_with("//") || line.starts_with("/*") || line.starts_with('*') {
