@@ -1059,6 +1059,14 @@ async fn run_chat(chat_args: ChatArgs) -> ExitCode {
     let runner = runner;
 
     // Launch TUI
+    // Same dedicated compaction client the run path builds.
+    let compaction_llm: Option<std::sync::Arc<dyn remix_agent_runtime::llm::client::LlmProvider>> =
+        remix_agent_runtime::llm::client::build_compaction_client(&config.llm, &config.compaction)
+            .map(|c| std::sync::Arc::new(c) as std::sync::Arc<_>);
+    if let Some(ref m) = config.compaction.compaction_model {
+        tracing::info!(model = %m, "Using dedicated compaction model");
+    }
+
     remix_agent_runtime::tui::run_tui(
         runner,
         event_bus,
@@ -1067,6 +1075,7 @@ async fn run_chat(chat_args: ChatArgs) -> ExitCode {
         agents_md,
         session_store,
         compaction_config,
+        compaction_llm,
         config.llm.model.clone(),
     )
     .await

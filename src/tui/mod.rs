@@ -54,6 +54,9 @@ pub async fn run_tui<L, T>(
     agents_md: Option<AgentsMdContent>,
     session_store: Option<SessionStore>,
     compaction_config: Option<CompactionConfig>,
+    // Dedicated client for compaction summarization, when `compaction_model` is set.
+    // Chat previously always summarized on the primary model.
+    compaction_llm: Option<Arc<dyn crate::llm::client::LlmProvider>>,
     model_name: String,
 ) -> ExitCode
 where
@@ -116,6 +119,7 @@ where
         let mut runner = runner;
         let session_store_ref = session_store.as_ref().map(|s| s as &dyn SessionStorage);
         let compaction_ref = compaction_config.as_ref();
+        let compaction_llm_ref = compaction_llm.as_deref();
 
         runner
             .run_interactive_stream(
@@ -126,9 +130,7 @@ where
                 &agents_md,
                 session_store_ref,
                 compaction_ref,
-                // The chat path has no dedicated compaction client wired yet; the
-                // primary model is used, as before.
-                None,
+                compaction_llm_ref,
             )
             .await
     });
