@@ -142,6 +142,135 @@ pub struct MessagesRequest {
     pub thinking: Option<ThinkingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    /// Index into `messages` whose final content block carries a cache breakpoint.
+    ///
+    /// Held here rather than on `ContentBlock` so the breakpoint is applied once, at
+    /// the serialization boundary, instead of adding a `cache_control` field to two
+    /// enum variants that are constructed at ~180 sites across the tree.
+    #[serde(skip)]
+    pub cache_breakpoint: Option<usize>,
+}
+
+/// A content block with a cache breakpoint attached.
+///
+/// `flatten` splices `cache_control` into the block's own object, producing exactly the
+/// shape the API expects, without any hand-built JSON.
+#[derive(Serialize)]
+struct CachedBlock<'a> {
+    #[serde(flatten)]
+    inner: &'a ContentBlock,
+    cache_control: CacheControl,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum MaybeCachedBlock<'a> {
+    Plain(&'a ContentBlock),
+    Cached(CachedBlock<'a>),
+}
+
+#[derive(Serialize)]
+struct SerializableMessage<'a> {
+    role: &'a Role,
+    content: Vec<MaybeCachedBlock<'a>>,
+}
+
+/// The wire form of a request, with the cache breakpoint applied.
+#[derive(Serialize)]
+pub struct WireRequest<'a> {
+    model: &'a str,
+    max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<&'a Vec<SystemContent>>,
+    messages: Vec<SerializableMessage<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a Vec<ToolDefinition>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<&'a ThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
+}
+
+impl MessagesRequest {
+    /// Build the wire form, splicing in the cache breakpoint if one is set.
+    pub fn to_wire(&self) -> WireRequest<'_> {
+        let messages = self
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(i, msg)| {
+                let mark_last = self.cache_breakpoint == Some(i);
+                let last_idx = msg.content.len().saturating_sub(1);
+                let content = msg
+                    .content
+                    .iter()
+                    .enumerate()
+                    .map(|(j, block)| {
+                        if mark_last && j == last_idx && block_accepts_cache_control(block) {
+                            MaybeCachedBlock::Cached(CachedBlock {
+                                inner: block,
+                                cache_control: CacheControl::ephemeral(),
+                            })
+                        } else {
+                            MaybeCachedBlock::Plain(block)
+                        }
+                    })
+                    .collect();
+                SerializableMessage {
+                    role: &msg.role,
+                    content,
+                }
+            })
+            .collect();
+
+        WireRequest {
+            model: &self.model,
+            max_tokens: self.max_tokens,
+            system: self.system.as_ref(),
+            messages,
+            tools: self.tools.as_ref(),
+            thinking: self.thinking.as_ref(),
+            stream: self.stream,
+        }
+    }
+}
+
+/// Whether the API accepts `cache_control` on this block type.
+///
+/// Thinking and redacted-thinking blocks reject it, and marking one fails the whole
+/// request — so a breakpoint that lands on a thinking block is skipped rather than sent.
+fn block_accepts_cache_control(block: &ContentBlock) -> bool {
+    matches!(
+        block,
+        ContentBlock::Text { .. } | ContentBlock::ToolResult { .. } | ContentBlock::Image { .. }
+    )
+}
+
+/// Choose the message index that should carry the conversation cache breakpoint.
+///
+/// Without one, the entire growing history is re-sent uncached on every iteration,
+/// which on a long run is the dominant cost. The breakpoint goes on the last message of
+/// the stable prefix — the most recent exchange is excluded because it changes every
+/// turn and would invalidate the entry immediately.
+///
+/// Returns `None` for conversations too short to be worth caching.
+pub fn conversation_cache_breakpoint(messages: &[Message]) -> Option<usize> {
+    /// The API does not cache prefixes below its own minimum, so very short
+    /// conversations gain nothing and would just burn a breakpoint.
+    const MIN_MESSAGES: usize = 5;
+    /// Leave the most recent exchange (assistant turn + tool results) outside.
+    const UNCACHED_TAIL: usize = 2;
+
+    if messages.len() < MIN_MESSAGES {
+        return None;
+    }
+    let idx = messages.len() - UNCACHED_TAIL - 1;
+    // A breakpoint is useless on a block type that cannot carry one.
+    messages
+        .get(idx)
+        .and_then(|m| m.content.last())
+        .filter(|b| block_accepts_cache_control(b))
+        .map(|_| idx)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -365,6 +494,7 @@ mod tests {
             tools: None,
             thinking: None,
             stream: None,
+            cache_breakpoint: None,
         };
 
         let json = serde_json::to_value(&request).unwrap();
@@ -407,6 +537,7 @@ mod tests {
             }]),
             thinking: None,
             stream: None,
+            cache_breakpoint: None,
         };
 
         let json = serde_json::to_value(&request).unwrap();
@@ -438,6 +569,7 @@ mod tests {
             tools: None,
             thinking: None,
             stream: None,
+            cache_breakpoint: None,
         };
 
         let json_str = serde_json::to_string(&request).unwrap();
@@ -949,6 +1081,7 @@ mod tests {
             tools: None,
             thinking: Some(ThinkingConfig::enabled(10000)),
             stream: None,
+            cache_breakpoint: None,
         };
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["thinking"]["type"], "enabled");
@@ -966,6 +1099,7 @@ mod tests {
             tools: None,
             thinking: None,
             stream: Some(true),
+            cache_breakpoint: None,
         };
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["stream"], true);
@@ -1007,5 +1141,161 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&tool).unwrap()).unwrap();
         assert_eq!(deserialized.name, "navigate");
         assert!(deserialized.cache_control.is_some());
+    }
+
+    // --- Conversation cache breakpoint ---
+    //
+    // Without a breakpoint the whole growing history is re-sent uncached every
+    // iteration, which on a long run is the dominant cost.
+
+    fn msg(role: Role, text: &str) -> Message {
+        Message {
+            role,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    fn conversation(n: usize) -> Vec<Message> {
+        (0..n)
+            .map(|i| {
+                let role = if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                };
+                msg(role, &format!("message {i}"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_no_breakpoint_for_short_conversations() {
+        for n in 0..5 {
+            assert_eq!(
+                conversation_cache_breakpoint(&conversation(n)),
+                None,
+                "a {n}-message conversation should not burn a breakpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn test_breakpoint_excludes_the_most_recent_exchange() {
+        let msgs = conversation(9);
+        // The last two messages change every turn; caching through them would
+        // invalidate the entry immediately.
+        assert_eq!(conversation_cache_breakpoint(&msgs), Some(6));
+    }
+
+    #[test]
+    fn test_breakpoint_advances_as_the_conversation_grows() {
+        let a = conversation_cache_breakpoint(&conversation(7)).unwrap();
+        let b = conversation_cache_breakpoint(&conversation(9)).unwrap();
+        assert!(b > a, "breakpoint should move forward: {a} then {b}");
+    }
+
+    #[test]
+    fn test_breakpoint_skips_blocks_that_cannot_carry_it() {
+        // Thinking blocks reject cache_control, and marking one fails the whole request.
+        let mut msgs = conversation(9);
+        msgs[6].content = vec![ContentBlock::Thinking {
+            thinking: "hmm".to_string(),
+            signature: "sig".to_string(),
+        }];
+        assert_eq!(conversation_cache_breakpoint(&msgs), None);
+    }
+
+    fn wire_json(messages: Vec<Message>, breakpoint: Option<usize>) -> Value {
+        let request = MessagesRequest {
+            model: "test-model".to_string(),
+            max_tokens: 100,
+            system: None,
+            messages,
+            tools: None,
+            thinking: None,
+            stream: None,
+            cache_breakpoint: breakpoint,
+        };
+        serde_json::to_value(request.to_wire()).unwrap()
+    }
+
+    #[test]
+    fn test_wire_form_splices_cache_control_into_the_marked_block() {
+        let json = wire_json(conversation(9), Some(6));
+        let block = &json["messages"][6]["content"][0];
+        assert_eq!(block["type"], "text", "block shape was altered: {block}");
+        assert_eq!(block["text"], "message 6");
+        assert_eq!(block["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_wire_form_leaves_other_blocks_untouched() {
+        let json = wire_json(conversation(9), Some(6));
+        for i in [0usize, 5, 7, 8] {
+            let block = &json["messages"][i]["content"][0];
+            assert!(
+                block.get("cache_control").is_none(),
+                "message {i} should not carry a breakpoint: {block}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_wire_form_without_breakpoint_matches_plain_serialization() {
+        // The wire form must be a faithful rendering when no breakpoint is set.
+        let msgs = conversation(9);
+        let with_wire = wire_json(msgs.clone(), None);
+        let plain = serde_json::json!({
+            "model": "test-model",
+            "max_tokens": 100,
+            "messages": msgs,
+        });
+        assert_eq!(with_wire, plain);
+    }
+
+    #[test]
+    fn test_wire_form_marks_only_the_last_block_of_the_message() {
+        let mut msgs = conversation(9);
+        msgs[6].content = vec![
+            ContentBlock::Text {
+                text: "first".to_string(),
+            },
+            ContentBlock::Text {
+                text: "last".to_string(),
+            },
+        ];
+        let json = wire_json(msgs, Some(6));
+        assert!(json["messages"][6]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert_eq!(
+            json["messages"][6]["content"][1]["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
+
+    #[test]
+    fn test_wire_form_handles_tool_result_blocks() {
+        let msgs = vec![
+            msg(Role::User, "task"),
+            msg(Role::Assistant, "working"),
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    content: ToolResultContent::Text("ok".to_string()),
+                    is_error: None,
+                }],
+            },
+            msg(Role::Assistant, "more"),
+            msg(Role::User, "next"),
+        ];
+        let json = wire_json(msgs, Some(2));
+        let block = &json["messages"][2]["content"][0];
+        assert_eq!(block["type"], "tool_result");
+        assert_eq!(block["tool_use_id"], "t1");
+        assert_eq!(block["cache_control"]["type"], "ephemeral");
     }
 }

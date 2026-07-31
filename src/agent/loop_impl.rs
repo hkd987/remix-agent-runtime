@@ -43,11 +43,8 @@ fn mark_tools_cacheable(tools: &mut [ToolDefinition]) {
     }
 }
 
-// NOTE: the conversation prefix is still re-sent uncached each iteration, which on a
-// long run is the dominant remaining cost. Caching it needs a `cache_control` field on
-// the `ContentBlock::Text` and `ContentBlock::ToolResult` variants, which are
-// constructed at ~180 sites across the tree; that is tracked separately rather than
-// bundled into this change.
+// The conversation prefix is cached too — see `conversation_cache_breakpoint` in
+// `llm::types`, which the client applies at the serialization boundary.
 
 /// Message injected when a response is cut off by the output token limit.
 const TRUNCATION_MESSAGE: &str = "Your previous response was cut off because it reached the output token limit. Continue from exactly where you stopped. Do not repeat what you already produced.";

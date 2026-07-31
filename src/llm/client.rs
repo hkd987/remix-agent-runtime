@@ -156,7 +156,7 @@ impl AnthropicClient {
             builder = builder.header(key, value);
         }
 
-        builder.json(request)
+        builder.json(&request.to_wire())
     }
 }
 
@@ -240,6 +240,9 @@ impl LlmProvider for AnthropicClient {
             tools: tools.map(|t| t.to_vec()),
             thinking,
             stream: None,
+            // Cache the stable conversation prefix. Without this the whole history is
+            // re-sent uncached every iteration, which dominates the cost of a long run.
+            cache_breakpoint: conversation_cache_breakpoint(messages),
         };
 
         let max_retries = self.max_retries.max(1);
@@ -403,6 +406,7 @@ impl StreamingLlmProvider for AnthropicClient {
             tools: tools.map(|t| t.to_vec()),
             thinking,
             stream: Some(true),
+            cache_breakpoint: conversation_cache_breakpoint(messages),
         };
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamEvent, AgentError>>(32);
@@ -427,7 +431,7 @@ impl StreamingLlmProvider for AnthropicClient {
                 builder = builder.header(key, value);
             }
 
-            let response = match builder.json(&request).send().await {
+            let response = match builder.json(&request.to_wire()).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx.send(Err(AgentError::Http(e))).await;
@@ -1414,5 +1418,101 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AgentError::Http(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_conversation_cache_breakpoint_is_sent_on_the_wire() {
+        // The unit tests cover the wire form; this proves the client actually sends it,
+        // which is the part that was silently missing before.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/messages")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "m0"}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "m1"}]},
+                    {"role": "user", "content": [{"type": "text", "text": "m2"}]},
+                    {"role": "assistant", "content": [{
+                        "type": "text",
+                        "text": "m3",
+                        "cache_control": {"type": "ephemeral"}
+                    }]},
+                    {"role": "user", "content": [{"type": "text", "text": "m4"}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "m5"}]},
+                ]
+            })))
+            .with_status(200)
+            .with_body(
+                r#"{"id":"msg_1","content":[{"type":"text","text":"ok"}],
+                    "model":"test-model","stop_reason":"end_turn"}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = AnthropicClient::new(
+            server.url(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            8192,
+            Default::default(),
+            None,
+            true,
+        )
+        .with_retry_base_delay_ms(1);
+
+        let messages: Vec<Message> = (0..6)
+            .map(|i| Message {
+                role: if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
+                content: vec![ContentBlock::Text {
+                    text: format!("m{i}"),
+                }],
+            })
+            .collect();
+
+        client.send_messages(None, &messages, None).await.unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_short_conversation_sends_no_cache_control() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/messages")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+            })))
+            .with_status(200)
+            .with_body(
+                r#"{"id":"msg_1","content":[{"type":"text","text":"ok"}],
+                    "model":"test-model","stop_reason":"end_turn"}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = AnthropicClient::new(
+            server.url(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            8192,
+            Default::default(),
+            None,
+            true,
+        )
+        .with_retry_base_delay_ms(1);
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "hi".to_string(),
+            }],
+        }];
+
+        let response = client.send_messages(None, &messages, None).await.unwrap();
+        assert_eq!(response.id, "msg_1");
+        mock.assert_async().await;
     }
 }
