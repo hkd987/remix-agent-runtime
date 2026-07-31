@@ -144,13 +144,20 @@ pub struct MessagesRequest {
     pub stream: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
     EndTurn,
     ToolUse,
     MaxTokens,
     StopSequence,
+    /// A stop reason this build does not know about, such as `refusal` or `pause_turn`.
+    ///
+    /// Without this arm the field fails to deserialize and the whole response surfaces
+    /// as a misleading "Failed to parse response" error, so a new API value looks like
+    /// a client bug. The loop treats it as the end of the turn.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

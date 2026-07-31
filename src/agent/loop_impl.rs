@@ -2,7 +2,7 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::browser::mcp::ToolExecutor;
 use crate::config::credentials::{inject_credentials_into_system_prompt, CredentialSet};
@@ -29,6 +29,9 @@ use super::tool_registry::ToolRegistry;
 
 /// Message injected when the LLM returns text-only without using any tools.
 const NUDGE_MESSAGE: &str = "You provided analysis but did not take any action. Continue with the implementation. Use tools to make progress on the task.";
+
+/// Message injected when a response is cut off by the output token limit.
+const TRUNCATION_MESSAGE: &str = "Your previous response was cut off because it reached the output token limit. Continue from exactly where you stopped. Do not repeat what you already produced.";
 
 /// Message injected for a one-time goal check before the agent terminates.
 const GOAL_CHECK_BASE: &str = "STOP. Before you finish, re-read the ORIGINAL TASK below and verify ALL requirements and constraints are met:\n\n\
@@ -115,6 +118,34 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         self.emit_response_content_events(&content);
         state.add_assistant_message(content);
         state.inject_system_notification(NUDGE_MESSAGE);
+        None
+    }
+
+    /// Ask the model to continue a response that was cut off by the output token cap.
+    ///
+    /// Returns `None` if a continuation was requested (caller should `continue` the
+    /// loop), `Some(content)` if the attempt budget is exhausted and the caller should
+    /// terminate with whatever text arrived.
+    fn try_continue_truncated(
+        &self,
+        state: &mut AgentState,
+        content: Vec<ContentBlock>,
+        continuation_count: &mut u32,
+    ) -> Option<Vec<ContentBlock>> {
+        if *continuation_count >= self.config.nudge_max_count {
+            warn!(
+                attempts = *continuation_count,
+                "Response repeatedly truncated at max_tokens; returning partial output"
+            );
+            return Some(content);
+        }
+        *continuation_count += 1;
+        info!(
+            attempt = *continuation_count,
+            "Response truncated at max_tokens, requesting continuation"
+        );
+        self.emit_response_content_events(&content);
+        state.add_assistant_message_refusing_tools(content, TRUNCATION_MESSAGE);
         None
     }
 
@@ -575,7 +606,31 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     state.messages(),
                     Some(&effective_tool_defs),
                 )
-                .await?;
+                .await;
+
+            // Do not let the `?` shortcut skip teardown: without this the persisted
+            // session stays stuck in its pre-existing status and no terminal event ever
+            // reaches the event bus, so a subscriber sees the run simply stop.
+            let response = match response {
+                Ok(r) => r,
+                Err(e) => {
+                    error!(error = %e, "LLM request failed, ending run");
+                    self.finalize_session(
+                        session_store,
+                        &session_metadata,
+                        &state,
+                        SessionStatus::Error,
+                    )
+                    .await;
+                    events::emit(
+                        &self.event_bus,
+                        AgentEvent::AgentError {
+                            error: e.to_string(),
+                        },
+                    );
+                    return Err(e);
+                }
+            };
 
             state.accumulate_usage(response.usage.as_ref(), &response.model);
 
@@ -724,13 +779,39 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         }
                     }
                 }
-                StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
+                StopReason::EndTurn
+                | StopReason::MaxTokens
+                | StopReason::StopSequence
+                | StopReason::Unknown => {
+                    if effective_stop_reason == StopReason::Unknown {
+                        warn!(
+                            stop_reason = ?response.stop_reason,
+                            "Unrecognized stop_reason from the API; treating as end_turn"
+                        );
+                    }
+
                     // Normalization above guarantees this arm is only reached when the
                     // response carries no tool_use blocks, so both the nudge and the
                     // goal check can safely append the content and inject a follow-up
                     // user message without orphaning a tool call.
-                    let Some(content) =
-                        self.try_nudge(&mut state, response.content, &mut nudge_count)
+
+                    // `max_tokens` means the output was cut off mid-sentence. Reporting
+                    // that as a successful completion hands back a truncated answer, so
+                    // ask for a continuation first.
+                    let content = if effective_stop_reason == StopReason::MaxTokens {
+                        let Some(c) = self.try_continue_truncated(
+                            &mut state,
+                            response.content,
+                            &mut nudge_count,
+                        ) else {
+                            continue;
+                        };
+                        c
+                    } else {
+                        response.content
+                    };
+
+                    let Some(content) = self.try_nudge(&mut state, content, &mut nudge_count)
                     else {
                         continue;
                     };
@@ -935,6 +1016,13 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         state: &mut AgentState,
         compaction_llm: Option<&dyn LlmProvider>,
     ) {
+        // Honour `enabled` on both paths. Only the legacy branch used to check it, via
+        // `should_compact`, so a config with `enabled: false` plus stage thresholds
+        // still compacted.
+        if !compact_config.enabled {
+            return;
+        }
+
         // Feature 3: Progressive compaction stages
         if let Some(ref thresholds) = compact_config.stage_thresholds {
             if let Some(stage) = compaction_stages::determine_stage(
@@ -942,15 +1030,28 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 compact_config.context_window_tokens,
                 state.effective_input_tokens(),
             ) {
+                // Latch: a stage that already ran and did not bring the context below
+                // its threshold has nothing left to give, and re-running it every
+                // iteration just rewrites the message list for no benefit.
+                if !state.should_run_compaction_stage(stage) {
+                    debug!(
+                        stage = ?stage,
+                        "Skipping compaction stage; already applied at this context size"
+                    );
+                    return;
+                }
                 info!(
                     stage = ?stage,
                     input_tokens = state.effective_input_tokens(),
                     "Triggering progressive compaction"
                 );
+                state.record_compaction_stage(stage);
                 match stage {
                     compaction_stages::CompactionStage::ToolOutputCompression => {
                         let messages = state.messages_mut();
-                        let count = compaction_stages::compress_tool_outputs(messages, 500);
+                        let preserve = compact_config.preserve_recent_n;
+                        let count =
+                            compaction_stages::compress_tool_outputs(messages, 500, preserve);
                         if count > 0 {
                             info!(compressed = count, "Compressed tool outputs");
                         }
@@ -1192,7 +1293,31 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     state.messages(),
                     Some(&effective_tool_defs),
                 )
-                .await?;
+                .await;
+
+            // Do not let the `?` shortcut skip teardown: without this the persisted
+            // session stays stuck in its pre-existing status and no terminal event ever
+            // reaches the event bus, so a subscriber sees the run simply stop.
+            let response = match response {
+                Ok(r) => r,
+                Err(e) => {
+                    error!(error = %e, "LLM request failed, ending run");
+                    self.finalize_session(
+                        Some(session_store),
+                        &session_metadata,
+                        &state,
+                        SessionStatus::Error,
+                    )
+                    .await;
+                    events::emit(
+                        &self.event_bus,
+                        AgentEvent::AgentError {
+                            error: e.to_string(),
+                        },
+                    );
+                    return Err(e);
+                }
+            };
 
             state.accumulate_usage(response.usage.as_ref(), &response.model);
 
@@ -1270,13 +1395,39 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         }
                     }
                 }
-                StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
+                StopReason::EndTurn
+                | StopReason::MaxTokens
+                | StopReason::StopSequence
+                | StopReason::Unknown => {
+                    if effective_stop_reason == StopReason::Unknown {
+                        warn!(
+                            stop_reason = ?response.stop_reason,
+                            "Unrecognized stop_reason from the API; treating as end_turn"
+                        );
+                    }
+
                     // Normalization above guarantees this arm is only reached when the
                     // response carries no tool_use blocks, so both the nudge and the
                     // goal check can safely append the content and inject a follow-up
                     // user message without orphaning a tool call.
-                    let Some(content) =
-                        self.try_nudge(&mut state, response.content, &mut nudge_count)
+
+                    // `max_tokens` means the output was cut off mid-sentence. Reporting
+                    // that as a successful completion hands back a truncated answer, so
+                    // ask for a continuation first.
+                    let content = if effective_stop_reason == StopReason::MaxTokens {
+                        let Some(c) = self.try_continue_truncated(
+                            &mut state,
+                            response.content,
+                            &mut nudge_count,
+                        ) else {
+                            continue;
+                        };
+                        c
+                    } else {
+                        response.content
+                    };
+
+                    let Some(content) = self.try_nudge(&mut state, content, &mut nudge_count)
                     else {
                         continue;
                     };
@@ -1323,7 +1474,7 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
     ) {
         if let (Some(store), Some(metadata)) = (session_store, session_metadata) {
             let (r1, r2) = tokio::join!(
-                store.append_messages(&metadata.id, state.messages()),
+                store.save_messages(&metadata.id, state.messages()),
                 store.save_steps(&metadata.id, state.steps())
             );
             if let Err(e) = r1 {
@@ -1732,8 +1883,16 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
                 }
             }
 
-            // Process the assembled response (same logic as batch loop)
-            match response.stop_reason {
+            // Process the assembled response (same logic as batch loop). As there, a
+            // response carrying tool_use blocks is executed regardless of the reported
+            // stop_reason.
+            let effective_stop_reason = if content_has_tool_use(&response.content) {
+                StopReason::ToolUse
+            } else {
+                response.stop_reason
+            };
+
+            match effective_stop_reason {
                 StopReason::ToolUse => {
                     let assistant_content = response.content;
                     let has_tool_use = content_has_tool_use(&assistant_content);
@@ -1813,7 +1972,16 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
                         }
                     }
                 }
-                StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
+                StopReason::EndTurn
+                | StopReason::MaxTokens
+                | StopReason::StopSequence
+                | StopReason::Unknown => {
+                    if effective_stop_reason == StopReason::Unknown {
+                        warn!(
+                            stop_reason = ?response.stop_reason,
+                            "Unrecognized stop_reason from the API; treating as end_turn"
+                        );
+                    }
                     let content = if !content_has_tool_use(&response.content) {
                         let Some(content) =
                             self.try_nudge(&mut state, response.content, &mut nudge_count)

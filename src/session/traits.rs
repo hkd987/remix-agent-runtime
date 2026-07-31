@@ -18,8 +18,14 @@ pub trait SessionStorage: Send + Sync {
     /// Save/update session metadata.
     async fn save_metadata(&self, metadata: &SessionMetadata) -> Result<(), AgentError>;
 
-    /// Append messages to the session's message log (append-only).
-    async fn append_messages(
+    /// Replace the session's message log with `messages`.
+    ///
+    /// This is a full replace, not an append. The caller passes the entire in-memory
+    /// conversation each iteration, and compaction rewrites that history in place —
+    /// summarizing, merging, and pruning earlier turns — so an appending backend would
+    /// both duplicate every message and keep messages the agent has already discarded.
+    /// The persisted log must mirror the current conversation exactly.
+    async fn save_messages(
         &self,
         session_id: &SessionId,
         messages: &[Message],

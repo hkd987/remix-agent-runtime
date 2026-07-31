@@ -76,9 +76,18 @@ pub fn determine_stage(
 
 /// Stage 1: Compress large tool output results in-place.
 /// Truncates ToolResult text content that exceeds `max_chars` to `max_chars` chars + truncation marker.
-pub fn compress_tool_outputs(messages: &mut [Message], max_chars: usize) -> usize {
+///
+/// The most recent `preserve_recent_n` messages are left untouched. Without that guard
+/// this truncates the tool result the model is about to reason over — including the one
+/// produced in the previous iteration — which is exactly the context it still needs.
+pub fn compress_tool_outputs(
+    messages: &mut [Message],
+    max_chars: usize,
+    preserve_recent_n: usize,
+) -> usize {
     let mut compressed_count = 0;
-    for msg in messages.iter_mut() {
+    let compressible_end = messages.len().saturating_sub(preserve_recent_n);
+    for msg in messages.iter_mut().take(compressible_end) {
         for block in msg.content.iter_mut() {
             if let ContentBlock::ToolResult { content, .. } = block {
                 match content {
@@ -421,7 +430,7 @@ mod tests {
             }],
         }];
 
-        compress_tool_outputs(&mut messages, 500);
+        compress_tool_outputs(&mut messages, 500, 0);
 
         if let ContentBlock::ToolResult { content, .. } = &messages[0].content[0] {
             if let ToolResultContent::Text(text) = content {
@@ -448,7 +457,7 @@ mod tests {
             }],
         }];
 
-        let count = compress_tool_outputs(&mut messages, 500);
+        let count = compress_tool_outputs(&mut messages, 500, 0);
         assert_eq!(count, 0);
 
         if let ContentBlock::ToolResult { content, .. } = &messages[0].content[0] {
@@ -494,7 +503,7 @@ mod tests {
             },
         ];
 
-        let count = compress_tool_outputs(&mut messages, 500);
+        let count = compress_tool_outputs(&mut messages, 500, 0);
         assert_eq!(count, 2);
     }
 
@@ -685,7 +694,7 @@ mod tests {
             }],
         }];
 
-        let count = compress_tool_outputs(&mut messages, 500);
+        let count = compress_tool_outputs(&mut messages, 500, 0);
         assert_eq!(count, 1);
 
         if let ContentBlock::ToolResult { content, .. } = &messages[0].content[0] {
@@ -791,7 +800,7 @@ mod tests {
     fn test_compress_tool_outputs_skips_non_tool_result_blocks() {
         let mut messages = vec![make_user_text("Hello"), make_assistant_text("World")];
 
-        let count = compress_tool_outputs(&mut messages, 500);
+        let count = compress_tool_outputs(&mut messages, 500, 0);
         assert_eq!(count, 0);
     }
 }

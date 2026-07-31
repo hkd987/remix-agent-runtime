@@ -20,6 +20,7 @@ use remix_agent_runtime::llm::types::{
     ContentBlock, Message, MessagesResponse, StopReason, SystemContent, ToolDefinition, Usage,
 };
 use remix_agent_runtime::llm::LlmProvider;
+use remix_agent_runtime::output::result::AgentStatus;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
@@ -405,4 +406,78 @@ async fn reminder_injection_holds_invariants() {
     let (llm, violations) = ValidatingLlm::new(responses);
     let violations = run(llm, violations, EchoTools::new(), config).await;
     assert!(violations.is_empty(), "violations: {violations:#?}");
+}
+
+// --- C6 / C7: stop-reason handling ---------------------------------------------
+
+fn max_tokens_response(text: &str) -> MessagesResponse {
+    MessagesResponse {
+        id: "msg_test".to_string(),
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+        }],
+        model: "test-model".to_string(),
+        stop_reason: StopReason::MaxTokens,
+        usage: Some(Usage {
+            input_tokens: 1000,
+            output_tokens: 100,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        }),
+    }
+}
+
+#[tokio::test]
+async fn truncated_response_is_continued_not_reported_as_success() {
+    // A max_tokens stop means the output was cut off mid-sentence. Terminating there
+    // reports a partial answer as the final one.
+    let (llm, violations) = ValidatingLlm::new(vec![
+        max_tokens_response("The answer is that the system should"),
+        end_turn(" be configured as follows. Done."),
+    ]);
+
+    let runner = AgentRunner::new(llm, EchoTools::new(), base_config());
+    let result = runner
+        .run(
+            "explain the thing",
+            &Default::default(),
+            &Default::default(),
+            &None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        violations.lock().unwrap().is_empty(),
+        "violations: {:?}",
+        violations.lock().unwrap()
+    );
+    // The loop asked for a continuation, so the final text is the continued turn
+    // rather than the truncated fragment.
+    let final_text = result.result.unwrap_or_default();
+    assert!(
+        final_text.contains("Done."),
+        "expected the continuation to be the final text, got: {final_text}"
+    );
+}
+
+#[tokio::test]
+async fn unknown_stop_reason_deserializes_and_ends_the_turn() {
+    // A `refusal` or `pause_turn` from the API must not surface as a parse failure.
+    let parsed: StopReason =
+        serde_json::from_str("\"refusal\"").expect("unknown stop_reason must deserialize");
+    assert_eq!(parsed, StopReason::Unknown);
+
+    let mut response = end_turn("stopping here");
+    response.stop_reason = StopReason::Unknown;
+
+    let (llm, violations) = ValidatingLlm::new(vec![response]);
+    let runner = AgentRunner::new(llm, EchoTools::new(), base_config());
+    let result = runner
+        .run("do it", &Default::default(), &Default::default(), &None)
+        .await
+        .unwrap();
+
+    assert!(violations.lock().unwrap().is_empty());
+    assert_eq!(result.status, AgentStatus::Success);
 }

@@ -1,3 +1,5 @@
+#[cfg(test)]
+pub mod conformance;
 pub mod file_store;
 pub mod traits;
 pub mod types;

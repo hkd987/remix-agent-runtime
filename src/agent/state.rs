@@ -18,6 +18,9 @@ pub struct AgentState {
     effective_input_tokens: u32,
     /// Cached flag: true once a `write_file` or `edit_file` step has been recorded.
     has_written_files: bool,
+    /// The compaction stage most recently applied, and the context size at the time.
+    /// Used to stop a stage from re-running when it cannot reduce the context further.
+    last_compaction: Option<(crate::agent::compaction_stages::CompactionStage, u32)>,
 }
 
 impl AgentState {
@@ -37,6 +40,7 @@ impl AgentState {
             total_cost: 0.0,
             effective_input_tokens: 0,
             has_written_files: false,
+            last_compaction: None,
         }
     }
 
@@ -56,6 +60,7 @@ impl AgentState {
             total_cost: 0.0,
             effective_input_tokens: 0,
             has_written_files,
+            last_compaction: None,
         }
     }
 
@@ -163,7 +168,19 @@ impl AgentState {
         if let Some(u) = usage {
             self.total_input_tokens += u.input_tokens;
             self.total_output_tokens += u.output_tokens;
-            self.effective_input_tokens += u.input_tokens;
+
+            // `effective_input_tokens` tracks the *current* context size, so it is
+            // assigned, not accumulated. Each response's `input_tokens` already counts
+            // the whole prompt; summing them across iterations measures cumulative
+            // spend and makes compaction fire on iteration count rather than on real
+            // context pressure.
+            //
+            // Cached prefix tokens are counted separately by the API but still occupy
+            // the context window, so they belong in the total.
+            self.effective_input_tokens = u.input_tokens
+                + u.cache_read_input_tokens.unwrap_or(0)
+                + u.cache_creation_input_tokens.unwrap_or(0);
+
             self.total_cost += compute_cost(model, u.input_tokens, u.output_tokens);
         }
     }
@@ -191,6 +208,31 @@ impl AgentState {
     /// `estimated_tokens` is a rough estimate of the compacted context size.
     pub fn reset_effective_tokens(&mut self, estimated_tokens: u32) {
         self.effective_input_tokens = estimated_tokens;
+    }
+
+    /// Whether `stage` should run, given what already ran and at what context size.
+    ///
+    /// A stage is worth repeating only once the context has grown past the point where
+    /// it last ran. Otherwise the same stage fires on every iteration, rewriting the
+    /// message list without reducing anything.
+    pub fn should_run_compaction_stage(
+        &self,
+        stage: crate::agent::compaction_stages::CompactionStage,
+    ) -> bool {
+        match self.last_compaction {
+            Some((last_stage, tokens_at_run)) if last_stage == stage => {
+                self.effective_input_tokens > tokens_at_run
+            }
+            _ => true,
+        }
+    }
+
+    /// Record that `stage` ran at the current context size.
+    pub fn record_compaction_stage(
+        &mut self,
+        stage: crate::agent::compaction_stages::CompactionStage,
+    ) {
+        self.last_compaction = Some((stage, self.effective_input_tokens));
     }
 
     pub fn steps(&self) -> &[StepRecord] {
@@ -681,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn test_effective_input_tokens_accumulates_with_usage() {
+    fn test_effective_input_tokens_tracks_latest_prompt_size() {
         use crate::llm::types::Usage;
 
         let mut state = AgentState::new("task");
@@ -706,8 +748,29 @@ mod tests {
             }),
             "claude-sonnet-4-20250514",
         );
-        assert_eq!(state.effective_input_tokens(), 300);
+        // `effective` is the size of the latest prompt, not a running sum: the API
+        // reports the whole context in every response's `input_tokens`.
+        assert_eq!(state.effective_input_tokens(), 200);
+        // `total` stays cumulative, for spend reporting.
         assert_eq!(state.total_input_tokens(), 300);
+    }
+
+    #[test]
+    fn test_effective_input_tokens_includes_cached_prefix() {
+        use crate::llm::types::Usage;
+
+        let mut state = AgentState::new("task");
+        state.accumulate_usage(
+            Some(&Usage {
+                input_tokens: 1_000,
+                output_tokens: 50,
+                cache_creation_input_tokens: Some(400),
+                cache_read_input_tokens: Some(8_000),
+            }),
+            "claude-sonnet-4-20250514",
+        );
+        // Cached tokens are billed separately but still occupy the context window.
+        assert_eq!(state.effective_input_tokens(), 9_400);
     }
 
     #[test]
@@ -817,8 +880,8 @@ mod tests {
             "claude-sonnet-4-20250514",
         );
 
-        // effective tracks only post-compaction context
-        assert_eq!(state.effective_input_tokens(), 12_000);
+        // effective tracks only the latest prompt, which is the post-compaction context
+        assert_eq!(state.effective_input_tokens(), 10_000);
         // total is cumulative across the whole session
         assert_eq!(state.total_input_tokens(), 160_000);
     }
