@@ -142,6 +142,15 @@ pub fn inject_credentials_into_system_prompt(creds: &CredentialSet) -> Option<St
 
 #[cfg(test)]
 mod tests {
+    /// (name, type, fields, optional domain) — named so the signature below stays
+    /// readable instead of being a four-deep nested tuple.
+    type CredentialSpec<'a> = (
+        &'a str,
+        CredentialType,
+        Vec<(&'a str, &'a str)>,
+        Option<&'a str>,
+    );
+
     use super::*;
 
     fn make_raw_credential(
@@ -166,9 +175,7 @@ mod tests {
         }
     }
 
-    fn make_credential_set(
-        creds: Vec<(&str, CredentialType, Vec<(&str, &str)>, Option<&str>)>,
-    ) -> CredentialSet {
+    fn make_credential_set(creds: Vec<CredentialSpec<'_>>) -> CredentialSet {
         let mut set = CredentialSet::new();
         for (name, cred_type, fields, url_pattern) in creds {
             let field_vec: Vec<(String, String)> = fields

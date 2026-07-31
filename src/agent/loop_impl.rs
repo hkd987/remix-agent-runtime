@@ -469,10 +469,6 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         tools.iter().filter(|t| t.read_only).cloned().collect()
     }
 
-    /// Execute tool_use blocks from an assistant response sequentially.
-    ///
-    /// Returns `(tool_results, step_records)` preserving the original block order.
-
     /// Process a single tool execution result into a ContentBlock and StepRecord.
     fn process_tool_result(
         id: &str,
@@ -624,7 +620,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
 
         // Feature 1: Lazy tool discovery — build registry only when needed
 
-        let all_tool_defs = self.tools.tool_definitions().to_vec();
+        let mut all_tool_defs = self.tools.tool_definitions().to_vec();
+        mark_tools_cacheable(&mut all_tool_defs);
         let mut tool_registry = if self.config.lazy_tool_discovery {
             let always_avail = ALWAYS_AVAILABLE_TOOLS
                 .iter()
@@ -1360,7 +1357,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         // The resumed conversation carries the original task as its first message.
         let resumed_task = state.original_task().unwrap_or_default().to_string();
 
-        let all_tool_defs = self.tools.tool_definitions().to_vec();
+        let mut all_tool_defs = self.tools.tool_definitions().to_vec();
+        mark_tools_cacheable(&mut all_tool_defs);
         let mut tool_registry = if self.config.lazy_tool_discovery {
             let always_avail = ALWAYS_AVAILABLE_TOOLS
                 .iter()
@@ -1856,7 +1854,8 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
         let system_prompt = self.build_system_blocks(credential_set, skill_set, agents_md);
 
         // Tool definitions
-        let all_tool_defs = self.tools.tool_definitions().to_vec();
+        let mut all_tool_defs = self.tools.tool_definitions().to_vec();
+        mark_tools_cacheable(&mut all_tool_defs);
         let mut tool_registry = if self.config.lazy_tool_discovery {
             let always_avail = ALWAYS_AVAILABLE_TOOLS
                 .iter()

@@ -511,7 +511,6 @@ agent:
                 no_repo_map: false,
                 lsp_server: Vec::new(),
                 thinking_budget_tokens: None,
-                ..Default::default()
             },
             task: Some("cli task".to_string()),
             timeout: Some(120),
@@ -532,7 +531,6 @@ agent:
             execution_budget_tokens: None,
             verification_budget_tokens: None,
             iteration_budget_warning_threshold: None,
-            ..Default::default()
         };
         let config = load_config(&args).unwrap();
 

@@ -408,14 +408,18 @@ mod tests {
     fn test_plugin_set_all_skill_dirs() {
         let mut set = PluginSet::new();
 
-        let mut c1 = PluginComponents::default();
-        c1.has_skills = true;
-        c1.skill_dirs = vec![PathBuf::from("/p1/skills/a"), PathBuf::from("/p1/skills/b")];
+        let c1 = PluginComponents {
+            has_skills: true,
+            skill_dirs: vec![PathBuf::from("/p1/skills/a"), PathBuf::from("/p1/skills/b")],
+            ..Default::default()
+        };
         set.push(make_resolved("p1", c1));
 
-        let mut c2 = PluginComponents::default();
-        c2.has_skills = true;
-        c2.skill_dirs = vec![PathBuf::from("/p2/skills/c")];
+        let c2 = PluginComponents {
+            has_skills: true,
+            skill_dirs: vec![PathBuf::from("/p2/skills/c")],
+            ..Default::default()
+        };
         set.push(make_resolved("p2", c2));
 
         // Third plugin with no skills
@@ -432,9 +436,11 @@ mod tests {
     fn test_plugin_set_all_mcp_configs() {
         let mut set = PluginSet::new();
 
-        let mut c1 = PluginComponents::default();
-        c1.has_mcp_config = true;
-        c1.mcp_config_path = Some(PathBuf::from("/p1/.mcp.json"));
+        let c1 = PluginComponents {
+            has_mcp_config: true,
+            mcp_config_path: Some(PathBuf::from("/p1/.mcp.json")),
+            ..Default::default()
+        };
         set.push(make_resolved("p1", c1));
 
         // No mcp config
@@ -450,14 +456,18 @@ mod tests {
     fn test_plugin_set_all_hook_configs() {
         let mut set = PluginSet::new();
 
-        let mut c1 = PluginComponents::default();
-        c1.has_hooks = true;
-        c1.hooks_config_path = Some(PathBuf::from("/p1/hooks/hooks.json"));
+        let c1 = PluginComponents {
+            has_hooks: true,
+            hooks_config_path: Some(PathBuf::from("/p1/hooks/hooks.json")),
+            ..Default::default()
+        };
         set.push(make_resolved("p1", c1));
 
-        let mut c2 = PluginComponents::default();
-        c2.has_hooks = true;
-        c2.hooks_config_path = Some(PathBuf::from("/p2/hooks/hooks.json"));
+        let c2 = PluginComponents {
+            has_hooks: true,
+            hooks_config_path: Some(PathBuf::from("/p2/hooks/hooks.json")),
+            ..Default::default()
+        };
         set.push(make_resolved("p2", c2));
 
         let configs = set.all_hook_configs();
@@ -470,12 +480,14 @@ mod tests {
     fn test_plugin_set_all_agent_files() {
         let mut set = PluginSet::new();
 
-        let mut c1 = PluginComponents::default();
-        c1.has_agents = true;
-        c1.agent_files = vec![
-            PathBuf::from("/p1/agents/qa.md"),
-            PathBuf::from("/p1/agents/dev.md"),
-        ];
+        let c1 = PluginComponents {
+            has_agents: true,
+            agent_files: vec![
+                PathBuf::from("/p1/agents/qa.md"),
+                PathBuf::from("/p1/agents/dev.md"),
+            ],
+            ..Default::default()
+        };
         set.push(make_resolved("p1", c1));
 
         // No agent files

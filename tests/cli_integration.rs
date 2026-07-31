@@ -3,7 +3,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 
 fn cmd() -> Command {
-    cargo_bin_cmd!("remix-agent").into()
+    cargo_bin_cmd!("remix-agent")
 }
 
 #[test]
