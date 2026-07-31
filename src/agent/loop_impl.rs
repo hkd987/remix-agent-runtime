@@ -653,7 +653,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     SessionStatus::Completed,
                 )
                 .await;
-                self.emit_completed(AgentStatus::MaxIterations, None, &state);
+                self.emit_completed(AgentStatus::MaxIterations, None, &state)
+                    .await;
                 return Ok(state.into_result(AgentStatus::MaxIterations, None));
             }
 
@@ -674,7 +675,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         SessionStatus::Completed,
                     )
                     .await;
-                    self.emit_completed(AgentStatus::BudgetExceeded, None, &state);
+                    self.emit_completed(AgentStatus::BudgetExceeded, None, &state)
+                        .await;
                     return Ok(state.into_result(AgentStatus::BudgetExceeded, None));
                 }
             }
@@ -688,7 +690,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     SessionStatus::Completed,
                 )
                 .await;
-                self.emit_completed(AgentStatus::Timeout, None, &state);
+                self.emit_completed(AgentStatus::Timeout, None, &state)
+                    .await;
                 return Ok(state.into_result(AgentStatus::Timeout, None));
             }
 
@@ -831,7 +834,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                             SessionStatus::Completed,
                         )
                         .await;
-                        self.emit_completed(AgentStatus::Success, Some(final_text.clone()), &state);
+                        self.emit_completed(AgentStatus::Success, Some(final_text.clone()), &state)
+                            .await;
                         return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                     }
 
@@ -956,7 +960,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         SessionStatus::Completed,
                     )
                     .await;
-                    self.emit_completed(AgentStatus::Success, Some(final_text.clone()), &state);
+                    self.emit_completed(AgentStatus::Success, Some(final_text.clone()), &state)
+                        .await;
                     return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                 }
             }
@@ -1090,7 +1095,18 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
     }
 
     /// Emit an AgentCompleted event via the event bus.
-    fn emit_completed(&self, status: AgentStatus, result: Option<String>, state: &AgentState) {
+    /// Emit the terminal event and fire the end-of-run lifecycle hooks.
+    ///
+    /// Every terminal path in every loop goes through here, which is why the hooks live
+    /// here rather than in `finalize_session` — the interactive loop never calls that,
+    /// so it would have fired SessionStart with no matching end.
+    async fn emit_completed(
+        &self,
+        status: AgentStatus,
+        result: Option<String>,
+        state: &AgentState,
+    ) {
+        let status_label = format!("{status:?}");
         events::emit(
             &self.event_bus,
             AgentEvent::AgentCompleted {
@@ -1099,6 +1115,24 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                 total_duration_ms: state.elapsed_ms(),
             },
         );
+
+        let end_context = serde_json::json!({
+            "status": status_label,
+            "iterations": state.current_iteration(),
+            "total_input_tokens": state.total_input_tokens(),
+            "total_output_tokens": state.total_output_tokens(),
+            "total_cost_usd": state.total_cost(),
+        });
+        self.fire_lifecycle(
+            crate::plugins::components::hooks::HookTiming::Stop,
+            end_context.clone(),
+        )
+        .await;
+        self.fire_lifecycle(
+            crate::plugins::components::hooks::HookTiming::SessionEnd,
+            end_context,
+        )
+        .await;
     }
 
     /// Emit TextDelta and ThinkingComplete events for content blocks in a response.
@@ -1354,6 +1388,14 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         // The resumed conversation carries the original task as its first message.
         let resumed_task = state.original_task().unwrap_or_default().to_string();
 
+        // Pairs with the Stop/SessionEnd that `finalize_session` fires on every exit.
+        // Without it a resumed run emitted an end hook with no matching start.
+        self.fire_lifecycle(
+            crate::plugins::components::hooks::HookTiming::SessionStart,
+            serde_json::json!({ "task": resumed_task, "resumed": true }),
+        )
+        .await;
+
         let mut all_tool_defs = self.tools.tool_definitions().to_vec();
         mark_tools_cacheable(&mut all_tool_defs);
         let mut tool_registry = if self.config.lazy_tool_discovery {
@@ -1381,7 +1423,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     SessionStatus::Completed,
                 )
                 .await;
-                self.emit_completed(AgentStatus::MaxIterations, None, &state);
+                self.emit_completed(AgentStatus::MaxIterations, None, &state)
+                    .await;
                 return Ok(state.into_result(AgentStatus::MaxIterations, None));
             }
 
@@ -1402,7 +1445,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         SessionStatus::Completed,
                     )
                     .await;
-                    self.emit_completed(AgentStatus::BudgetExceeded, None, &state);
+                    self.emit_completed(AgentStatus::BudgetExceeded, None, &state)
+                        .await;
                     return Ok(state.into_result(AgentStatus::BudgetExceeded, None));
                 }
             }
@@ -1415,7 +1459,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     SessionStatus::Completed,
                 )
                 .await;
-                self.emit_completed(AgentStatus::Timeout, None, &state);
+                self.emit_completed(AgentStatus::Timeout, None, &state)
+                    .await;
                 return Ok(state.into_result(AgentStatus::Timeout, None));
             }
 
@@ -1555,7 +1600,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                             SessionStatus::Completed,
                         )
                         .await;
-                        self.emit_completed(AgentStatus::Success, Some(final_text.clone()), &state);
+                        self.emit_completed(AgentStatus::Success, Some(final_text.clone()), &state)
+                            .await;
                         return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                     }
 
@@ -1660,7 +1706,8 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                         SessionStatus::Completed,
                     )
                     .await;
-                    self.emit_completed(AgentStatus::Success, Some(final_text.clone()), &state);
+                    self.emit_completed(AgentStatus::Success, Some(final_text.clone()), &state)
+                        .await;
                     return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                 }
             }
@@ -1696,26 +1743,6 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
         state: &AgentState,
         status: SessionStatus,
     ) {
-        // Every terminal path in every loop routes through here, so this is the one
-        // place that reliably corresponds to "the run is ending".
-        let end_context = serde_json::json!({
-            "status": format!("{status:?}"),
-            "iterations": state.current_iteration(),
-            "total_input_tokens": state.total_input_tokens(),
-            "total_output_tokens": state.total_output_tokens(),
-            "total_cost_usd": state.total_cost(),
-        });
-        self.fire_lifecycle(
-            crate::plugins::components::hooks::HookTiming::Stop,
-            end_context.clone(),
-        )
-        .await;
-        self.fire_lifecycle(
-            crate::plugins::components::hooks::HookTiming::SessionEnd,
-            end_context,
-        )
-        .await;
-
         if let (Some(store), Some(metadata)) = (session_store, session_metadata) {
             let mut updated = metadata.clone();
             updated.status = status;
@@ -1847,6 +1874,12 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
             },
         );
 
+        self.fire_lifecycle(
+            crate::plugins::components::hooks::HookTiming::SessionStart,
+            serde_json::json!({ "task": first_task, "interactive": true }),
+        )
+        .await;
+
         // Build system prompt (same logic as run_with_options)
         let system_prompt = self.build_system_blocks(credential_set, skill_set, agents_md);
 
@@ -1876,7 +1909,8 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
                     iterations = state.current_iteration(),
                     "Max iterations reached"
                 );
-                self.emit_completed(AgentStatus::MaxIterations, None, &state);
+                self.emit_completed(AgentStatus::MaxIterations, None, &state)
+                    .await;
                 return Ok(state.into_result(AgentStatus::MaxIterations, None));
             }
 
@@ -1890,7 +1924,8 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
                         budget_usd = max_budget,
                         "Budget exhausted"
                     );
-                    self.emit_completed(AgentStatus::BudgetExceeded, None, &state);
+                    self.emit_completed(AgentStatus::BudgetExceeded, None, &state)
+                        .await;
                     return Ok(state.into_result(AgentStatus::BudgetExceeded, None));
                 }
             }
@@ -1899,7 +1934,8 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
 
             if state.elapsed_ms() >= timeout_ms {
                 info!(elapsed_ms = state.elapsed_ms(), "Timeout reached");
-                self.emit_completed(AgentStatus::Timeout, None, &state);
+                self.emit_completed(AgentStatus::Timeout, None, &state)
+                    .await;
                 return Ok(state.into_result(AgentStatus::Timeout, None));
             }
 
@@ -2032,7 +2068,8 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
                     if !response.content.is_empty() {
                         state.add_assistant_message(response.content);
                     }
-                    self.emit_completed(AgentStatus::Success, None, &state);
+                    self.emit_completed(AgentStatus::Success, None, &state)
+                        .await;
                     return Ok(state.into_result(AgentStatus::Success, None));
                 }
                 StreamOutcome::Interrupted(response) => (response, true),
@@ -2073,7 +2110,8 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
                         continue;
                     }
                     Some(UserMessage::Quit) => {
-                        self.emit_completed(AgentStatus::Success, None, &state);
+                        self.emit_completed(AgentStatus::Success, None, &state)
+                            .await;
                         return Ok(state.into_result(AgentStatus::Success, None));
                     }
                     Some(UserMessage::Interrupt) => continue,
@@ -2131,7 +2169,8 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
                                     AgentStatus::Success,
                                     Some(final_text.clone()),
                                     &state,
-                                );
+                                )
+                                .await;
                                 return Ok(
                                     state.into_result(AgentStatus::Success, Some(final_text))
                                 );
@@ -2243,7 +2282,8 @@ impl<L: crate::llm::client::StreamingLlmProvider, T: ToolExecutor> AgentRunner<L
                                 AgentStatus::Success,
                                 Some(final_text.clone()),
                                 &state,
-                            );
+                            )
+                            .await;
                             return Ok(state.into_result(AgentStatus::Success, Some(final_text)));
                         }
                         Some(UserMessage::Interrupt) => continue,
