@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use crate::llm::types::{compute_cost, ContentBlock, Message, Role};
+use crate::llm::types::{compute_cost, ContentBlock, Message, Role, ToolResultContent};
 use crate::output::result::{AgentResult, AgentStatus, StepRecord};
 use crate::session::types::SessionSnapshot;
 
@@ -71,6 +71,41 @@ impl AgentState {
             role: Role::User,
             content: results,
         });
+    }
+
+    /// Append an assistant message whose tool calls are being refused, answering every
+    /// `tool_use` block it contains with a synthetic error `tool_result` carrying
+    /// `feedback`.
+    ///
+    /// Any path that appends an assistant message without executing its tools must go
+    /// through this. Appending the message and then pushing a plain user text message
+    /// leaves the `tool_use` unanswered, and the API rejects the next request with a
+    /// 400. If the content carries no tool calls this is equivalent to
+    /// [`Self::add_assistant_message`].
+    pub fn add_assistant_message_refusing_tools(
+        &mut self,
+        content: Vec<ContentBlock>,
+        feedback: &str,
+    ) {
+        let synthetic: Vec<ContentBlock> = content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: ToolResultContent::Text(feedback.to_string()),
+                    is_error: Some(true),
+                }),
+                _ => None,
+            })
+            .collect();
+
+        self.add_assistant_message(content);
+
+        if synthetic.is_empty() {
+            self.inject_system_notification(feedback);
+        } else {
+            self.add_tool_results(synthetic);
+        }
     }
 
     pub fn record_step(&mut self, step: StepRecord) {

@@ -579,7 +579,17 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
 
             state.accumulate_usage(response.usage.as_ref(), &response.model);
 
-            match response.stop_reason {
+            // A response carrying tool_use blocks must have them executed regardless of
+            // the reported stop_reason. Terminating on `end_turn` while tool calls are
+            // pending both drops the work the model asked for and leaves the tool_use
+            // unanswered, which the API rejects on the next request.
+            let effective_stop_reason = if content_has_tool_use(&response.content) {
+                StopReason::ToolUse
+            } else {
+                response.stop_reason
+            };
+
+            match effective_stop_reason {
                 StopReason::ToolUse => {
                     let assistant_content = response.content.clone();
 
@@ -667,13 +677,17 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                                 let result = self_critique::parse_critique_response(&critique_text);
                                 if !result.approved {
                                     info!("Self-critique rejected actions: {}", result.reasoning);
-                                    state.add_assistant_message(assistant_content);
                                     let feedback = format!(
                                         "[SELF_CRITIQUE] Your planned actions were rejected.\nReason: {}\n{}Please revise your approach.",
                                         result.reasoning,
                                         result.suggestions.map(|s| format!("Suggestions: {s}\n")).unwrap_or_default(),
                                     );
-                                    state.inject_system_notification(&feedback);
+                                    // The rejected content carries tool_use blocks by
+                                    // construction, so each one needs a tool_result.
+                                    state.add_assistant_message_refusing_tools(
+                                        assistant_content,
+                                        &feedback,
+                                    );
                                     continue;
                                 }
                             }
@@ -711,15 +725,14 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     }
                 }
                 StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
-                    let content = if !content_has_tool_use(&response.content) {
-                        let Some(content) =
-                            self.try_nudge(&mut state, response.content, &mut nudge_count)
-                        else {
-                            continue;
-                        };
-                        content
-                    } else {
-                        response.content
+                    // Normalization above guarantees this arm is only reached when the
+                    // response carries no tool_use blocks, so both the nudge and the
+                    // goal check can safely append the content and inject a follow-up
+                    // user message without orphaning a tool call.
+                    let Some(content) =
+                        self.try_nudge(&mut state, response.content, &mut nudge_count)
+                    else {
+                        continue;
                     };
 
                     // Goal check: one-time verification before termination
@@ -1183,7 +1196,17 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
 
             state.accumulate_usage(response.usage.as_ref(), &response.model);
 
-            match response.stop_reason {
+            // A response carrying tool_use blocks must have them executed regardless of
+            // the reported stop_reason. Terminating on `end_turn` while tool calls are
+            // pending both drops the work the model asked for and leaves the tool_use
+            // unanswered, which the API rejects on the next request.
+            let effective_stop_reason = if content_has_tool_use(&response.content) {
+                StopReason::ToolUse
+            } else {
+                response.stop_reason
+            };
+
+            match effective_stop_reason {
                 StopReason::ToolUse => {
                     let assistant_content = response.content.clone();
                     let has_tool_use = content_has_tool_use(&assistant_content);
@@ -1248,15 +1271,14 @@ impl<L: LlmProvider, T: ToolExecutor> AgentRunner<L, T> {
                     }
                 }
                 StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
-                    let content = if !content_has_tool_use(&response.content) {
-                        let Some(content) =
-                            self.try_nudge(&mut state, response.content, &mut nudge_count)
-                        else {
-                            continue;
-                        };
-                        content
-                    } else {
-                        response.content
+                    // Normalization above guarantees this arm is only reached when the
+                    // response carries no tool_use blocks, so both the nudge and the
+                    // goal check can safely append the content and inject a follow-up
+                    // user message without orphaning a tool call.
+                    let Some(content) =
+                        self.try_nudge(&mut state, response.content, &mut nudge_count)
+                    else {
+                        continue;
                     };
 
                     // Goal check: one-time verification before termination

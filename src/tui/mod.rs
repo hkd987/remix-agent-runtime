@@ -74,7 +74,11 @@ where
     }
 
     let mut stdout = io::stdout();
-    if let Err(e) = execute!(stdout, EnterAlternateScreen, crossterm::event::EnableMouseCapture) {
+    if let Err(e) = execute!(
+        stdout,
+        EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture
+    ) {
         let _ = disable_raw_mode();
         eprintln!("Error: Failed to enter alternate screen: {e}");
         return ExitStatus::AgentError.into();
@@ -139,8 +143,7 @@ where
         let has_event = event::poll(TICK_RATE).unwrap_or(false);
         if has_event {
             match event::read() {
-            Ok(Event::Mouse(mouse_event)) => {
-                match mouse_event.kind {
+                Ok(Event::Mouse(mouse_event)) => match mouse_event.kind {
                     crossterm::event::MouseEventKind::ScrollUp => {
                         state.scroll_up(3);
                     }
@@ -148,46 +151,46 @@ where
                         state.scroll_down(3);
                     }
                     _ => {}
-                }
-            }
-            Ok(Event::Key(key_event)) => {
-                match handle_key_event(key_event, &mut state) {
-                    InputAction::None | InputAction::Redraw => {}
-                    InputAction::SendMessage(msg) => {
-                        match msg {
-                            UserMessage::Quit => {
-                                // Send quit to agent and exit
-                                let _ = input_tx.send(UserMessage::Quit).await;
-                                break ExitStatus::Success;
-                            }
-                            UserMessage::Interrupt => {
-                                let _ = input_tx.send(UserMessage::Interrupt).await;
-                            }
-                            UserMessage::Chat(ref text) => {
-                                if text.starts_with('/') {
-                                    // Handle slash commands locally
-                                    if let Some(action) = commands::CommandRegistry::parse(text) {
-                                        handle_slash_command(action, &mut state);
-                                        continue;
-                                    }
+                },
+                Ok(Event::Key(key_event)) => {
+                    match handle_key_event(key_event, &mut state) {
+                        InputAction::None | InputAction::Redraw => {}
+                        InputAction::SendMessage(msg) => {
+                            match msg {
+                                UserMessage::Quit => {
+                                    // Send quit to agent and exit
+                                    let _ = input_tx.send(UserMessage::Quit).await;
+                                    break ExitStatus::Success;
                                 }
-                                // Send to agent
-                                state.state = TuiState::Running;
-                                state.thinking_text.clear();
-                                let _ = input_tx.send(UserMessage::Chat(text.clone())).await;
+                                UserMessage::Interrupt => {
+                                    let _ = input_tx.send(UserMessage::Interrupt).await;
+                                }
+                                UserMessage::Chat(ref text) => {
+                                    if text.starts_with('/') {
+                                        // Handle slash commands locally
+                                        if let Some(action) = commands::CommandRegistry::parse(text)
+                                        {
+                                            handle_slash_command(action, &mut state);
+                                            continue;
+                                        }
+                                    }
+                                    // Send to agent
+                                    state.state = TuiState::Running;
+                                    state.thinking_text.clear();
+                                    let _ = input_tx.send(UserMessage::Chat(text.clone())).await;
+                                }
+                            }
+                        }
+                        InputAction::PermissionResponse(allowed) => {
+                            state.permission_request = None;
+                            state.state = TuiState::Running;
+                            if let Some(respond) = permission_respond.take() {
+                                let _ = respond.send(allowed);
                             }
                         }
                     }
-                    InputAction::PermissionResponse(allowed) => {
-                        state.permission_request = None;
-                        state.state = TuiState::Running;
-                        if let Some(respond) = permission_respond.take() {
-                            let _ = respond.send(allowed);
-                        }
-                    }
                 }
-            }
-            _ => {}
+                _ => {}
             }
         }
 
