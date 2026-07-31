@@ -55,11 +55,63 @@ pub fn create_tenant_config(context: &TenantContext) -> AgentConfig {
 }
 
 /// Create permissions config from tenant context.
+///
+/// Uses `Default` mode, not `BypassPermissions`. A tenant profile exists to *constrain*
+/// a run — it carries `allowed_tools` and `denied_tools` — so granting bypass would
+/// make those two fields inert and hand every tenant unrestricted access.
 pub fn create_tenant_permissions(context: &TenantContext) -> PermissionsConfig {
     PermissionsConfig {
-        mode: PermissionModeConfig::BypassPermissions,
+        mode: PermissionModeConfig::Default,
         allowed_tools: context.allowed_tools.clone(),
         denied_tools: context.denied_tools.clone(),
+    }
+}
+
+/// Apply a tenant profile on top of a loaded config.
+///
+/// The tenant's limits win, because the point of the profile is to bound the run.
+/// Fields the profile does not speak to are left as configured.
+pub fn apply_tenant_profile(config: &mut crate::config::schema::AppConfig) {
+    let Some(context) = config.tenant.clone() else {
+        return;
+    };
+
+    tracing::info!(tenant = %context.id, "Applying tenant profile");
+
+    config.llm.model = context.model.clone();
+    config.llm.max_tokens = context.max_tokens;
+    if !context.api_key.is_empty() {
+        config.llm.api_key = context.api_key.clone();
+    }
+    for (k, v) in &context.custom_headers {
+        config.llm.custom_headers.insert(k.clone(), v.clone());
+    }
+
+    // Take the tighter of the two bounds so a profile can only ever narrow a run.
+    config.agent.max_iterations = config.agent.max_iterations.min(context.max_iterations);
+    config.agent.timeout_secs = config.agent.timeout_secs.min(context.timeout_secs);
+    config.agent.max_budget_usd = match (config.agent.max_budget_usd, context.max_budget_usd) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    };
+    if context.system_prompt.is_some() {
+        config.agent.system_prompt = context.system_prompt.clone();
+    }
+
+    if context.compaction_model.is_some() {
+        config.compaction.compaction_model = context.compaction_model.clone();
+    }
+
+    // Deny lists are additive: a profile may add restrictions but never remove them.
+    let tenant_perms = create_tenant_permissions(&context);
+    for denied in tenant_perms.denied_tools {
+        if !config.permissions.denied_tools.contains(&denied) {
+            config.permissions.denied_tools.push(denied);
+        }
+    }
+    if !tenant_perms.allowed_tools.is_empty() {
+        config.permissions.allowed_tools = tenant_perms.allowed_tools;
     }
 }
 
@@ -125,7 +177,8 @@ mod tests {
         let ctx = make_context();
         let perms = create_tenant_permissions(&ctx);
 
-        assert_eq!(perms.mode, PermissionModeConfig::BypassPermissions);
+        // A tenant profile constrains a run; it must not grant bypass.
+        assert_eq!(perms.mode, PermissionModeConfig::Default);
         assert_eq!(perms.allowed_tools, vec!["navigate".to_string()]);
         assert_eq!(perms.denied_tools, vec!["bash".to_string()]);
     }
@@ -135,8 +188,86 @@ mod tests {
         let ctx = TenantContext::new("empty-tools", "sk-key");
         let perms = create_tenant_permissions(&ctx);
 
-        assert_eq!(perms.mode, PermissionModeConfig::BypassPermissions);
+        // A tenant profile constrains a run; it must not grant bypass.
+        assert_eq!(perms.mode, PermissionModeConfig::Default);
         assert!(perms.allowed_tools.is_empty());
         assert!(perms.denied_tools.is_empty());
+    }
+
+    // --- Tenant profile application ---
+    //
+    // These cover the wiring that makes this module reachable at all: before it, no
+    // binary path constructed a TenantContext.
+
+    fn config_with_tenant(context: TenantContext) -> crate::config::schema::AppConfig {
+        crate::config::schema::AppConfig {
+            tenant: Some(context),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_apply_tenant_profile_sets_model_and_tokens() {
+        let mut config = config_with_tenant(make_context());
+        apply_tenant_profile(&mut config);
+        assert_eq!(config.llm.model, "claude-sonnet-4-20250514");
+        assert_eq!(config.llm.max_tokens, 4096);
+        assert_eq!(config.llm.custom_headers.get("X-Custom").unwrap(), "val");
+    }
+
+    #[test]
+    fn test_apply_tenant_profile_only_narrows_limits() {
+        let mut config = config_with_tenant(make_context());
+        // Start looser than the tenant allows.
+        config.agent.max_iterations = 500;
+        config.agent.timeout_secs = 9_999;
+        config.agent.max_budget_usd = Some(100.0);
+
+        apply_tenant_profile(&mut config);
+
+        assert_eq!(config.agent.max_iterations, 30);
+        assert_eq!(config.agent.timeout_secs, 180);
+        assert_eq!(config.agent.max_budget_usd, Some(5.0));
+    }
+
+    #[test]
+    fn test_apply_tenant_profile_does_not_loosen_limits() {
+        let mut config = config_with_tenant(make_context());
+        // Already tighter than the tenant profile; the profile must not raise them.
+        config.agent.max_iterations = 5;
+        config.agent.timeout_secs = 10;
+        config.agent.max_budget_usd = Some(1.0);
+
+        apply_tenant_profile(&mut config);
+
+        assert_eq!(config.agent.max_iterations, 5);
+        assert_eq!(config.agent.timeout_secs, 10);
+        assert_eq!(config.agent.max_budget_usd, Some(1.0));
+    }
+
+    #[test]
+    fn test_apply_tenant_profile_deny_list_is_additive() {
+        let mut config = config_with_tenant(make_context());
+        config.permissions.denied_tools = vec!["write_file".to_string()];
+
+        apply_tenant_profile(&mut config);
+
+        // The pre-existing denial survives and the tenant's is added.
+        assert!(config
+            .permissions
+            .denied_tools
+            .contains(&"write_file".to_string()));
+        assert!(config
+            .permissions
+            .denied_tools
+            .contains(&"bash".to_string()));
+    }
+
+    #[test]
+    fn test_apply_tenant_profile_is_a_noop_without_a_tenant() {
+        let mut config = crate::config::schema::AppConfig::default();
+        let before = config.agent.max_iterations;
+        apply_tenant_profile(&mut config);
+        assert_eq!(config.agent.max_iterations, before);
     }
 }

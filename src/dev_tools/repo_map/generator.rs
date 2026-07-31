@@ -169,8 +169,12 @@ fn matches_glob(name: &str, pattern: &str) -> bool {
     }
 }
 
-/// Extract symbols from a source file using regex-based parsing.
-/// This is a fallback when tree-sitter is not available.
+/// Extract symbols from a source file.
+///
+/// With the `dev-tools` feature enabled this parses with tree-sitter, which understands
+/// the grammar and so handles multi-line signatures, nested items, and anything else
+/// the line-oriented regexes miss. Without it — or for a language tree-sitter is not
+/// configured for — it falls back to the regex extractors below.
 fn extract_symbols_from_file(path: &Path) -> Vec<SymbolEntry> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
@@ -179,11 +183,21 @@ fn extract_symbols_from_file(path: &Path) -> Vec<SymbolEntry> {
 
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
+    #[cfg(feature = "dev-tools")]
+    if let Some(symbols) = super::treesitter::extract_symbols(&content, ext) {
+        return symbols;
+    }
+
+    extract_symbols_with_regex(&content, ext)
+}
+
+/// Line-oriented fallback used when tree-sitter is unavailable.
+fn extract_symbols_with_regex(content: &str, ext: &str) -> Vec<SymbolEntry> {
     match ext {
-        "rs" => extract_rust_symbols(&content),
-        "ts" | "tsx" | "js" | "jsx" => extract_typescript_symbols(&content),
-        "py" => extract_python_symbols(&content),
-        "go" => extract_go_symbols(&content),
+        "rs" => extract_rust_symbols(content),
+        "ts" | "tsx" | "js" | "jsx" => extract_typescript_symbols(content),
+        "py" => extract_python_symbols(content),
+        "go" => extract_go_symbols(content),
         _ => Vec::new(),
     }
 }
@@ -867,5 +881,39 @@ export type Status = 'active' | 'inactive';
         let output = format_repo_map(&entries, Path::new("/test"));
         assert!(output.contains("src/main.rs"));
         assert!(output.contains("pub fn main()"));
+    }
+
+    /// The two symbol backends must agree on the symbols that matter.
+    ///
+    /// The regex path is the fallback when `dev-tools` is off, so a user who disables
+    /// the feature should get a smaller map, not a different or wrong one. This runs
+    /// only when tree-sitter is compiled in, since it is comparing the two.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn treesitter_and_regex_backends_agree_on_rust_symbols() {
+        let src = "\
+pub struct Config {}
+pub enum Mode {}
+pub trait Runner {}
+pub fn exported() {}
+fn private() {}
+";
+        let ts = super::super::treesitter::extract_symbols(src, "rs").unwrap();
+        let re = extract_symbols_with_regex(src, "rs");
+
+        let mut ts_names: Vec<&str> = ts.iter().map(|s| s.name.as_str()).collect();
+        let mut re_names: Vec<&str> = re.iter().map(|s| s.name.as_str()).collect();
+        ts_names.sort_unstable();
+        re_names.sort_unstable();
+
+        // Every symbol the regex extractor finds must also be found by tree-sitter.
+        // The reverse need not hold: tree-sitter understands the grammar and picks up
+        // constructs the line-oriented regexes miss.
+        for name in &re_names {
+            assert!(
+                ts_names.contains(name),
+                "tree-sitter missed `{name}` that regex found: ts={ts_names:?} regex={re_names:?}"
+            );
+        }
     }
 }

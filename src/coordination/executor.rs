@@ -134,7 +134,8 @@ impl<T: ToolExecutor> CoordinationExecutor<T> {
             },
             ToolDefinition {
                 name: "task_update".to_string(),
-                description: "Update an existing task (status, owner, description, etc.).".to_string(),
+                description: "Update an existing task (status, owner, description, etc.)."
+                    .to_string(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -240,39 +241,7 @@ impl<T: ToolExecutor> CoordinationExecutor<T> {
                 cache_control: None,
                 read_only: false,
             },
-            ToolDefinition {
-                name: "spawn_agent".to_string(),
-                description: "Spawn a child agent to handle a subtask. The child agent runs independently with its own conversation and can use a subset of available tools.".to_string(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Name for the subagent"
-                        },
-                        "task": {
-                            "type": "string",
-                            "description": "The task for the subagent to accomplish"
-                        },
-                        "system_prompt": {
-                            "type": "string",
-                            "description": "Optional system prompt for the subagent"
-                        },
-                        "allowed_tools": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "Tool name patterns this subagent can use (regex). If empty, uses all parent tools except spawn_agent."
-                        },
-                        "max_iterations": {
-                            "type": "integer",
-                            "description": "Maximum iterations for the subagent (default from config)"
-                        }
-                    },
-                    "required": ["name", "task"]
-                }),
-                cache_control: None,
-                read_only: false,
-            },
+            crate::subagent::executor::spawn_agent_tool_definition(),
         ]
     }
 

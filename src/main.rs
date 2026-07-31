@@ -73,6 +73,10 @@ async fn main() -> ExitCode {
                 return ExitStatus::ConfigError.into();
             }
 
+            // Apply a tenant profile, if the config carries one, before anything reads
+            // the limits it constrains.
+            remix_agent_runtime::tenant::isolation::apply_tenant_profile(&mut config);
+
             tracing::info!("Starting agent with config: {}", config.llm);
 
             // Create LLM client (wrapped in Arc for sharing with child agents)

@@ -21,44 +21,53 @@ pub struct SubagentExecutor<T: ToolExecutor> {
     all_tools: Vec<ToolDefinition>,
 }
 
+/// The `spawn_agent` tool definition.
+///
+/// Single source of truth: `CoordinationExecutor` and `SubagentExecutor` both advertise
+/// this tool and previously carried byte-identical copies of the schema, so a change to
+/// one silently diverged from the other.
+pub fn spawn_agent_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "spawn_agent".to_string(),
+        description: "Spawn a child agent to handle a subtask. The child agent runs independently with its own conversation and can use a subset of available tools.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Name for the subagent"
+                },
+                "task": {
+                    "type": "string",
+                    "description": "The task for the subagent to accomplish"
+                },
+                "system_prompt": {
+                    "type": "string",
+                    "description": "Optional system prompt for the subagent"
+                },
+                "allowed_tools": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Tool name patterns this subagent can use (regex). If empty, uses all parent tools except spawn_agent."
+                },
+                "max_iterations": {
+                    "type": "integer",
+                    "description": "Maximum iterations for the subagent (default from config)"
+                }
+            },
+            "required": ["name", "task"]
+        }),
+        cache_control: None,
+        read_only: false,
+    }
+}
+
 impl<T: ToolExecutor> SubagentExecutor<T> {
     pub fn new(inner: T, config: SubagentConfig) -> Self {
         let mut all_tools = Vec::new();
 
         if config.enabled {
-            all_tools.push(ToolDefinition {
-                name: "spawn_agent".to_string(),
-                description: "Spawn a child agent to handle a subtask. The child agent runs independently with its own conversation and can use a subset of available tools.".to_string(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Name for the subagent"
-                        },
-                        "task": {
-                            "type": "string",
-                            "description": "The task for the subagent to accomplish"
-                        },
-                        "system_prompt": {
-                            "type": "string",
-                            "description": "Optional system prompt for the subagent"
-                        },
-                        "allowed_tools": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "Tool name patterns this subagent can use (regex). If empty, uses all parent tools except spawn_agent."
-                        },
-                        "max_iterations": {
-                            "type": "integer",
-                            "description": "Maximum iterations for the subagent (default from config)"
-                        }
-                    },
-                    "required": ["name", "task"]
-                }),
-                cache_control: None,
-                read_only: false,
-            });
+            all_tools.push(spawn_agent_tool_definition());
         }
 
         // Add inner tools after virtual tools

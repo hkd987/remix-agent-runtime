@@ -36,6 +36,14 @@ pub struct AppConfig {
     pub coordination: CoordinationConfig,
     #[serde(default)]
     pub dev_tools: DevToolsConfig,
+    /// Optional tenant profile.
+    ///
+    /// When present, its limits (model, token cap, tool allow/deny lists, iteration
+    /// and time budgets, spend cap, compaction model) are applied on top of the rest of
+    /// the config. This is what makes `src/tenant/` reachable — the module was fully
+    /// implemented and tested but had no call sites anywhere in the binary.
+    #[serde(default)]
+    pub tenant: Option<crate::tenant::context::TenantContext>,
 }
 
 pub fn default_base_url() -> String {
@@ -1165,6 +1173,7 @@ url: "https://example.com/hook"
             subagent: SubagentConfig::default(),
             coordination: CoordinationConfig::default(),
             dev_tools: DevToolsConfig::default(),
+            tenant: None,
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         let deserialized: AppConfig = serde_yaml::from_str(&yaml).unwrap();
