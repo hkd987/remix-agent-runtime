@@ -87,15 +87,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          # `harbor` requires >=3.12, and the adapter imports it at module scope, so the
+          # tests cannot even be collected on an older interpreter.
+          python-version: "3.12"
       - name: Install test dependencies
         working-directory: harbor-adapter
         run: |
           python -m pip install --upgrade pip
           pip install pytest
-          # `harbor` may not be installable from a public index; the adapter's own tests
-          # do not require it, so a failure here must not fail the job.
-          pip install -e . || echo "adapter deps unavailable; running tests standalone"
+          pip install -e .
       - name: Run adapter tests
         working-directory: harbor-adapter
         run: python -m pytest tests/ -v
