@@ -5,6 +5,9 @@ use crate::error::AgentError;
 /// A parsed Server-Sent Event from the Anthropic streaming API.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
+    /// An event type this build does not recognize. Carried rather than silently
+    /// folded into `Ping` so it is visible in logs and in tests.
+    Unknown { event_type: String },
     /// `message_start` - contains the initial Message object
     MessageStart { message: MessageStartData },
     /// `content_block_start` - a new content block is beginning
@@ -232,9 +235,14 @@ impl SseParser {
                     error: wrapper.error,
                 })
             }
-            _other => {
-                // Silently ignore unknown event types (e.g. "data" from some providers)
-                Ok(StreamEvent::Ping)
+            other => {
+                // Unknown event types are tolerated — some providers emit their own —
+                // but mapping them to `Ping` made them indistinguishable from a
+                // keep-alive, so a new protocol event would vanish without trace.
+                tracing::debug!(event_type = %other, "Ignoring unrecognized SSE event type");
+                Ok(StreamEvent::Unknown {
+                    event_type: other.to_string(),
+                })
             }
         }
     }
@@ -439,9 +447,15 @@ mod tests {
 
     #[test]
     fn test_parse_unknown_event_type() {
+        // Unknown events are tolerated but kept distinguishable from a keep-alive, so a
+        // new protocol event shows up in logs instead of vanishing as a Ping.
         let result = SseParser::parse_event("unknown_type", "{}");
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), StreamEvent::Ping);
+        assert_eq!(
+            result.unwrap(),
+            StreamEvent::Unknown {
+                event_type: "unknown_type".to_string()
+            }
+        );
     }
 
     #[test]

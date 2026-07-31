@@ -75,8 +75,21 @@ impl ContentBlockBuilder {
                 name,
                 input_json,
             } => {
-                let input: Value =
-                    serde_json::from_str(&input_json).unwrap_or(Value::Object(Default::default()));
+                // Falling back to `{}` here dispatched the tool with no arguments at
+                // all, which looks to the model like the tool ignored its request.
+                // Surface the malformed JSON instead.
+                let input: Value = serde_json::from_str(&input_json).unwrap_or_else(|e| {
+                    tracing::error!(
+                        tool = %name,
+                        error = %e,
+                        raw = %input_json,
+                        "Streamed tool input was not valid JSON"
+                    );
+                    serde_json::json!({
+                        "__malformed_tool_input": input_json,
+                        "__parse_error": e.to_string(),
+                    })
+                });
                 ContentBlock::ToolUse { id, name, input }
             }
             ContentBlockBuilder::Thinking {
@@ -104,12 +117,16 @@ pub struct StreamAssembler {
     stop_reason: Option<StopReason>,
     input_usage: Option<MessageStartUsage>,
     output_tokens: u32,
+    /// An error the server sent mid-stream, so `finish` can report the real cause
+    /// rather than the missing stop reason it produces as a side effect.
+    stream_error: Option<String>,
 }
 
 impl StreamAssembler {
     /// Create an empty assembler ready to process stream events.
     pub fn new() -> Self {
         Self {
+            stream_error: None,
             message_id: String::new(),
             model: String::new(),
             content_blocks: Vec::new(),
@@ -256,14 +273,20 @@ impl StreamAssembler {
                 // Stream complete. Final response assembled via finish().
             }
             StreamEvent::Ping => {}
+            StreamEvent::Unknown { event_type } => {
+                tracing::debug!(event_type = %event_type, "Ignoring unrecognized stream event");
+            }
             StreamEvent::Error { error } => {
-                // Error events are handled by the caller via the Result stream.
-                // We log the error type for debugging but don't produce deltas.
+                // Record the error so `finish` can report it. Previously this only
+                // logged, and the stream then ended without a stop reason — so an
+                // `overloaded_error` surfaced as the unrelated and misleading
+                // "Stream ended without a stop_reason in message_delta".
                 tracing::warn!(
                     error_type = %error.error_type,
                     message = %error.message,
                     "Stream error event received"
                 );
+                self.stream_error = Some(format!("{}: {}", error.error_type, error.message));
             }
         }
 
@@ -272,8 +295,14 @@ impl StreamAssembler {
 
     /// Assemble the final `MessagesResponse` after the stream completes.
     ///
-    /// Returns an error if no stop reason was received (incomplete stream).
+    /// Returns an error if the server reported one mid-stream, or if no stop reason was
+    /// received (incomplete stream).
     pub fn finish(self) -> Result<MessagesResponse, AgentError> {
+        // A mid-stream error is the real cause; the missing stop reason is only its
+        // symptom, and reporting the symptom sent people looking in the wrong place.
+        if let Some(err) = self.stream_error {
+            return Err(AgentError::Llm(format!("Stream error: {err}")));
+        }
         let usage = self.build_usage();
         let stop_reason = self.stop_reason.ok_or_else(|| {
             AgentError::Llm("Stream ended without a stop_reason in message_delta".to_string())

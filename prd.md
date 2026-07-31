@@ -1,8 +1,9 @@
 # remix-agent-runtime — Product Requirements Document
 
-**Version:** 0.1.0-draft
+**Version:** 0.1.0-draft (implementation is at v0.4.11)
 **Date:** February 7, 2026
-**Status:** Ready for development
+**Status:** MVP shipped. See [MVP Scope](#mvp-scope) for what was built and what
+was deferred; this document otherwise still reads as the pre-implementation spec.
 
 ---
 
@@ -453,22 +454,25 @@ This runtime is MIT licensed and open source. It will handle user API keys and c
 
 For the initial v0.1.0 release, ship:
 
-- [ ] Core agent loop with tool execution (R1)
-- [ ] LLM provider configuration with base URL (R2)
-- [ ] CLI interface with direct task and YAML config (R3a, R3b)
-- [ ] remix-browser child process management (R4)
-- [ ] Basic credential handling via env vars (R5, minimal)
-- [ ] Structured JSON output (R7)
-- [ ] `on_complete` webhook (R6, minimal)
+- [x] Core agent loop with tool execution (R1)
+- [x] LLM provider configuration with base URL (R2)
+- [x] CLI interface with direct task and YAML config (R3a, R3b)
+- [x] remix-browser child process management (R4)
+- [x] Basic credential handling via env vars (R5, minimal)
+- [x] Structured JSON output (R7)
+- [x] `on_complete` webhook (R6, minimal)
 
-Defer to v0.2.0:
+Deferred from v0.1.0 — status as of v0.4.11:
 
-- HTTP server mode (R3c)
-- SSE streaming
-- Step recording and screenshots
-- Full hook system
-- Credential file encryption
-- Variable interpolation in tasks
+- HTTP server mode (R3c) — **not built.** No `serve` subcommand exists. The
+  only HTTP surface is the SSE event server.
+- SSE streaming — shipped, behind the `sse` Cargo feature.
+- Step recording and screenshots (`--record`) — **not built.**
+- Full hook system — shipped: tool-level and lifecycle hooks, with hooks able
+  to deny a call, rewrite its arguments, or inject a message.
+- Credential file encryption — delegated to the external `remix-credentials`
+  dependency.
+- Variable interpolation in tasks — shipped.
 
 ---
 
