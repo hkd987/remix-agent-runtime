@@ -74,7 +74,7 @@ impl ToolRegistry {
             })
             .collect();
 
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
         let results: Vec<ToolDefinition> = scored
             .into_iter()
             .take(max_results)

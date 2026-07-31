@@ -6,10 +6,16 @@ build-backend = "hatchling.build"
 name = "remix-agent-harbor"
 version = "0.1.0"
 description = "Harbor adapter for running remix-agent against Terminal-Bench 2.0"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = "MIT"
 dependencies = [
-    "harbor",
+    # Pinned to the 0.1.x line. This adapter subclasses `BaseInstalledAgent` and
+    # implements `create_run_agent_commands` returning `harbor.agents.installed.base.
+    # ExecInput` — an API that exists only in 0.1.x. Harbor 0.2 onward restructured
+    # `BaseInstalledAgent` around `install`/`setup` and dropped `ExecInput` from that
+    # module entirely, so an unpinned install resolves to a harbor this code cannot
+    # even import. Moving to the current API is a port, not a version bump.
+    "harbor>=0.1.45,<0.2",
 ]
 
 [project.entry-points."harbor.agents"]

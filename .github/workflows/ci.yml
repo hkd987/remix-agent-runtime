@@ -6,15 +6,17 @@ on:
   pull_request:
     branches: [main]
 
+# The Rust version every job below uses comes from `rust-toolchain.toml`, not from the
+# `@stable` ref on the setup action. That action only runs `rustup default`, and a
+# `rust-toolchain.toml` takes precedence over the default, so rustup installs and uses
+# the pinned toolchain — with the components the file declares — on the first `cargo`
+# call. Bump the version in that one file to move every job at once.
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-features
       # --all-targets so test code is linted too. Without it, warnings inside
@@ -66,8 +68,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -- --test-threads=1
 
@@ -76,8 +76,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
 
@@ -89,15 +87,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          # `harbor` requires >=3.12, and the adapter imports it at module scope, so the
+          # tests cannot even be collected on an older interpreter.
+          python-version: "3.12"
       - name: Install test dependencies
         working-directory: harbor-adapter
         run: |
           python -m pip install --upgrade pip
           pip install pytest
-          # `harbor` may not be installable from a public index; the adapter's own tests
-          # do not require it, so a failure here must not fail the job.
-          pip install -e . || echo "adapter deps unavailable; running tests standalone"
+          pip install -e .
       - name: Run adapter tests
         working-directory: harbor-adapter
         run: python -m pytest tests/ -v

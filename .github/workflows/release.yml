@@ -60,10 +60,14 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      # Release binaries build with the compiler pinned in `rust-toolchain.toml`, same
+      # as CI. The target has to be added in a separate step rather than via the
+      # action's `targets:` input: that input installs against the toolchain the action
+      # sets as default, which the pinned file then overrides, leaving the cross target
+      # missing from the compiler that actually runs. `rustup target add` inside the
+      # checkout resolves the pinned toolchain, so it lands on the right one.
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          targets: ${{ matrix.target }}
+      - run: rustup target add ${{ matrix.target }}
       - name: Install musl tools
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
