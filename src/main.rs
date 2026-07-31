@@ -500,9 +500,8 @@ async fn main() -> ExitCode {
                 if args.common.continue_session && args.common.session_id.is_none() {
                     match session_store.as_ref() {
                         Some(store) => match store.list().await {
-                            Ok(mut sessions) => {
-                                sessions.sort_by_key(|s| s.updated_at);
-                                match sessions.last() {
+                            Ok(sessions) => {
+                                match remix_agent_runtime::session::most_recent_session(&sessions) {
                                     Some(latest) => {
                                         tracing::info!(
                                             session_id = %latest.id,

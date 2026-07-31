@@ -87,3 +87,29 @@ fn example_benchmark_config_parses() {
         .expect("example config should pass validation");
     assert!(config.task.is_some(), "example should define a task");
 }
+
+/// `--continue` must fail loudly when there is nothing to continue.
+///
+/// The flag parsed into a field that was only ever written, never read, so it silently
+/// did nothing at all. This asserts it now reaches the resume path.
+#[test]
+fn continue_without_a_prior_session_reports_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = cargo_bin_cmd!("remix-agent")
+        .arg("run")
+        .arg("--continue")
+        .arg("--session-dir")
+        .arg(dir.path())
+        .arg("--api-key")
+        .arg("test-key")
+        .arg("--no-browser")
+        .arg("some task")
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--continue found no previous session"),
+        "expected --continue to report an empty session store, got: {stderr}"
+    );
+}

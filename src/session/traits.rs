@@ -54,6 +54,21 @@ pub trait SessionStorage: Send + Sync {
     async fn fork(&self, source_id: &SessionId) -> Result<SessionMetadata, AgentError>;
 }
 
+/// Pick the session `--continue` should resume: the most recently updated one.
+///
+/// Extracted from `main.rs` so it can be tested. `main.rs` is 886 lines with no tests
+/// of its own, so logic that lives only there is logic nothing checks.
+///
+/// Ties are broken by session id, so the choice is deterministic rather than dependent
+/// on whatever order the store happened to return.
+pub fn most_recent_session(sessions: &[SessionMetadata]) -> Option<&SessionMetadata> {
+    sessions.iter().max_by(|a, b| {
+        a.updated_at
+            .cmp(&b.updated_at)
+            .then_with(|| a.id.0.cmp(&b.id.0))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,5 +81,51 @@ mod tests {
         // This test verifies at compile time that SessionStorage can be used as a trait object.
         // If SessionStorage were not object-safe, this file would fail to compile.
         fn _takes_dyn(_: &dyn SessionStorage) {}
+    }
+
+    use chrono::{Duration, Utc};
+
+    fn meta(id: &str, age_secs: i64) -> SessionMetadata {
+        let mut m = SessionMetadata::new(SessionId(id.to_string()), "task");
+        m.updated_at = Utc::now() - Duration::seconds(age_secs);
+        m
+    }
+
+    #[test]
+    fn test_most_recent_session_picks_newest() {
+        // `--continue` was dead code until recently; this is the logic it now depends on.
+        let sessions = vec![meta("old", 300), meta("newest", 1), meta("middle", 60)];
+        let picked = most_recent_session(&sessions).unwrap();
+        assert_eq!(picked.id.0, "newest");
+    }
+
+    #[test]
+    fn test_most_recent_session_ignores_input_order() {
+        let a = vec![meta("old", 300), meta("newest", 1)];
+        let b = vec![meta("newest", 1), meta("old", 300)];
+        assert_eq!(
+            most_recent_session(&a).unwrap().id.0,
+            most_recent_session(&b).unwrap().id.0
+        );
+    }
+
+    #[test]
+    fn test_most_recent_session_breaks_ties_deterministically() {
+        // Equal timestamps must not leave the choice up to store iteration order.
+        let mut x = meta("aaa", 10);
+        let mut y = meta("zzz", 10);
+        let ts = Utc::now();
+        x.updated_at = ts;
+        y.updated_at = ts;
+        assert_eq!(
+            most_recent_session(&[x.clone(), y.clone()]).unwrap().id.0,
+            "zzz"
+        );
+        assert_eq!(most_recent_session(&[y, x]).unwrap().id.0, "zzz");
+    }
+
+    #[test]
+    fn test_most_recent_session_empty_is_none() {
+        assert!(most_recent_session(&[]).is_none());
     }
 }
