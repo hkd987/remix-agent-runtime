@@ -11,15 +11,9 @@ pub async fn execute_bash(
     config: &LocalToolsConfig,
     max_bytes: usize,
 ) -> Result<ToolExecutionResult, AgentError> {
-    let command = args
-        .get("command")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AgentError::LocalTool("bash requires 'command' parameter".to_string()))?;
-
-    let timeout = args
-        .get("timeout_secs")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(config.bash_timeout_secs);
+    let args: super::params::BashArgs = super::params::parse("bash", args)?;
+    let command = args.command.as_str();
+    let timeout = args.timeout_secs.unwrap_or(config.bash_timeout_secs);
 
     // Resolve every program the command line actually invokes, so the lists cannot be
     // sidestepped by `;rm`, `$(rm ...)`, `/bin/rm`, `\rm`, and friends.
@@ -320,7 +314,7 @@ mod tests {
         let result = execute_bash(json!({}), &sandbox, &config, DEFAULT_MAX_BYTES).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("requires 'command' parameter"));
+        assert!(err.contains("missing field `command`"));
     }
 
     #[tokio::test]

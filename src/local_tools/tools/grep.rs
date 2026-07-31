@@ -9,19 +9,11 @@ pub async fn execute_grep(
     args: Value,
     path_validator: &PathValidator,
 ) -> Result<ToolExecutionResult, AgentError> {
-    let pattern = args
-        .get("pattern")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AgentError::LocalTool("grep requires 'pattern' parameter".to_string()))?;
-
-    let search_path = args.get("path").and_then(|v| v.as_str());
-
-    let include = args.get("include").and_then(|v| v.as_str());
-
-    let context_lines = args
-        .get("context_lines")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
+    let args: super::params::GrepArgs = super::params::parse("grep", args)?;
+    let pattern = args.pattern.as_str();
+    let search_path = args.path.as_deref();
+    let include = args.include.as_deref();
+    let context_lines = args.context_lines.unwrap_or(0);
 
     let regex = regex::Regex::new(pattern)
         .map_err(|e| AgentError::LocalTool(format!("Invalid regex pattern: {e}")))?;
@@ -304,7 +296,7 @@ mod tests {
         let result = execute_grep(json!({}), &validator).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("requires 'pattern' parameter"));
+        assert!(err.contains("missing field `pattern`"));
     }
 
     #[tokio::test]

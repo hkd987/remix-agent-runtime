@@ -5,6 +5,7 @@ pub mod glob_tool;
 pub mod grep;
 pub mod multi_edit;
 pub mod output_filter;
+pub mod params;
 pub mod read_file;
 pub mod web_fetch;
 pub mod write_file;

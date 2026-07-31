@@ -25,13 +25,9 @@ pub async fn execute_web_fetch(
     timeout_secs: u64,
     max_bytes: usize,
 ) -> Result<ToolExecutionResult, AgentError> {
-    let url_str = args
-        .get("url")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AgentError::LocalTool("web_fetch requires 'url' parameter".to_string()))?;
-
-    let custom_headers = parse_headers(&args)?;
-    let url = validate_and_normalize_url(url_str)?;
+    let args: super::params::WebFetchArgs = super::params::parse("web_fetch", args)?;
+    let custom_headers = args.headers.unwrap_or_default();
+    let url = validate_and_normalize_url(&args.url)?;
 
     fetch_url(&url, &custom_headers, timeout_secs, max_bytes).await
 }
@@ -125,18 +121,6 @@ async fn fetch_url(
         content: output,
         is_error: false,
     })
-}
-
-/// Parse and validate the `headers` parameter from tool arguments.
-fn parse_headers(args: &Value) -> Result<HashMap<String, String>, AgentError> {
-    match args.get("headers") {
-        None => Ok(HashMap::new()),
-        Some(v) => serde_json::from_value::<HashMap<String, String>>(v.clone()).map_err(|e| {
-            AgentError::LocalTool(format!(
-                "Invalid 'headers' parameter: expected an object with string values. {e}"
-            ))
-        }),
-    }
 }
 
 /// Stream the response body up to `max_bytes`, stopping early once the cap is reached.
@@ -471,7 +455,7 @@ mod tests {
         let result = execute_web_fetch(json!({}), 30, 102_400).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("requires 'url' parameter"));
+        assert!(err.contains("missing field `url`"));
     }
 
     #[tokio::test]
@@ -500,7 +484,7 @@ mod tests {
         .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("Invalid 'headers' parameter"));
+        assert!(err.contains("Invalid arguments for web_fetch"));
     }
 
     #[tokio::test]
@@ -687,24 +671,33 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_headers_missing() {
-        let result = parse_headers(&json!({"url": "https://example.com"})).unwrap();
-        assert!(result.is_empty());
+    fn test_headers_default_to_empty() {
+        let args: super::super::params::WebFetchArgs =
+            super::super::params::parse("web_fetch", json!({"url": "https://example.com"}))
+                .unwrap();
+        assert!(args.headers.is_none());
     }
 
     #[test]
-    fn test_parse_headers_valid() {
-        let result = parse_headers(&json!({"headers": {"Accept": "text/html"}})).unwrap();
-        assert_eq!(result.get("Accept").unwrap(), "text/html");
+    fn test_headers_parse_when_present() {
+        let args: super::super::params::WebFetchArgs = super::super::params::parse(
+            "web_fetch",
+            json!({"url": "https://example.com", "headers": {"Accept": "text/html"}}),
+        )
+        .unwrap();
+        assert_eq!(args.headers.unwrap().get("Accept").unwrap(), "text/html");
     }
 
     #[test]
-    fn test_parse_headers_malformed() {
-        let result = parse_headers(&json!({"headers": "not-an-object"}));
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid 'headers' parameter"));
+    fn test_malformed_headers_are_rejected() {
+        let err = super::super::params::parse::<super::super::params::WebFetchArgs>(
+            "web_fetch",
+            json!({"url": "https://example.com", "headers": "not-an-object"}),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid arguments for web_fetch"),
+            "{err}"
+        );
     }
 }

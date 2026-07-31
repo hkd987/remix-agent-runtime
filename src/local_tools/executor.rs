@@ -144,7 +144,7 @@ impl<T: ToolExecutor> ToolExecutor for LocalToolsExecutor<T> {
     }
 }
 
-fn local_tool_definitions() -> Vec<ToolDefinition> {
+pub fn local_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "read_file".to_string(),

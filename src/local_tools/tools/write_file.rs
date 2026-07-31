@@ -9,17 +9,8 @@ pub async fn execute_write_file(
     path_validator: &PathValidator,
     max_bytes: usize,
 ) -> Result<ToolExecutionResult, AgentError> {
-    let path = args
-        .get("path")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AgentError::LocalTool("write_file requires 'path' parameter".to_string()))?;
-
-    let content = args
-        .get("content")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            AgentError::LocalTool("write_file requires 'content' parameter".to_string())
-        })?;
+    let args: super::params::WriteFileArgs = super::params::parse("write_file", args)?;
+    let (path, content) = (args.path.as_str(), args.content.as_str());
 
     if content.len() > max_bytes {
         return Err(AgentError::LocalTool(format!(
@@ -141,7 +132,7 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("requires 'path' parameter"));
+        assert!(err.contains("missing field `path`"));
     }
 
     #[tokio::test]
@@ -153,7 +144,7 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("requires 'content' parameter"));
+        assert!(err.contains("missing field `content`"));
     }
 
     #[tokio::test]

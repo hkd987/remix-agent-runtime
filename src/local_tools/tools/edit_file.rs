@@ -8,24 +8,12 @@ pub async fn execute_edit_file(
     args: Value,
     path_validator: &PathValidator,
 ) -> Result<ToolExecutionResult, AgentError> {
-    let path = args
-        .get("path")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AgentError::LocalTool("edit_file requires 'path' parameter".to_string()))?;
-
-    let old_string = args
-        .get("old_string")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            AgentError::LocalTool("edit_file requires 'old_string' parameter".to_string())
-        })?;
-
-    let new_string = args
-        .get("new_string")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            AgentError::LocalTool("edit_file requires 'new_string' parameter".to_string())
-        })?;
+    let args: super::params::EditFileArgs = super::params::parse("edit_file", args)?;
+    let (path, old_string, new_string) = (
+        args.path.as_str(),
+        args.old_string.as_str(),
+        args.new_string.as_str(),
+    );
 
     let resolved = path_validator.resolve_path(path)?;
 
@@ -151,7 +139,7 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("requires 'path' parameter"));
+        assert!(err.contains("missing field `path`"));
     }
 
     #[tokio::test]
@@ -164,7 +152,7 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("requires 'old_string' parameter"));
+        assert!(err.contains("missing field `old_string`"));
     }
 
     #[tokio::test]
@@ -177,7 +165,7 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("requires 'new_string' parameter"));
+        assert!(err.contains("missing field `new_string`"));
     }
 
     #[tokio::test]
