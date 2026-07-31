@@ -68,6 +68,15 @@ impl<T: ToolExecutor> PermissionAwareExecutor<T> {
         self.inner
     }
 
+    /// Borrow the wrapped executor.
+    ///
+    /// Needed because this decorator is outermost in the chain, so callers reaching for
+    /// an inner executor's own API (e.g. `CoordinationExecutor::wait_for_children`)
+    /// have to go through it.
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
+
     pub fn policy(&self) -> &PermissionPolicy {
         &self.policy
     }

@@ -51,22 +51,101 @@ const PLAN_MODE_ALLOWED: &[&str] = &[
 const ACCEPT_EDITS_AUTO_ALLOW: &[&str] = &["write_file", "edit_file", "bash", "multi_edit"];
 
 impl PermissionPolicy {
+    /// Compile every configured pattern, returning a description of the first that is
+    /// invalid.
+    ///
+    /// Call this at startup. An unparseable pattern is silently ignored during
+    /// matching, which for a *deny* pattern means it fails open — a typo would quietly
+    /// grant access the operator believed they had revoked. Surfacing it as a hard
+    /// config error is the only safe handling.
+    pub fn validate(&self) -> Result<(), String> {
+        for (label, patterns) in [
+            ("denied_tools", &self.denied_tools),
+            ("allowed_tools", &self.allowed_tools),
+        ] {
+            for pattern in patterns {
+                if let Err(e) = regex::Regex::new(pattern) {
+                    return Err(format!("invalid regex in {label}: `{pattern}`: {e}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Log a warning when the effective policy is broader than it may appear.
+    ///
+    /// `Default` mode falls through to `Ask`, and a non-interactive run has no one to
+    /// ask, so `Ask` executes the tool. That makes headless `Default` mode
+    /// "allow everything not explicitly denied" — worth stating out loud rather than
+    /// leaving implicit.
+    pub fn warn_if_permissive(&self, interactive: bool) {
+        match self.mode {
+            PermissionMode::BypassPermissions => {
+                tracing::warn!(
+                    "Permission mode is `bypass_permissions`: every tool is allowed and \
+                     denied_tools is ignored."
+                );
+            }
+            PermissionMode::Default if !interactive => {
+                tracing::warn!(
+                    denied_tools = ?self.denied_tools,
+                    "Permission mode is `default` in a non-interactive run: tools that would \
+                     prompt are executed instead. Effectively every tool is allowed except \
+                     the denied patterns. Use `--permission-mode dont_ask` to deny instead."
+                );
+            }
+            PermissionMode::AcceptEdits => {
+                tracing::warn!(
+                    auto_allowed = ?ACCEPT_EDITS_AUTO_ALLOW,
+                    "Permission mode is `accept_edits`: these tools run without prompting."
+                );
+            }
+            _ => {}
+        }
+    }
+
     /// Returns the first denied pattern that matches `tool_name`, if any.
+    ///
+    /// Deny patterns are matched **unanchored** so a broad pattern catches variants.
     fn matches_denied(&self, tool_name: &str) -> Option<&str> {
         self.denied_tools.iter().find_map(|pattern| {
-            regex::Regex::new(pattern)
-                .ok()
-                .filter(|re| re.is_match(tool_name))
-                .map(|_| pattern.as_str())
+            match regex::Regex::new(pattern) {
+                Ok(re) if re.is_match(tool_name) => Some(pattern.as_str()),
+                Ok(_) => None,
+                Err(e) => {
+                    // Cannot evaluate the rule, so treat it as matching rather than
+                    // letting a malformed deny rule fail open. `validate()` should have
+                    // rejected this at startup.
+                    tracing::error!(
+                        pattern = %pattern,
+                        error = %e,
+                        "Invalid deny pattern; denying the tool rather than failing open"
+                    );
+                    Some(pattern.as_str())
+                }
+            }
         })
     }
 
     /// Returns `true` if `tool_name` matches any pattern in `allowed_tools`.
+    ///
+    /// Allow patterns are **anchored** to the whole tool name, so `read` grants
+    /// `read_file` only if written as such and never accidentally matches
+    /// `spread_files`. Alternations still work: `navigate|click` becomes
+    /// `^(?:navigate|click)$`.
     fn matches_allowed(&self, tool_name: &str) -> bool {
         self.allowed_tools.iter().any(|pattern| {
-            regex::Regex::new(pattern)
+            let anchored = format!("^(?:{pattern})$");
+            regex::Regex::new(&anchored)
                 .map(|re| re.is_match(tool_name))
-                .unwrap_or(false)
+                .unwrap_or_else(|e| {
+                    tracing::error!(
+                        pattern = %pattern,
+                        error = %e,
+                        "Invalid allow pattern; not granting access"
+                    );
+                    false
+                })
         })
     }
 
@@ -493,14 +572,76 @@ mod tests {
     // --- Invalid regex is gracefully handled ---
 
     #[test]
-    fn test_invalid_regex_in_denied_is_skipped() {
+    fn test_invalid_regex_in_denied_fails_closed() {
         let policy = PermissionPolicy {
             mode: PermissionMode::Default,
             allowed_tools: vec![],
             denied_tools: vec!["[invalid".to_string()],
         };
-        // Invalid regex should be skipped, falling through to Ask
-        assert_eq!(policy.check("bash"), PermissionDecision::Ask);
+        // An unevaluatable deny rule must not grant access. A typo in a deny pattern
+        // silently permitting the tool is the worst possible failure mode, so the
+        // rule is treated as matching.
+        assert!(matches!(
+            policy.check("bash"),
+            PermissionDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_denied_pattern() {
+        let policy = PermissionPolicy {
+            mode: PermissionMode::Default,
+            allowed_tools: vec![],
+            denied_tools: vec!["[invalid".to_string()],
+        };
+        let err = policy.validate().unwrap_err();
+        assert!(err.contains("denied_tools"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_allowed_pattern() {
+        let policy = PermissionPolicy {
+            mode: PermissionMode::Default,
+            allowed_tools: vec!["(unclosed".to_string()],
+            denied_tools: vec![],
+        };
+        let err = policy.validate().unwrap_err();
+        assert!(err.contains("allowed_tools"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_accepts_valid_patterns() {
+        let policy = PermissionPolicy {
+            mode: PermissionMode::Default,
+            allowed_tools: vec!["navigate|click".to_string()],
+            denied_tools: vec!["bash".to_string()],
+        };
+        assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn test_allow_pattern_is_anchored() {
+        let policy = PermissionPolicy {
+            mode: PermissionMode::Default,
+            allowed_tools: vec!["read".to_string()],
+            denied_tools: vec![],
+        };
+        // `read` must not grant `spread_files` by substring match.
+        assert_eq!(policy.check("spread_files"), PermissionDecision::Ask);
+        assert_eq!(policy.check("read"), PermissionDecision::Allow);
+    }
+
+    #[test]
+    fn test_allow_pattern_alternation_still_works_when_anchored() {
+        let policy = PermissionPolicy {
+            mode: PermissionMode::Default,
+            allowed_tools: vec!["navigate|click|screenshot".to_string()],
+            denied_tools: vec![],
+        };
+        assert_eq!(policy.check("navigate"), PermissionDecision::Allow);
+        assert_eq!(policy.check("click"), PermissionDecision::Allow);
+        assert_eq!(policy.check("screenshot"), PermissionDecision::Allow);
+        assert_eq!(policy.check("navigate_away"), PermissionDecision::Ask);
     }
 
     #[test]

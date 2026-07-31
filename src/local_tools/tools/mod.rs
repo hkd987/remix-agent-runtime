@@ -1,4 +1,5 @@
 pub mod bash;
+pub mod command_parser;
 pub mod edit_file;
 pub mod glob_tool;
 pub mod grep;

@@ -21,11 +21,42 @@ pub struct CommandOutput {
     pub exit_code: i32,
 }
 
-/// Trait for sandboxed bash command execution.
+/// Quote a single argument for safe inclusion in a `sh -c` command line.
+///
+/// Wraps the value in single quotes and escapes any embedded single quote using the
+/// standard `'\''` idiom, so no metacharacter in the input can influence parsing.
+pub fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', r"'\''"))
+}
+
+/// Trait for sandboxed command execution.
 #[async_trait]
 pub trait BashSandbox: Send + Sync {
     async fn execute(&self, command: &str, timeout_secs: u64) -> Result<CommandOutput, AgentError>;
     fn root(&self) -> &Path;
+
+    /// Run a program with explicit arguments under the same sandbox as [`Self::execute`].
+    ///
+    /// Every subprocess the agent starts must go through a sandbox. Tools that already
+    /// have a program and an argument vector — the test harness, skill scripts — should
+    /// use this rather than spawning `tokio::process::Command` directly, which would
+    /// escape both the OS-level restrictions and the sandbox root.
+    ///
+    /// The default implementation quotes each argument and delegates to
+    /// [`Self::execute`], so every sandbox implementation gets it for free.
+    async fn execute_argv(
+        &self,
+        program: &str,
+        args: &[String],
+        timeout_secs: u64,
+    ) -> Result<CommandOutput, AgentError> {
+        let mut command = shell_quote(program);
+        for arg in args {
+            command.push(' ');
+            command.push_str(&shell_quote(arg));
+        }
+        self.execute(&command, timeout_secs).await
+    }
 }
 
 /// Fallback sandbox with no OS-level enforcement (timeout + cwd only).
@@ -42,19 +73,48 @@ impl FallbackSandbox {
     }
 }
 
+/// Build a shell invocation for the host platform.
+///
+/// `sh` does not exist on a stock Windows install, so a hardcoded `sh -c` makes the
+/// bash tool fail to spawn there — on a target the project ships release binaries for.
+#[cfg(windows)]
+fn shell_command(command: &str) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("cmd");
+    cmd.args(["/C", command]);
+    cmd
+}
+
+#[cfg(not(windows))]
+fn shell_command(command: &str) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.args(["-c", command]);
+    cmd
+}
+
 #[async_trait]
 impl BashSandbox for FallbackSandbox {
     async fn execute(&self, command: &str, timeout_secs: u64) -> Result<CommandOutput, AgentError> {
         use std::time::Duration;
 
-        let child = tokio::process::Command::new("sh")
-            .args(["-c", command])
+        let mut builder = shell_command(command);
+        builder
             .current_dir(&self.root)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+
+        // Put the child in its own process group so a timeout can kill the whole tree.
+        // `kill_on_drop` only signals the direct child, so a shell that has forked
+        // (a build, a test runner) leaves its children running past the timeout.
+        #[cfg(unix)]
+        builder.process_group(0);
+
+        let child = builder
             .spawn()
             .map_err(|e| AgentError::LocalTool(format!("Failed to spawn command: {e}")))?;
+
+        #[cfg(unix)]
+        let child_pid = child.id();
 
         let timeout = Duration::from_secs(timeout_secs);
         let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
@@ -68,9 +128,13 @@ impl BashSandbox for FallbackSandbox {
             Ok(Err(e)) => Err(AgentError::LocalTool(format!(
                 "Command execution failed: {e}"
             ))),
-            Err(_) => Err(AgentError::LocalTool(format!(
-                "Command timed out after {timeout_secs}s"
-            ))),
+            Err(_) => {
+                #[cfg(unix)]
+                kill_process_group(child_pid);
+                Err(AgentError::LocalTool(format!(
+                    "Command timed out after {timeout_secs}s"
+                )))
+            }
         }
     }
 
@@ -79,7 +143,31 @@ impl BashSandbox for FallbackSandbox {
     }
 }
 
+/// Send SIGKILL to the process group led by `pid`, reaping any grandchildren the
+/// timed-out command left behind.
+#[cfg(unix)]
+pub(crate) fn kill_process_group(pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+    // Safety: `killpg` takes a process group id and a signal and has no memory
+    // effects. A failure (group already gone) is reported via the return value and
+    // is not actionable here.
+    unsafe {
+        libc_killpg(pid as i32, 9);
+    }
+}
+
+#[cfg(unix)]
+unsafe fn libc_killpg(pgid: i32, sig: i32) -> i32 {
+    extern "C" {
+        fn killpg(pgrp: i32, sig: i32) -> i32;
+    }
+    killpg(pgid, sig)
+}
+
 /// Create the appropriate sandbox for the current platform.
+///
+/// Warns when no OS-level enforcement is available, so an operator is never left
+/// believing a run is contained when it is not.
 pub fn create_sandbox(root: PathBuf) -> Result<Box<dyn BashSandbox>, AgentError> {
     create_platform_sandbox(root)
 }
@@ -96,6 +184,12 @@ fn create_platform_sandbox(root: PathBuf) -> Result<Box<dyn BashSandbox>, AgentE
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn create_platform_sandbox(root: PathBuf) -> Result<Box<dyn BashSandbox>, AgentError> {
+    tracing::warn!(
+        root = %root.display(),
+        "No OS-level sandbox is available on this platform. Shell commands run with the \
+         agent's full privileges, restricted only by working directory and timeout. Do not \
+         run untrusted tasks in this configuration."
+    );
     Ok(Box::new(FallbackSandbox::new(root)?))
 }
 

@@ -307,10 +307,21 @@ async fn main() -> ExitCode {
                 }
             };
 
-            // Wrap with dev tools executor
+            // Wrap with dev tools executor. It shares the local tools' sandbox root so
+            // `run_tests` cannot reach outside the boundary the bash tool respects.
+            let dev_sandbox = match remix_agent_runtime::local_tools::sandbox::create_sandbox(
+                remix_agent_runtime::local_tools::executor::sandbox_root(&config.local_tools),
+            ) {
+                Ok(s) => std::sync::Arc::from(s),
+                Err(e) => {
+                    eprintln!("Error: Failed to initialize dev-tools sandbox: {e}");
+                    return ExitStatus::AgentError.into();
+                }
+            };
             let executor = remix_agent_runtime::dev_tools::DevToolsExecutor::new(
                 executor,
                 config.dev_tools.clone(),
+                dev_sandbox,
             );
             if config.dev_tools.enabled {
                 tracing::info!(
@@ -320,8 +331,11 @@ async fn main() -> ExitCode {
             }
 
             // Wrap with hook-aware executor
-            let executor =
-                HookAwareExecutor::new(executor, hook_registry, config.plugins.hook_timeout_secs);
+            let executor = HookAwareExecutor::new(
+                executor,
+                hook_registry.clone(),
+                config.plugins.hook_timeout_secs,
+            );
 
             // Wrap with permission-aware executor
             let permission_mode = match config.permissions.mode {
@@ -346,9 +360,19 @@ async fn main() -> ExitCode {
                 allowed_tools: config.permissions.allowed_tools.clone(),
                 denied_tools: config.permissions.denied_tools.clone(),
             };
-            let executor = PermissionAwareExecutor::new(executor, permission_policy);
+            if let Err(e) = permission_policy.validate() {
+                eprintln!("Error: invalid permission configuration: {e}");
+                return ExitStatus::ConfigError.into();
+            }
+            permission_policy.warn_if_permissive(false);
 
-            // Wrap with coordination executor (supersedes SubagentExecutor)
+            // Wrap with coordination executor (supersedes SubagentExecutor).
+            //
+            // This must sit *inside* PermissionAwareExecutor. CoordinationExecutor
+            // intercepts its virtual tools (spawn_agent, task_*, team_create,
+            // send_message) before delegating inward, so wrapping it on the outside
+            // would let those tools skip the policy entirely — including in Plan mode
+            // and including explicit denied_tools.
             let coordination_context =
                 std::sync::Arc::new(CoordinationContext::from_config(&config.coordination));
             let spawn_handler = std::sync::Arc::new(DefaultSpawnHandler::new(
@@ -360,6 +384,9 @@ async fn main() -> ExitCode {
                 config.coordination.clone(),
                 coordination_context.clone(),
                 config.agent.tool_result_max_bytes,
+                permission_policy.clone(),
+                hook_registry.clone(),
+                config.plugins.hook_timeout_secs,
             ));
             let executor = CoordinationExecutor::new(
                 executor,
@@ -368,6 +395,8 @@ async fn main() -> ExitCode {
                 "lead".to_string(),
             )
             .with_spawn_handler(spawn_handler);
+
+            let executor = PermissionAwareExecutor::new(executor, permission_policy);
 
             // Set up session store
             let session_store = if config.session.enabled {
@@ -482,6 +511,7 @@ async fn main() -> ExitCode {
             // Wait for any spawned child agents to complete
             let child_results = runner
                 .tools_ref()
+                .inner()
                 .wait_for_children(std::time::Duration::from_secs(
                     config.coordination.worker_timeout_secs,
                 ))
@@ -496,7 +526,7 @@ async fn main() -> ExitCode {
             }
 
             // Gracefully shut down all MCP connections
-            // Chain: CoordinationExecutor -> PermissionAwareExecutor -> HookAwareExecutor -> DevToolsExecutor -> LocalToolsExecutor -> SkillAwareExecutor -> CompositeToolExecutor
+            // Chain: PermissionAwareExecutor -> CoordinationExecutor -> HookAwareExecutor -> DevToolsExecutor -> LocalToolsExecutor -> SkillAwareExecutor -> CompositeToolExecutor
             runner
                 .into_tools()
                 .into_inner()
@@ -796,11 +826,27 @@ async fn run_chat(chat_args: ChatArgs) -> ExitCode {
         }
     };
 
-    let executor =
-        remix_agent_runtime::dev_tools::DevToolsExecutor::new(executor, config.dev_tools.clone());
+    let dev_sandbox: std::sync::Arc<dyn remix_agent_runtime::local_tools::sandbox::BashSandbox> =
+        match remix_agent_runtime::local_tools::sandbox::create_sandbox(
+            remix_agent_runtime::local_tools::executor::sandbox_root(&config.local_tools),
+        ) {
+            Ok(s) => std::sync::Arc::from(s),
+            Err(e) => {
+                eprintln!("Error: Failed to initialize dev-tools sandbox: {e}");
+                return ExitStatus::AgentError.into();
+            }
+        };
+    let executor = remix_agent_runtime::dev_tools::DevToolsExecutor::new(
+        executor,
+        config.dev_tools.clone(),
+        dev_sandbox,
+    );
 
-    let executor =
-        HookAwareExecutor::new(executor, hook_registry, config.plugins.hook_timeout_secs);
+    let executor = HookAwareExecutor::new(
+        executor,
+        hook_registry.clone(),
+        config.plugins.hook_timeout_secs,
+    );
 
     let permission_mode = match config.permissions.mode {
         remix_agent_runtime::config::schema::PermissionModeConfig::Default => {
@@ -822,8 +868,14 @@ async fn run_chat(chat_args: ChatArgs) -> ExitCode {
         allowed_tools: config.permissions.allowed_tools.clone(),
         denied_tools: config.permissions.denied_tools.clone(),
     };
-    let executor = PermissionAwareExecutor::new(executor, permission_policy);
+    if let Err(e) = permission_policy.validate() {
+        eprintln!("Error: invalid permission configuration: {e}");
+        return ExitStatus::ConfigError.into();
+    }
+    permission_policy.warn_if_permissive(true);
 
+    // CoordinationExecutor must sit inside PermissionAwareExecutor — see the comment
+    // on the equivalent chain in `run_agent`.
     let coordination_context =
         std::sync::Arc::new(CoordinationContext::from_config(&config.coordination));
     let spawn_handler = std::sync::Arc::new(DefaultSpawnHandler::new(
@@ -835,6 +887,9 @@ async fn run_chat(chat_args: ChatArgs) -> ExitCode {
         config.coordination.clone(),
         coordination_context.clone(),
         config.agent.tool_result_max_bytes,
+        permission_policy.clone(),
+        hook_registry.clone(),
+        config.plugins.hook_timeout_secs,
     ));
     let executor = CoordinationExecutor::new(
         executor,
@@ -843,6 +898,8 @@ async fn run_chat(chat_args: ChatArgs) -> ExitCode {
         "lead".to_string(),
     )
     .with_spawn_handler(spawn_handler);
+
+    let executor = PermissionAwareExecutor::new(executor, permission_policy);
 
     // Session store
     let session_store = if config.session.enabled {

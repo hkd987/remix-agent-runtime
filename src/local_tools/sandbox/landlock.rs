@@ -88,30 +88,67 @@ mod linux_impl {
             .create()
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        // Read access to system dirs
+        // Read access to system dirs.
+        //
+        // `/proc` stays on this list deliberately. Build tools, language runtimes and
+        // allocators read `/proc/self/*` routinely, and Landlock rules are path-based,
+        // so there is no way to grant `/proc/self` without granting sibling PIDs. The
+        // residual exposure (`/proc/<pid>/environ` of other same-user processes) is not
+        // closable here — it belongs to process isolation, not the filesystem sandbox.
+        //
         // add_rule() takes self by value and returns the modified ruleset,
         // so we chain through a mutable binding.
         let mut ruleset = ruleset;
         for sys_dir in &[
             "/usr", "/bin", "/lib", "/lib64", "/etc", "/dev", "/sbin", "/proc",
         ] {
-            if let Ok(fd) = PathFd::new(sys_dir) {
-                ruleset = ruleset
-                    .add_rule(PathBeneath::new(fd, read_access))
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+            match PathFd::new(sys_dir) {
+                Ok(fd) => {
+                    ruleset = ruleset
+                        .add_rule(PathBeneath::new(fd, read_access))
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                }
+                Err(e) => {
+                    // Not fatal — the directory may simply not exist on this system —
+                    // but silently dropping it changes what the sandbox permits, so say so.
+                    tracing::debug!(dir = %sys_dir, error = %e, "Skipping sandbox read rule");
+                }
             }
         }
 
-        // Read + write access to sandbox root
-        if let Ok(fd) = PathFd::new(root) {
-            ruleset = ruleset
-                .add_rule(PathBeneath::new(fd, read_write_access))
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-        }
+        // Read + write access to sandbox root.
+        //
+        // Unlike the system directories, a failure here is fatal: the ruleset would be
+        // applied with no writable path at all, and every write would fail with a
+        // confusing permission error instead of a clear startup failure.
+        let root_fd = PathFd::new(root).map_err(|e| {
+            std::io::Error::other(format!(
+                "Cannot open sandbox root {} for Landlock: {e}",
+                root.display()
+            ))
+        })?;
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(root_fd, read_write_access))
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        ruleset
+        let status = ruleset
             .restrict_self()
             .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        // On a kernel without Landlock support `restrict_self` succeeds but enforces
+        // nothing. Reporting that is the difference between a contained run and one the
+        // operator only believes is contained.
+        if status.ruleset == landlock::RulesetStatus::NotEnforced {
+            tracing::warn!(
+                "Landlock is not enforced by this kernel. Shell commands run with the \
+                 agent's full filesystem access. Do not run untrusted tasks here."
+            );
+        } else if status.ruleset == landlock::RulesetStatus::PartiallyEnforced {
+            tracing::warn!(
+                "Landlock is only partially enforced by this kernel; some filesystem \
+                 restrictions are not active."
+            );
+        }
 
         Ok(())
     }

@@ -16,7 +16,11 @@ use crate::coordination::spawn_handler::{ChildHandle, SpawnDefinition, SpawnHand
 use crate::error::AgentError;
 use crate::llm::client::LlmProvider;
 use crate::local_tools::executor::LocalToolsExecutor;
+use crate::permissions::executor::PermissionAwareExecutor;
+use crate::permissions::types::PermissionPolicy;
+use crate::plugins::components::hooks::HookRegistry;
 use crate::plugins::composite_executor::CompositeToolExecutor;
+use crate::plugins::hook_executor::HookAwareExecutor;
 use crate::skills::executor::SkillAwareExecutor;
 use crate::skills::SkillSet;
 use crate::subagent::filtered_executor::FilteredToolExecutor;
@@ -32,6 +36,10 @@ pub struct DefaultSpawnHandler<L: LlmProvider + 'static> {
     coordination_config: CoordinationConfig,
     coordination_context: Arc<CoordinationContext>,
     tool_result_max_bytes: usize,
+    /// The parent's policy. A child must never hold more authority than its parent.
+    permission_policy: PermissionPolicy,
+    hook_registry: HookRegistry,
+    hook_timeout_secs: u64,
 }
 
 impl<L: LlmProvider + 'static> DefaultSpawnHandler<L> {
@@ -45,6 +53,9 @@ impl<L: LlmProvider + 'static> DefaultSpawnHandler<L> {
         coordination_config: CoordinationConfig,
         coordination_context: Arc<CoordinationContext>,
         tool_result_max_bytes: usize,
+        permission_policy: PermissionPolicy,
+        hook_registry: HookRegistry,
+        hook_timeout_secs: u64,
     ) -> Self {
         Self {
             llm,
@@ -55,9 +66,15 @@ impl<L: LlmProvider + 'static> DefaultSpawnHandler<L> {
             coordination_config,
             coordination_context,
             tool_result_max_bytes,
+            permission_policy,
+            hook_registry,
+            hook_timeout_secs,
         }
     }
 }
+
+/// The child agent's fully-decorated tool executor.
+type ChildExecutor = PermissionAwareExecutor<CoordinationExecutor<Box<dyn ToolExecutor>>>;
 
 /// Build the child agent's tool executor chain from a base executor.
 ///
@@ -73,7 +90,10 @@ fn build_child_chain(
     coordination_config: &CoordinationConfig,
     coordination_context: Arc<CoordinationContext>,
     tool_result_max_bytes: usize,
-) -> Result<CoordinationExecutor<Box<dyn ToolExecutor>>, AgentError> {
+    permission_policy: PermissionPolicy,
+    hook_registry: HookRegistry,
+    hook_timeout_secs: u64,
+) -> Result<ChildExecutor, AgentError> {
     // 1. Wrap base in CompositeToolExecutor
     let mut composite = CompositeToolExecutor::new();
     composite.add_backend(base_executor);
@@ -92,7 +112,11 @@ fn build_child_chain(
         tool_result_max_bytes,
     )?;
 
-    // 4. Optionally wrap in FilteredToolExecutor
+    // 4. Optionally wrap in FilteredToolExecutor.
+    //
+    // Note this narrowing comes from `allowed_tools` in the model's own spawn request,
+    // so it is a convenience, not a control — the permission layer added in step 6 is
+    // what actually bounds the child.
     let executor: Box<dyn ToolExecutor> = if !definition.allowed_tools.is_empty() {
         Box::new(FilteredToolExecutor::new(
             local_exec,
@@ -102,15 +126,29 @@ fn build_child_chain(
         Box::new(local_exec)
     };
 
-    // 5. Wrap in CoordinationExecutor (shared context, child's name, no spawn_handler)
-    let coord_exec = CoordinationExecutor::new(
+    // 5. Wrap in HookAwareExecutor so the child's tool calls fire the same hooks as
+    //    the parent's.
+    let hook_exec: Box<dyn ToolExecutor> = Box::new(HookAwareExecutor::new(
         executor,
+        hook_registry,
+        hook_timeout_secs,
+    ));
+
+    // 6. Wrap in CoordinationExecutor (shared context, child's name, no spawn_handler)
+    let coord_exec = CoordinationExecutor::new(
+        hook_exec,
         coordination_config.clone(),
         coordination_context,
         definition.name.clone(),
     );
 
-    Ok(coord_exec)
+    // 7. Wrap in PermissionAwareExecutor, outermost, carrying the *parent's* policy.
+    //
+    // Without this a child spawned from a Plan-mode or DontAsk-mode parent would run
+    // with unrestricted bash/write_file — spawn_agent would be a complete escape from
+    // the parent's policy. Outermost placement also means the coordination virtual
+    // tools are policy-checked, matching the parent chain.
+    Ok(PermissionAwareExecutor::new(coord_exec, permission_policy))
 }
 
 /// Connect to an MCP browser with retry logic.
@@ -196,6 +234,9 @@ impl<L: LlmProvider + 'static> SpawnHandler for DefaultSpawnHandler<L> {
             &self.coordination_config,
             self.coordination_context.clone(),
             self.tool_result_max_bytes,
+            self.permission_policy.clone(),
+            self.hook_registry.clone(),
+            self.hook_timeout_secs,
         )?;
 
         // 3. Build child AgentConfig
@@ -242,6 +283,7 @@ mod tests {
     use super::*;
     use crate::browser::mcp::ToolExecutionResult;
     use crate::llm::types::{Message, MessagesResponse, SystemContent, ToolDefinition};
+    use crate::permissions::types::PermissionMode;
     use serde_json::json;
     use std::sync::Mutex;
 
@@ -345,6 +387,12 @@ mod tests {
             config,
             context,
             32_768,
+            PermissionPolicy {
+                mode: crate::permissions::types::PermissionMode::BypassPermissions,
+                ..Default::default()
+            },
+            HookRegistry::new(),
+            30,
         );
 
         assert!(handler.browser_config.headless);
@@ -374,6 +422,12 @@ mod tests {
             &config,
             context,
             32_768,
+            PermissionPolicy {
+                mode: crate::permissions::types::PermissionMode::BypassPermissions,
+                ..Default::default()
+            },
+            HookRegistry::new(),
+            30,
         )
         .unwrap();
 
@@ -415,6 +469,12 @@ mod tests {
             &config,
             context,
             32_768,
+            PermissionPolicy {
+                mode: crate::permissions::types::PermissionMode::BypassPermissions,
+                ..Default::default()
+            },
+            HookRegistry::new(),
+            30,
         )
         .unwrap();
 
@@ -449,6 +509,12 @@ mod tests {
             &config,
             context,
             32_768,
+            PermissionPolicy {
+                mode: crate::permissions::types::PermissionMode::BypassPermissions,
+                ..Default::default()
+            },
+            HookRegistry::new(),
+            30,
         )
         .unwrap();
 
@@ -491,6 +557,12 @@ mod tests {
             &config,
             context,
             32_768,
+            PermissionPolicy {
+                mode: crate::permissions::types::PermissionMode::BypassPermissions,
+                ..Default::default()
+            },
+            HookRegistry::new(),
+            30,
         )
         .unwrap();
 
@@ -550,6 +622,12 @@ mod tests {
             &config,
             context,
             32_768,
+            PermissionPolicy {
+                mode: crate::permissions::types::PermissionMode::BypassPermissions,
+                ..Default::default()
+            },
+            HookRegistry::new(),
+            30,
         )
         .unwrap();
 
@@ -596,6 +674,12 @@ mod tests {
             &config,
             context,
             32_768,
+            PermissionPolicy {
+                mode: crate::permissions::types::PermissionMode::BypassPermissions,
+                ..Default::default()
+            },
+            HookRegistry::new(),
+            30,
         );
         assert!(result.is_err());
     }
@@ -646,5 +730,118 @@ mod tests {
         // Total max wait time should be 1.5s (reasonable for browser startup)
         let total: std::time::Duration = retry_delays.iter().flatten().sum();
         assert_eq!(total, std::time::Duration::from_millis(1500));
+    }
+
+    // --- Security: child containment (S1b) ---
+    //
+    // A child spawned via `spawn_agent` must never hold more authority than the parent
+    // that spawned it. Before these, `build_child_chain` had no permission layer at
+    // all, so a Plan-mode parent could spawn a child with unrestricted bash/write_file.
+
+    /// Build a child chain under a given parent policy, with local tools enabled so
+    /// bash/write_file are genuinely present in the inner chain.
+    fn child_chain_under(policy: PermissionPolicy) -> ChildExecutor {
+        let base: Box<dyn ToolExecutor> = Box::new(MockToolExecutor::new(&[]));
+        let definition = SpawnDefinition {
+            name: "child".to_string(),
+            ..test_spawn_definition()
+        };
+        build_child_chain(
+            base,
+            &definition,
+            &SkillsConfig::default(),
+            &SkillSet::new(),
+            &LocalToolsConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            &CoordinationConfig::default(),
+            Arc::new(CoordinationContext::new(std::env::temp_dir())),
+            32_768,
+            policy,
+            HookRegistry::new(),
+            30,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_child_inherits_plan_mode_and_cannot_write() {
+        let chain = child_chain_under(PermissionPolicy {
+            mode: PermissionMode::Plan,
+            ..Default::default()
+        });
+
+        let result = chain
+            .execute_tool("write_file", json!({"path": "x.txt", "content": "hi"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_error,
+            "a Plan-mode parent must not be able to spawn a child that writes files"
+        );
+        assert!(
+            result.content.contains("Permission denied"),
+            "got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_child_inherits_denied_tools() {
+        let chain = child_chain_under(PermissionPolicy {
+            mode: PermissionMode::Default,
+            allowed_tools: vec![],
+            denied_tools: vec!["bash".to_string()],
+        });
+
+        let result = chain
+            .execute_tool("bash", json!({"command": "echo hi"}))
+            .await
+            .unwrap();
+
+        assert!(result.is_error, "child ignored the parent's denied_tools");
+        assert!(
+            result.content.contains("Permission denied"),
+            "got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_child_coordination_tools_are_permission_checked() {
+        // CoordinationExecutor intercepts its virtual tools before delegating inward,
+        // so it must sit *inside* the permission layer for them to be checked at all.
+        let chain = child_chain_under(PermissionPolicy {
+            mode: PermissionMode::Plan,
+            ..Default::default()
+        });
+
+        let result = chain
+            .execute_tool("task_create", json!({"subject": "s", "description": "d"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_error,
+            "coordination tools bypassed the permission layer"
+        );
+    }
+
+    #[test]
+    fn test_child_plan_mode_hides_write_tools_from_the_model() {
+        let chain = child_chain_under(PermissionPolicy {
+            mode: PermissionMode::Plan,
+            ..Default::default()
+        });
+        let names: Vec<&str> = chain
+            .tool_definitions()
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert!(!names.contains(&"write_file"), "advertised: {names:?}");
+        assert!(!names.contains(&"bash"), "advertised: {names:?}");
+        assert!(!names.contains(&"spawn_agent"), "advertised: {names:?}");
     }
 }

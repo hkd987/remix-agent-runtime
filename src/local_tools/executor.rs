@@ -26,15 +26,23 @@ pub struct LocalToolsExecutor<T: ToolExecutor> {
     tool_result_max_bytes: usize,
 }
 
+/// The directory every sandboxed tool is confined to.
+///
+/// Shared so the bash sandbox, the path validator, and the dev-tools subprocess
+/// sandbox all agree on the boundary instead of each deriving it.
+pub fn sandbox_root(config: &LocalToolsConfig) -> std::path::PathBuf {
+    config.sandbox_dir.clone().unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+    })
+}
+
 impl<T: ToolExecutor> LocalToolsExecutor<T> {
     pub fn new(
         inner: T,
         config: LocalToolsConfig,
         tool_result_max_bytes: usize,
     ) -> Result<Self, AgentError> {
-        let sandbox_root = config.sandbox_dir.clone().unwrap_or_else(|| {
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-        });
+        let sandbox_root = sandbox_root(&config);
 
         let path_validator =
             PathValidator::new_with_bypass(sandbox_root.clone(), config.bypass_sandbox)?;
